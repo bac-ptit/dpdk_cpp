@@ -8,8 +8,6 @@ find_package(PkgConfig REQUIRED)
 
 # pkg-config để tìm DPDK (tên gói trên Fedora/Ubuntu là 'libdpdk')
 pkg_check_modules(DPDK REQUIRED IMPORTED_TARGET libdpdk)
-find_package(yaml-cpp REQUIRED)
-
 include(FetchContent)
 
 FetchContent_Declare(
@@ -23,13 +21,18 @@ FetchContent_MakeAvailable(glaze)
 
 
 add_executable(untitled main.cpp
-        include/dpdk_environment.cpp)
+        include/dpdk_config_loader.cpp
+        include/dpdk_environment.cpp
+        include/spi_packet_parser.cpp
+        include/spi_pipeline.cpp
+        include/spi_rule_engine.cpp)
 
 target_compile_options(untitled PRIVATE -fno-exceptions)
-target_link_libraries(untitled PRIVATE PkgConfig::DPDK yaml-cpp::yaml-cpp glaze::glaze)
+target_link_libraries(untitled PRIVATE PkgConfig::DPDK glaze::glaze)
 target_include_directories(untitled PRIVATE include)
 target_compile_options(untitled PRIVATE -Wall -Wextra -Wpedantic -Werror)
 target_compile_definitions(untitled PRIVATE CONFIG_PATH="${CMAKE_CURRENT_BINARY_DIR}/config.yaml")
 
 # Copy config.yaml to build dir so it sits next to the executable
 configure_file(${CMAKE_SOURCE_DIR}/config.yaml ${CMAKE_CURRENT_BINARY_DIR}/config.yaml COPYONLY)
+

@@ -6,10 +6,14 @@ platforms = ["linux-64"]
 version = "0.1.0"
 preview = ["pixi-build"]
 
-[tasks]
-cmake = "cmake --preset pixi"
-build = "cmake --build --preset pixi-debug"
-
 [dependencies]
-yaml-cpp = ">=0.8.0,<0.9"
-glaze = { git = "https://github.com/stephenberry/glaze.git", tag = "7.0.0" }
+clang = ">=22"
+
+[tasks]
+cmake = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --preset pixi"
+build = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --build --preset pixi-debug"
+install = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH ./script/install.sh"
+run = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh run"
+test-pcap = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"
+bench = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh bench 250000"
+docs = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH doxygen Doxyfile"

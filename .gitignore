@@ -4,3 +4,6 @@
 
 
 .idea/*
+
+# Generated documentation
+docs/doxygen/
