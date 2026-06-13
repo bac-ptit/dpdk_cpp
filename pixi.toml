@@ -1,0 +1,15 @@
+[workspace]
+authors = ["bac <bacdaiphu@gmail.com>"]
+channels = ["conda-forge"]
+name = "untitled"
+platforms = ["linux-64"]
+version = "0.1.0"
+preview = ["pixi-build"]
+
+[tasks]
+cmake = "cmake --preset pixi"
+build = "cmake --build --preset pixi-debug"
+
+[dependencies]
+yaml-cpp = ">=0.8.0,<0.9"
+glaze = { git = "https://github.com/stephenberry/glaze.git", tag = "7.0.0" }

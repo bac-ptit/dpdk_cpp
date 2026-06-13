@@ -1,0 +1,44 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 4,
+    "minor": 2
+  },
+  "configurePresets": [
+    {
+      "name": "pixi",
+      "displayName": "Pixi Debug",
+      "description": "Configure with pixi environment (Debug)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_STANDARD": "26",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/.pixi/envs/default",
+        "yaml-cpp_DIR": "${sourceDir}/.pixi/envs/default/lib/cmake/yaml-cpp"
+      },
+      "environment": {
+        "PKG_CONFIG_PATH": "${sourceDir}/.pixi/envs/default/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}"
+      }
+    },
+    {
+      "name": "pixi-release",
+      "inherits": "pixi",
+      "displayName": "Pixi Release",
+      "description": "Configure with pixi environment (Release)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "pixi-debug",
+      "configurePreset": "pixi"
+    },
+    {
+      "name": "pixi-release",
+      "configurePreset": "pixi-release"
+    }
+  ]
+}

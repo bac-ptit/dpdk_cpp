@@ -1,0 +1,25 @@
+# Force LF line endings for all text files
+* text=auto eol=lf
+
+# Source files
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.h text eol=lf
+
+# Build system
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
+
+# Config
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# Binary files
+*.o binary
+*.a binary
+*.so binary
+
+# SCM syntax highlighting & preventing 3-way merges
+pixi.lock merge=binary linguist-language=YAML linguist-generated=true -diff

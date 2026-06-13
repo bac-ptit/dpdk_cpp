@@ -1,0 +1,35 @@
+# DPDK Application Configuration
+# All values match current defaults in dpdk_config.hpp
+
+eal:
+  core_mask: "0x3"              # -c: hex bitmask of cores to use
+  memory_channels: 4            # -n: number of memory channels
+  socket_mem: ""                # --socket-mem: per-socket memory (e.g. "256,256")
+  no_huge: false                # --no-huge: disable hugepages
+  no_pci: false                 # --no-pci: disable PCI
+  proc_type: "primary"          # --proc-type: primary/secondary/auto
+  file_prefix: ""               # --file-prefix: unique prefix for shared mem
+  log_level: "7"                # --log-level: 0=none, 8=debug
+
+port:
+  port_mask: "0x1"              # hex bitmask of ports to enable
+  promiscuous: false            # enable promiscuous mode
+  rx_queues: 1                  # RX queues per port
+  tx_queues: 1                  # TX queues per port
+  rx_desc: 1024                 # RX ring descriptors
+  tx_desc: 1024                 # TX ring descriptors
+  link_speed: 0                 # 0 = auto-negotiate
+  link_check_interval_ms: 100   # link status poll interval (ms)
+  link_check_max_count: 90      # max polls before timeout (90 * 100ms = 9s)
+
+mempool:
+  name: "mbuf_pool"
+  num_mbufs: 65536              # minimum mbufs (auto-scaled if too small)
+  cache_size: 256               # per-core mbuf cache size
+  mbuf_size: 2048               # RTE_MBUF_DEFAULT_BUF_SIZE
+
+l2fwd:
+  mac_updating: true            # rewrite src/dst MAC on forward
+  burst_size: 32                # max packets per rx/tx burst
+  rx_queue_per_lcore: 1         # RX queues assigned per lcore
+  timer_period_sec: 10          # stats print interval (0 = disabled)
