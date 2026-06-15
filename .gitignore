@@ -7,3 +7,6 @@
 
 # Generated documentation
 docs/doxygen/
+
+# Local CMake build output
+cmake-build-*/
