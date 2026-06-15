@@ -9,7 +9,7 @@
 
 #include "dpdk_config.hpp"
 
-namespace spi {
+namespace dpdk::spi {
 
 /// L4 protocols supported by the SPI classifier.
 enum class Protocol : std::uint8_t {
@@ -23,27 +23,41 @@ enum class Protocol : std::uint8_t {
 struct PacketMetadata {
   /// Parsed L4 protocol.
   Protocol protocol{};
+  /// IPv4 source address in host byte order.
+  std::uint32_t source_ip_address{};
+  /// IPv4 destination address in host byte order.
+  std::uint32_t destination_ip_address{};
   /// TCP/UDP source port in host byte order.
-  std::uint16_t src_port{};
+  std::uint16_t source_port{};
   /// TCP/UDP destination port in host byte order.
-  std::uint16_t dst_port{};
+  std::uint16_t destination_port{};
 };
 
 /**
  * @brief Startup-compiled classification rule used by the hot path.
  *
- * @note Port value 0 is an internal wildcard generated from an omitted YAML
- *       source or destination port. Runtime matching avoids std::optional.
+ * @note `match_*` flags encode omitted YAML fields as wildcards. Runtime
+ *       matching avoids std::optional and string parsing.
  */
 struct CompiledRule {
   /// L4 protocol that must match.
   Protocol protocol;
-  /// Source port to match, or 0 for any source port.
-  std::uint16_t src_port{};
-  /// Destination port to match, or 0 for any destination port.
-  std::uint16_t dst_port{};
-  /// Worker targets selected when the rule matches.
-  std::vector<std::uint16_t> workers;
+  /// Source IPv4 address to match when match_source_ip_address is true.
+  std::uint32_t source_ip_address{};
+  /// Destination IPv4 address to match when match_destination_ip_address is true.
+  std::uint32_t destination_ip_address{};
+  /// Source port to match when match_source_port is true.
+  std::uint16_t source_port{};
+  /// Destination port to match when match_destination_port is true.
+  std::uint16_t destination_port{};
+  /// Whether the rule constrains source IPv4 address.
+  bool match_source_ip_address{false};
+  /// Whether the rule constrains destination IPv4 address.
+  bool match_destination_ip_address{false};
+  /// Whether the rule constrains source port.
+  bool match_source_port{false};
+  /// Whether the rule constrains destination port.
+  bool match_destination_port{false};
   /// Human-readable classification label.
   std::string label;
 };
@@ -68,7 +82,7 @@ struct ClassificationResult {
  * construction. It does not allocate during Match().
  */
 class RuleTable final {
-public:
+ public:
   /**
    * @brief Take ownership of compiled rules.
    *
@@ -78,17 +92,10 @@ public:
   explicit RuleTable(std::vector<CompiledRule> rules) noexcept;
 
   /// Return the compiled rule storage owned by this table.
-  [[nodiscard]] const std::vector<CompiledRule>& GetRules() const noexcept {
-    return rules_;
-  }
+  [[nodiscard]] const std::vector<CompiledRule>& GetRules() const noexcept { return rules_; }
 
   /// Return the number of compiled rules.
   [[nodiscard]] std::size_t Size() const noexcept { return rules_.size(); }
-  /// Return worker targets configured for the rule at `rule_index`.
-  [[nodiscard]] const std::vector<std::uint16_t>& GetRuleWorkers(
-      std::size_t rule_index) const noexcept {
-    return rules_[rule_index].workers;
-  }
 
   /**
    * @brief Find the first rule matching parsed packet metadata.
@@ -97,10 +104,9 @@ public:
    * @return Classification result for the first matching rule, or std::nullopt
    *         when no rule matches.
    */
-  [[nodiscard]] std::optional<ClassificationResult> Match(
-      const PacketMetadata& packet) const noexcept;
+  [[nodiscard]] std::optional<ClassificationResult> Match(const PacketMetadata& packet) const noexcept;
 
-private:
+ private:
   std::vector<CompiledRule> rules_;
 };
 
@@ -114,7 +120,6 @@ private:
  * @note This function performs allocations during startup only. The resulting
  *       RuleTable is allocation-free during Match().
  */
-[[nodiscard]] std::expected<RuleTable, std::string> CompileRuleTable(
-    const SpiConfig& config) noexcept;
+[[nodiscard]] std::expected<RuleTable, std::string> CompileRuleTable(const SpiConfig& config) noexcept;
 
-}  // namespace spi
+}  // namespace dpdk::spi

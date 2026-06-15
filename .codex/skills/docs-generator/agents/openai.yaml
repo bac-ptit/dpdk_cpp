@@ -1,0 +1,4 @@
+interface:
+  display_name: "Docs Generator"
+  short_description: "Generate C++ API docs with Doxygen"
+  default_prompt: "Use $docs-generator to add Doxygen comments and generate project documentation."

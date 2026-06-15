@@ -13,7 +13,7 @@ BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/build_debug}"
 if [ ! -d "$BUILD_DIR" ] && [ -d "$PROJECT_DIR/cmake-build-debug" ]; then
   BUILD_DIR="$PROJECT_DIR/cmake-build-debug"
 fi
-APP_BINARY="${APP_BINARY:-$BUILD_DIR/untitled}"
+APP_BINARY="${APP_BINARY:-$BUILD_DIR/FastAPI}"
 
 usage() {
   echo "Usage: $0 {setup|run|send|pcap|bench|teardown}"
@@ -98,15 +98,15 @@ cmd_pcap() {
 import yaml
 with open('$config_file') as f:
     cfg = yaml.safe_load(f)
-cfg['eal']['vdevs'] = ['net_pcap0,rx_pcap=${pcap_file},tx_pcap=${tx_pcap_file},infinite_rx=0']
-cfg['eal']['core_list'] = '0-1'
-cfg['mempool']['mbuf_size'] = 2176
-cfg['port']['rx_queues'] = 1
-cfg['port']['tx_queues'] = 1
+cfg['eal']['virtual_devices'] = ['net_pcap0,rx_pcap=${pcap_file},tx_pcap=${tx_pcap_file},infinite_rx=0']
+cfg['eal']['cpu_core_list'] = '0-1'
+cfg['mempool']['memory_buffer_size'] = 2176
+cfg['port']['receive_queues'] = 1
+cfg['port']['transmit_queues'] = 1
 cfg['spi']['worker_count'] = 1
 with open('$config_file', 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
-print('Config updated for PCAP PMD: core_list=0-1, rx_queues=1, tx_queues=1, worker_count=1')
+print('Config updated for PCAP PMD: cpu_core_list=0-1, receive_queues=1, transmit_queues=1, worker_count=1')
 "
 
   echo "[*] Copying config to build dir..."
@@ -144,20 +144,20 @@ cache_size = cfg['mempool'].get('cache_size', 256)
 extra = cache_size * 2 + 512
 mbuf_needed = count + extra
 memory_mb = int(mbuf_needed * 2300 / (1024 * 1024) * 1.5 + 512)
-cfg['eal']['vdevs'] = ['net_pcap0,rx_pcap=${pcap_file},infinite_rx=1']
-cfg['eal']['core_list'] = '0-1'
+cfg['eal']['virtual_devices'] = ['net_pcap0,rx_pcap=${pcap_file},infinite_rx=1']
+cfg['eal']['cpu_core_list'] = '0-1'
 cfg['eal']['memory_size'] = str(memory_mb)
-cfg['eal']['legacy_mem'] = True
+cfg['eal']['legacy_memory'] = True
 cfg['eal'].pop('numa_limit', None)
-cfg['mempool']['mbuf_size'] = 2176
-cfg['mempool']['num_mbufs'] = mbuf_needed
-cfg['port']['rx_queues'] = 1
-cfg['port']['tx_queues'] = 1
+cfg['mempool']['memory_buffer_size'] = 2176
+cfg['mempool']['memory_buffer_count'] = mbuf_needed
+cfg['port']['receive_queues'] = 1
+cfg['port']['transmit_queues'] = 1
 cfg['spi']['worker_count'] = 1
 with open('$config_file', 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
 print(f'Config: {count} pkts, {mbuf_needed} mbufs ({extra} extra), {memory_mb}MB')
-print('PCAP PMD benchmark: forced core_list=0-1, rx_queues=1, tx_queues=1, worker_count=1')
+print('PCAP PMD benchmark: forced cpu_core_list=0-1, receive_queues=1, transmit_queues=1, worker_count=1')
 "
 
   cp "$config_file" "$BUILD_DIR/config.yaml"

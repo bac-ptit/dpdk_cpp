@@ -1,47 +1,55 @@
 eal:
-  core_list: 0-1
+  cpu_core_list: 0-1
   file_prefix: ''
-  legacy_mem: true
+  legacy_memory: true
   log_level: '7'
   memory_channels: 2
   memory_size: '1337'
-  no_huge: true
-  no_pci: true
-  proc_type: primary
-  vdevs:
+  disable_hugepages: true
+  disable_pci: true
+  process_type: primary
+  virtual_devices:
   - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench.pcap,infinite_rx=1
-l2fwd:
+l2_forward:
   burst_size: 64
   mac_updating: true
-  rx_queue_per_lcore: 1
+  receive_queue_per_lcore: 1
   timer_period_sec: 5
 mempool:
   cache_size: 256
-  mbuf_size: 2176
+  memory_buffer_size: 2176
   name: mbuf_pool
-  num_mbufs: 251024
+  memory_buffer_count: 251024
 port:
   link_check_interval_ms: 100
   link_check_max_count: 90
   link_speed: 0
-  port_mask: '0x1'
+  port_bitmask: '0x1'
   promiscuous: false
-  rx_desc: 1024
-  rx_queues: 1
-  tx_desc: 1024
-  tx_queues: 1
+  receive_descriptors: 1024
+  receive_queues: 1
+  transmit_descriptors: 1024
+  transmit_queues: 1
 spi:
   rules:
-  - dst_port: 80
+  - source_ip_address: 10.17.50.1
+    destination_ip_address: 10.17.50.12
+    destination_port: 80
     label: HTTP
     protocol: tcp
-  - dst_port: 443
+  - source_ip_address: 10.17.50.2
+    destination_ip_address: 10.17.50.12
+    destination_port: 443
     label: HTTPS
     protocol: tcp
-  - dst_port: 53
+  - source_ip_address: 10.17.50.3
+    destination_ip_address: 10.17.50.53
+    destination_port: 53
     label: DNS
     protocol: udp
-  - dst_port: 2152
+  - source_ip_address: 10.17.50.4
+    destination_ip_address: 10.17.50.215
+    destination_port: 2152
     label: GTP-U
     protocol: udp
   worker_count: 1

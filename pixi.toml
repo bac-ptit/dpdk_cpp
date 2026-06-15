@@ -1,7 +1,7 @@
 [workspace]
 authors = ["bac <bacdaiphu@gmail.com>"]
 channels = ["conda-forge"]
-name = "untitled"
+name = "FastAPI"
 platforms = ["linux-64"]
 version = "0.1.0"
 preview = ["pixi-build"]
@@ -12,6 +12,7 @@ clang = ">=22"
 [tasks]
 cmake = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --preset pixi"
 build = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --build --preset pixi-debug"
+clean = "rm -rf cmake-build-debug build_debug build"
 install = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH ./script/install.sh"
 run = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh run"
 test-pcap = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"

@@ -9,13 +9,13 @@ Build system: CMake 4.2+, compiler: C++26 with `-fno-exceptions`.
 ### Step 1: Try CLion MCP Build First
 Always attempt `mcp__clion__build_project` first:
 ```
-mcp__clion__build_project(projectPath="/home/bac/CLionProjects/untitled")
+mcp__clion__build_project(projectPath="/home/bac/programming/viettel/dpdk_cpp")
 ```
 
 ### Step 2: Fallback to CLI if MCP Fails
 If MCP build fails or returns errors, compile via CLI:
 ```bash
-cd /home/bac/CLionProjects/untitled/cmake-build-debug && cmake --build . --target untitled
+cd /home/bac/programming/viettel/dpdk_cpp/cmake-build-debug && cmake --build . --target FastAPI
 ```
 
 ### Step 3: Report Results
@@ -71,8 +71,9 @@ Read ALL rule files before generating or reviewing code:
 ```
 main.cpp                    — entry point, config loading
 include/
-  dpdk_config.hpp           — config structs (EalConfig, PortConfig, MempoolConfig, L2fwdConfig)
-  dpdk_environment.hpp      — Environment class declaration
-  dpdk_environment.cpp      — Environment class implementation
-  dpkg.hpp                  — (additional header)
+  dpdk/
+    dpdk.hpp                — umbrella public include
+    dpdk_config.hpp         — config structs (EalConfig, PortConfig, MempoolConfig, L2fwdConfig)
+    dpdk_environment.hpp    — Environment class declaration
+    dpdk_environment.cpp    — Environment class implementation
 ```

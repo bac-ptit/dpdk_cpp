@@ -48,12 +48,15 @@ def build_small_pcap(path):
     """Generate 20 packets (5 per rule) for correctness testing."""
     dst_mac = 'a0:36:bc:65:8f:11'
     src_mac = '00:00:00:00:00:01'
-    dst_ip = '10.17.50.12'
-    src_ip = '10.17.50.1'
     pcap = bytearray(pcap_global_header())
     ts = 1000
-    ports = [(80, 'tcp'), (443, 'tcp'), (53, 'udp'), (2152, 'udp')]
-    for port, proto in ports:
+    rules = [
+        ('tcp', '10.17.50.1', '10.17.50.12', 80),
+        ('tcp', '10.17.50.2', '10.17.50.12', 443),
+        ('udp', '10.17.50.3', '10.17.50.53', 53),
+        ('udp', '10.17.50.4', '10.17.50.215', 2152),
+    ]
+    for proto, src_ip, dst_ip, port in rules:
         for i in range(5):
             pkt = make_packet(proto, dst_mac, src_mac, src_ip, dst_ip, 12345 + i, port)
             pcap.extend(pcap_pkt_hdr(ts, len(pkt)))

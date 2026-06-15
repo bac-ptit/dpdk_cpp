@@ -6,9 +6,10 @@
 
 High-speed shallow packet inspection with DPDK and modern C++.
 
-The project receives packets, reads Ethernet/IPv4/TCP/UDP headers, classifies
-traffic by service port, updates L2 forwarding headers, and sends packets back
-out through DPDK.
+The project receives packets, reads Ethernet/IPv4/TCP/UDP headers, matches
+traffic against SPI rules with source/destination IP, source/destination port,
+and protocol fields, updates L2 forwarding headers, and sends packets back out
+through DPDK.
 
 ```text
 RX -> Parse headers -> Match SPI rule -> Update L2 -> TX
@@ -18,17 +19,17 @@ RX -> Parse headers -> Match SPI rule -> Update L2 -> TX
 
 | Traffic | Label |
 |---------|-------|
-| TCP dst port `80` | `HTTP` |
-| TCP dst port `443` | `HTTPS` |
-| UDP dst port `53` | `DNS` |
-| UDP dst port `2152` | `GTP-U` |
+| TCP `10.17.50.1 -> 10.17.50.12`, dst port `80` | `HTTP` |
+| TCP `10.17.50.2 -> 10.17.50.12`, dst port `443` | `HTTPS` |
+| UDP `10.17.50.3 -> 10.17.50.53`, dst port `53` | `DNS` |
+| UDP `10.17.50.4 -> 10.17.50.215`, dst port `2152` | `GTP-U` |
 
 ## Project Shape
 
 ```text
 .
 ├── config.yaml              # Runtime config
-├── include/                 # DPDK wrapper + SPI pipeline
+├── include/dpdk/            # DPDK wrapper + SPI pipeline
 ├── script/install.sh        # Configure, build, set capabilities
 ├── test/test_env.sh         # PCAP tests and benchmark helper
 ├── test/gen_test_pcap.py    # Test traffic generator
@@ -60,7 +61,7 @@ pixi run install
 The binary is created at:
 
 ```text
-cmake-build-debug/untitled
+cmake-build-debug/FastAPI
 ```
 
 ## Run
