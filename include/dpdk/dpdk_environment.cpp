@@ -57,7 +57,7 @@ struct EalArgs {
  * @return Void on success, or a DpdkError describing the failure.
  */
 [[nodiscard]] std::expected<void, dpdk::DpdkError> CheckNonZeroResult(int dpdk_result,
-                                                                       std::string_view function_name) noexcept {
+                                                                      std::string_view function_name) noexcept {
   if (dpdk_result != 0) {
     return std::unexpected(
         dpdk::DpdkError{.message = std::format("{} failed (ret={})", function_name, dpdk_result), .dpdk_errno = errno});
@@ -249,12 +249,12 @@ std::expected<void, DpdkError> Environment::InitEal() noexcept {
  */
 std::expected<void, DpdkError> Environment::CreateMempool() noexcept {
   const auto& mempool_config{config_.mempool};
-  const auto num_mbufs{
-      static_cast<unsigned>(std::max(mempool_config.memory_buffer_count, static_cast<std::size_t>(port_count_) * 1024U))};
+  const auto num_mbufs{static_cast<unsigned>(
+      std::max(mempool_config.memory_buffer_count, static_cast<std::size_t>(port_count_) * 1024U))};
 
-  memory_buffer_pool_ =
-      rte_pktmbuf_pool_create(mempool_config.name.c_str(), num_mbufs, static_cast<unsigned>(mempool_config.cache_size),
-                              0, static_cast<unsigned>(mempool_config.memory_buffer_size), static_cast<int>(rte_socket_id()));
+  memory_buffer_pool_ = rte_pktmbuf_pool_create(
+      mempool_config.name.c_str(), num_mbufs, static_cast<unsigned>(mempool_config.cache_size), 0,
+      static_cast<unsigned>(mempool_config.memory_buffer_size), static_cast<int>(rte_socket_id()));
 
   if (memory_buffer_pool_ == nullptr) {
     return std::unexpected(DpdkError{.message = std::format("rte_pktmbuf_pool_create '{}' failed (rte_errno={}: {})",
@@ -333,13 +333,13 @@ std::expected<void, DpdkError> Environment::SetupPort(std::uint16_t port_id) noe
     return std::unexpected(setup_info.error());
   }
 
-  if (const auto receive_result{SetupReceiveQueues(port_id, setup_info->dev_info, setup_info->port_conf,
-                                                   setup_info->receive_descriptors)};
+  if (const auto receive_result{
+          SetupReceiveQueues(port_id, setup_info->dev_info, setup_info->port_conf, setup_info->receive_descriptors)};
       !receive_result) {
     return std::unexpected(receive_result.error());
   }
-  if (const auto transmit_result{SetupTransmitQueues(port_id, setup_info->dev_info, setup_info->port_conf,
-                                                     setup_info->transmit_descriptors)};
+  if (const auto transmit_result{
+          SetupTransmitQueues(port_id, setup_info->dev_info, setup_info->port_conf, setup_info->transmit_descriptors)};
       !transmit_result) {
     return std::unexpected(transmit_result.error());
   }
@@ -374,14 +374,16 @@ std::expected<Environment::PortSetupInfo, DpdkError> Environment::ConfigurePort(
     return std::unexpected(info_result.error());
   }
   if (port_config.receive_queues > dev_info.max_rx_queues) {
-    return std::unexpected(DpdkError{.message = std::format("port {} receive_queues={} exceeds PMD max_rx_queues={}",
-                                                            port_id, port_config.receive_queues, dev_info.max_rx_queues),
-                                     .dpdk_errno = 0});
+    return std::unexpected(
+        DpdkError{.message = std::format("port {} receive_queues={} exceeds PMD max_rx_queues={}", port_id,
+                                         port_config.receive_queues, dev_info.max_rx_queues),
+                  .dpdk_errno = 0});
   }
   if (port_config.transmit_queues > dev_info.max_tx_queues) {
-    return std::unexpected(DpdkError{.message = std::format("port {} transmit_queues={} exceeds PMD max_tx_queues={}",
-                                                            port_id, port_config.transmit_queues, dev_info.max_tx_queues),
-                                     .dpdk_errno = 0});
+    return std::unexpected(
+        DpdkError{.message = std::format("port {} transmit_queues={} exceeds PMD max_tx_queues={}", port_id,
+                                         port_config.transmit_queues, dev_info.max_tx_queues),
+                  .dpdk_errno = 0});
   }
 
   auto local_port_conf{default_port_conf_};
@@ -440,10 +442,9 @@ std::expected<Environment::PortSetupInfo, DpdkError> Environment::ConfigurePort(
  * @param receive_descriptors  Descriptors per RX queue.
  * @return Void on success, or a DpdkError.
  */
-std::expected<void, DpdkError> Environment::SetupReceiveQueues(std::uint16_t port_id,
-                                                          const rte_eth_dev_info& dev_info,
-                                                          const rte_eth_conf& port_conf,
-                                                          std::uint16_t receive_descriptors) const noexcept {
+std::expected<void, DpdkError> Environment::SetupReceiveQueues(std::uint16_t port_id, const rte_eth_dev_info& dev_info,
+                                                               const rte_eth_conf& port_conf,
+                                                               std::uint16_t receive_descriptors) const noexcept {
   for (std::uint16_t queue_id{0}; queue_id < config_.port.receive_queues; ++queue_id) {
     rte_eth_rxconf receive_queue_conf{dev_info.default_rxconf};
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
@@ -469,19 +470,18 @@ std::expected<void, DpdkError> Environment::SetupReceiveQueues(std::uint16_t por
  * @param transmit_descriptors  Descriptors per TX queue.
  * @return Void on success, or a DpdkError.
  */
-std::expected<void, DpdkError> Environment::SetupTransmitQueues(std::uint16_t port_id,
-                                                           const rte_eth_dev_info& dev_info,
-                                                           const rte_eth_conf& port_conf,
-                                                           std::uint16_t transmit_descriptors) const noexcept {
+std::expected<void, DpdkError> Environment::SetupTransmitQueues(std::uint16_t port_id, const rte_eth_dev_info& dev_info,
+                                                                const rte_eth_conf& port_conf,
+                                                                std::uint16_t transmit_descriptors) const noexcept {
   for (std::uint16_t queue_id{0}; queue_id < config_.port.transmit_queues; ++queue_id) {
     rte_eth_txconf transmit_queue_conf{dev_info.default_txconf};
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
     transmit_queue_conf.offloads = port_conf.txmode.offloads;
 
-    if (const auto transmit_setup_result{CheckNegativeResult(
-            rte_eth_tx_queue_setup(port_id, queue_id, transmit_descriptors, rte_eth_dev_socket_id(port_id),
-                                   &transmit_queue_conf),
-            "rte_eth_tx_queue_setup")};
+    if (const auto transmit_setup_result{
+            CheckNegativeResult(rte_eth_tx_queue_setup(port_id, queue_id, transmit_descriptors,
+                                                       rte_eth_dev_socket_id(port_id), &transmit_queue_conf),
+                                "rte_eth_tx_queue_setup")};
         !transmit_setup_result) {
       return std::unexpected(transmit_setup_result.error());
     }

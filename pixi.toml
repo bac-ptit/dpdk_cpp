@@ -8,6 +8,7 @@ preview = ["pixi-build"]
 
 [dependencies]
 clang = ">=22"
+cmake = ">=4.0"
 
 [tasks]
 cmake = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --preset pixi"

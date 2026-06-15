@@ -1,5 +1,7 @@
 #pragma once
 
+#include <rte_ether.h>
+
 #include <array>
 #include <atomic>
 #include <csignal>
@@ -37,15 +39,40 @@ struct alignas(64) AtomicCounters {
   std::atomic<std::uint64_t> dropped{};
 };
 
+/// Startup-compiled IPv4 route used by the L3 forwarding path.
+struct L3RouteEntry {
+  /// Destination network in host byte order.
+  std::uint32_t network_address{};
+  /// Prefix mask in host byte order.
+  std::uint32_t prefix_mask{};
+  /// CIDR prefix length.
+  std::uint16_t prefix_length{};
+  /// Output DPDK port.
+  std::uint16_t output_port{};
+};
+
+/// Startup-compiled destination MAC for an output port.
+struct EthernetDestinationEntry {
+  /// Output DPDK port.
+  std::uint16_t port_id{};
+  /// Destination MAC to use on that port.
+  rte_ether_addr mac_address{};
+};
+
 /// Per-worker state passed to the worker loop function.
 struct WorkerContext {
   const dpdk::Environment* environment{};
   const RuleTable* rules{};
+  const std::vector<L3RouteEntry>* l3_routes{};
+  const std::vector<EthernetDestinationEntry>* ethernet_destinations{};
   AtomicCounters* counters{};
   std::vector<std::uint64_t> rule_match_counts;
   const volatile std::sig_atomic_t* force_quit{};
   std::uint16_t burst_size{};
   std::uint16_t worker_id{};
+  bool mac_updating{true};
+  bool l3_forwarding{false};
+  bool drop_unmatched{false};
 };
 
 /**
@@ -63,9 +90,12 @@ class Pipeline final {
    * @param rules        Compiled rule table owned by caller.
    * @param burst_size   Packets per rte_eth_rx_burst call.
    * @param worker_count Number of worker lcores to launch.
+   * @param mac_updating Whether to rewrite Ethernet source/destination MACs.
+   * @param l3_forward   L3 forwarding configuration loaded from YAML.
+   * @param drop_unmatched Whether to drop packets that match no SPI rule.
    */
   Pipeline(const dpdk::Environment& environment, const RuleTable& rules, std::uint16_t burst_size,
-           std::uint16_t worker_count);
+           std::uint16_t worker_count, bool mac_updating, L3ForwardConfig l3_forward, bool drop_unmatched);
 
   /// Stop all workers and release per-worker resources.
   ~Pipeline();
@@ -106,14 +136,14 @@ class Pipeline final {
    * @brief Run the hot path on the calling (main) lcore.
    * @return Final pipeline statistics.
    */
-  [[nodiscard]] std::expected<PipelineStats, std::string> RunSingleWorker(
-      const volatile std::sig_atomic_t& force_quit, std::uint32_t timer_period_sec) noexcept;
+  [[nodiscard]] std::expected<PipelineStats, std::string> RunSingleWorker(const volatile std::sig_atomic_t& force_quit,
+                                                                          std::uint32_t timer_period_sec) noexcept;
   /**
    * @brief Run workers on remote lcores, poll on main lcore.
    * @return Final pipeline statistics.
    */
-  [[nodiscard]] std::expected<PipelineStats, std::string> RunMultiWorker(
-      const volatile std::sig_atomic_t& force_quit, std::uint32_t timer_period_sec) noexcept;
+  [[nodiscard]] std::expected<PipelineStats, std::string> RunMultiWorker(const volatile std::sig_atomic_t& force_quit,
+                                                                         std::uint32_t timer_period_sec) noexcept;
   /**
    * @brief Fill a WorkerContext with pointers to shared state.
    * @param context    Worker context to populate.
@@ -136,7 +166,12 @@ class Pipeline final {
   AtomicCounters counters_;
   std::vector<std::uint64_t> rule_match_counts_;
   std::vector<WorkerContext> worker_contexts_;
+  std::vector<L3RouteEntry> l3_routes_;
+  std::vector<EthernetDestinationEntry> ethernet_destinations_;
   std::uint16_t burst_size_{};
+  bool mac_updating_{true};
+  bool l3_forwarding_{false};
+  bool drop_unmatched_{false};
   volatile std::sig_atomic_t worker_force_quit_{0};
   bool workers_started_{false};
 };

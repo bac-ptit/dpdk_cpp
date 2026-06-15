@@ -39,6 +39,8 @@ class Environment final {
 
   Environment(const Environment&) = delete;
   Environment& operator=(const Environment&) = delete;
+  Environment(Environment&&) = delete;
+  Environment& operator=(Environment&&) = delete;
 
   /**
    * @brief Run all initialization steps: EAL, mempool, ports, link check.
@@ -141,7 +143,7 @@ class Environment final {
                                                                   const rte_eth_conf& port_conf,
                                                                   std::uint16_t receive_descriptors) const noexcept;
   /**
-   * @brief Set up all transmit queues for the given port.
+   * @brief Set up all transmitted queues for the given port.
    * @param port_id               DPDK port identifier.
    * @param dev_info              Device info from rte_eth_dev_info_get.
    * @param port_conf             Port configuration after RSS setup.

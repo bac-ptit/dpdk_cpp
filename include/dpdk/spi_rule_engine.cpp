@@ -16,7 +16,7 @@ namespace {
  * @param protocol  Protocol string ("tcp" or "udp").
  * @return Protocol enum value, or nullopt for unknown strings.
  */
-[[nodiscard]] constexpr std::optional<Protocol> ParseProtocol(std::string_view protocol) noexcept {
+[[nodiscard]] constexpr std::optional<Protocol> ParseProtocol(const std::string_view protocol) noexcept {
   if (protocol == "tcp") {
     return Protocol::kTcp;
   }
@@ -122,18 +122,10 @@ std::expected<RuleTable, std::string> CompileRuleTable(const SpiConfig& config) 
       destination_ip_address = *parsed;
     }
 
-    rules.emplace_back(CompiledRule{
-        .protocol = *protocol,
-        .source_ip_address = source_ip_address,
-        .destination_ip_address = destination_ip_address,
-        .source_port = rule_config.source_port.value_or(0),
-        .destination_port = rule_config.destination_port.value_or(0),
-        .match_source_ip_address = rule_config.source_ip_address.has_value(),
-        .match_destination_ip_address = rule_config.destination_ip_address.has_value(),
-        .match_source_port = rule_config.source_port.has_value(),
-        .match_destination_port = rule_config.destination_port.has_value(),
-        .label = rule_config.label,
-    });
+    rules.emplace_back(*protocol, source_ip_address, destination_ip_address, rule_config.source_port.value_or(0),
+                       rule_config.destination_port.value_or(0), rule_config.source_ip_address.has_value(),
+                       rule_config.destination_ip_address.has_value(), rule_config.source_port.has_value(),
+                       rule_config.destination_port.has_value(), rule_config.label);
   }
 
   return RuleTable{std::move(rules)};

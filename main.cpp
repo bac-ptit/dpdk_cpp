@@ -1,8 +1,7 @@
 #include <cstddef>
+#include <dpdk/dpdk.hpp>
 #include <print>
 #include <utility>
-
-#include <dpdk/dpdk.hpp>
 
 /**
  * @brief Application entry point.
@@ -39,8 +38,11 @@ int main() {
 
   // Preserve runtime settings before DpdkConfig is moved into Environment.
   const auto burst_size{config->l2_forward.burst_size};
+  const bool mac_updating{config->l2_forward.mac_updating};
+  const auto l3_forward{config->l3_forward};
   const auto timer_period_sec{config->l2_forward.timer_period_sec};
   const auto worker_count{config->spi.worker_count};
+  const bool drop_unmatched{config->spi.drop_unmatched};
 
   // Environment owns EAL, mempool, ports, queues, and link startup.
   auto env{dpdk::Environment{std::move(*config)}};
@@ -50,7 +52,7 @@ int main() {
   }
 
   // Pipeline receives packets, classifies them, and forwards the mbufs.
-  dpdk::spi::Pipeline pipeline{env, *rule_table, burst_size, worker_count};
+  dpdk::spi::Pipeline pipeline{env, *rule_table, burst_size, worker_count, mac_updating, l3_forward, drop_unmatched};
   const auto stats{pipeline.RunUntilStopped(dpdk::ForceQuitFlag(), timer_period_sec)};
   if (!stats) {
     std::println(stderr, "Pipeline error: {}", stats.error());

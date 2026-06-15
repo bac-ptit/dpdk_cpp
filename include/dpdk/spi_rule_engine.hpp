@@ -91,6 +91,12 @@ class RuleTable final {
    */
   explicit RuleTable(std::vector<CompiledRule> rules) noexcept;
 
+  RuleTable(const RuleTable&) = delete;
+  RuleTable& operator=(const RuleTable&) = delete;
+  RuleTable(RuleTable&&) = default;
+  RuleTable& operator=(RuleTable&&) = default;
+  ~RuleTable() = default;
+
   /// Return the compiled rule storage owned by this table.
   [[nodiscard]] const std::vector<CompiledRule>& GetRules() const noexcept { return rules_; }
 

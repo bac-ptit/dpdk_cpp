@@ -4,18 +4,25 @@
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_ip.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_tcp.h>
+#include <rte_udp.h>
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <print>
 #include <span>
+#include <string_view>
+#include <utility>
 #include <vector>
 
+#include "spi_ip_address.hpp"
 #include "spi_packet_parser.hpp"
 
 namespace dpdk::spi {
@@ -37,6 +44,83 @@ struct BurstCounters {
   std::uint64_t malformed{};
   std::uint64_t dropped{};
 };
+
+/// Classification outcome for one packet.
+struct PacketClassification {
+  PacketMetadata metadata{};
+  bool parsed{false};
+  bool matched{false};
+};
+
+/// Return a host-byte-order IPv4 prefix mask.
+[[nodiscard]] constexpr std::uint32_t PrefixMask(std::uint16_t prefix_length) noexcept {
+  if (prefix_length == 0) {
+    return 0;
+  }
+  return UINT32_MAX << (32U - prefix_length);
+}
+
+/// Convert one hexadecimal character to its numeric value.
+[[nodiscard]] constexpr std::uint8_t HexValue(char value) noexcept {
+  if (value >= '0' && value <= '9') {
+    return static_cast<std::uint8_t>(value - '0');
+  }
+  if (value >= 'a' && value <= 'f') {
+    return static_cast<std::uint8_t>(value - 'a' + 10);
+  }
+  return static_cast<std::uint8_t>(value - 'A' + 10);
+}
+
+/// Parse a validated MM:MM:MM:MM:MM:MM MAC address.
+[[nodiscard]] constexpr rte_ether_addr ParseMacAddress(std::string_view mac_address) noexcept {
+  rte_ether_addr parsed{};
+  for (std::size_t byte_index{0}; byte_index < RTE_ETHER_ADDR_LEN; ++byte_index) {
+    const auto string_index{byte_index * 3U};
+    parsed.addr_bytes[byte_index] = static_cast<std::uint8_t>((HexValue(mac_address[string_index]) << 4U) |
+                                                              HexValue(mac_address[string_index + 1U]));
+  }
+  return parsed;
+}
+
+/// Build startup L3 route table from YAML config.
+[[nodiscard]] std::vector<L3RouteEntry> BuildL3Routes(const L3ForwardConfig& config) noexcept {
+  std::vector<L3RouteEntry> routes;
+  routes.reserve(config.ipv4_routes.size());
+
+  for (const auto& route : config.ipv4_routes) {
+    const auto parsed_address{ParseIpv4Address(route.destination_ip_address)};
+    if (!parsed_address) {
+      continue;
+    }
+
+    const auto mask{PrefixMask(route.prefix_length)};
+    routes.emplace_back(L3RouteEntry{
+        .network_address = *parsed_address & mask,
+        .prefix_mask = mask,
+        .prefix_length = route.prefix_length,
+        .output_port = route.output_port,
+    });
+  }
+
+  std::ranges::sort(
+      routes, [](const L3RouteEntry& lhs, const L3RouteEntry& rhs) { return lhs.prefix_length > rhs.prefix_length; });
+  return routes;
+}
+
+/// Build startup destination-MAC table from YAML config.
+[[nodiscard]] std::vector<EthernetDestinationEntry> BuildEthernetDestinations(const L3ForwardConfig& config) noexcept {
+  std::vector<EthernetDestinationEntry> destinations;
+  destinations.reserve(config.ethernet_destinations.size());
+
+  for (const auto& destination : config.ethernet_destinations) {
+    destinations.emplace_back(EthernetDestinationEntry{
+        .port_id = destination.port_id,
+        .mac_address = ParseMacAddress(destination.mac_address),
+    });
+  }
+
+  return destinations;
+}
 
 /**
  * @brief Determine the transmit port paired with the receive port.
@@ -69,6 +153,28 @@ struct BurstCounters {
   return receive_port;
 }
 
+/// Look up output port via longest-prefix IPv4 route match.
+[[nodiscard]] std::optional<std::uint16_t> LookupL3TransmitPort(const std::vector<L3RouteEntry>& routes,
+                                                                const PacketMetadata& metadata) noexcept {
+  for (const auto& route : routes) {
+    if ((metadata.destination_ip_address & route.prefix_mask) == route.network_address) {
+      return route.output_port;
+    }
+  }
+  return std::nullopt;
+}
+
+/// Look up configured destination MAC for an output port.
+[[nodiscard]] const rte_ether_addr* GetEthernetDestination(const std::vector<EthernetDestinationEntry>& destinations,
+                                                           std::uint16_t port_id) noexcept {
+  for (const auto& destination : destinations) {
+    if (destination.port_id == port_id) {
+      return &destination.mac_address;
+    }
+  }
+  return nullptr;
+}
+
 /**
  * @brief Rewrite Ethernet source/destination MACs for L2 forwarding.
  *
@@ -79,14 +185,68 @@ struct BurstCounters {
  * @param src_addr       Source MAC (transmit port's real address).
  * @param transmit_port  Port ID embedded in the destination MAC.
  */
-void UpdateL2ForwardMacs(const rte_mbuf& packet, const rte_ether_addr& src_addr,
-                          std::uint16_t transmit_port) noexcept {
+void UpdateL2ForwardMacs(const rte_mbuf& packet, const rte_ether_addr& src_addr, std::uint16_t transmit_port) noexcept {
   auto* eth_hdr{rte_pktmbuf_mtod(&packet, rte_ether_hdr*)};
   rte_ether_addr dst_addr{};
   dst_addr.addr_bytes[kLocalAdminMacByteIndex] = kLocalAdminMacPrefix;
   dst_addr.addr_bytes[kPortMacByteIndex] = static_cast<std::uint8_t>(transmit_port);
   rte_ether_addr_copy(&dst_addr, &eth_hdr->dst_addr);
   rte_ether_addr_copy(&src_addr, &eth_hdr->src_addr);
+}
+
+/// Recompute IPv4 TCP/UDP checksum after L3 header updates.
+[[nodiscard]] bool RecomputeL4Checksum(rte_mbuf& packet, rte_ipv4_hdr& ipv4_hdr) noexcept {
+  const auto ipv4_header_len{rte_ipv4_hdr_len(&ipv4_hdr)};
+  const auto l4_offset{static_cast<std::uint16_t>(sizeof(rte_ether_hdr) + ipv4_header_len)};
+
+  packet.ol_flags &= ~RTE_MBUF_F_TX_OFFLOAD_MASK;
+
+  if (ipv4_hdr.next_proto_id == IPPROTO_TCP) {
+    if (rte_pktmbuf_data_len(&packet) < l4_offset + sizeof(rte_tcp_hdr)) {
+      return false;
+    }
+
+    auto* tcp_hdr{rte_pktmbuf_mtod_offset(&packet, rte_tcp_hdr*, l4_offset)};
+    tcp_hdr->cksum = 0;
+    tcp_hdr->cksum = rte_ipv4_udptcp_cksum_mbuf(&packet, &ipv4_hdr, l4_offset);
+    return true;
+  }
+
+  if (ipv4_hdr.next_proto_id == IPPROTO_UDP) {
+    if (rte_pktmbuf_data_len(&packet) < l4_offset + sizeof(rte_udp_hdr)) {
+      return false;
+    }
+
+    auto* udp_hdr{rte_pktmbuf_mtod_offset(&packet, rte_udp_hdr*, l4_offset)};
+    udp_hdr->dgram_cksum = 0;
+    udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum_mbuf(&packet, &ipv4_hdr, l4_offset);
+  }
+
+  return true;
+}
+
+/**
+ * @brief Rewrite Ethernet MACs and decrement IPv4 TTL for L3 forwarding.
+ * @param packet    The mbuf whose Ethernet/IPv4 headers are modified.
+ * @param src_addr  Source MAC from the output DPDK port.
+ * @param dst_addr  Destination MAC for the next hop/VM.
+ * @return true on success, false if TTL expired.
+ */
+[[nodiscard]] bool UpdateL3ForwardHeaders(rte_mbuf& packet, const rte_ether_addr& src_addr,
+                                          const rte_ether_addr& dst_addr) noexcept {
+  auto* eth_hdr{rte_pktmbuf_mtod(&packet, rte_ether_hdr*)};
+  rte_ether_addr_copy(&dst_addr, &eth_hdr->dst_addr);
+  rte_ether_addr_copy(&src_addr, &eth_hdr->src_addr);
+
+  auto* ipv4_hdr{rte_pktmbuf_mtod_offset(&packet, rte_ipv4_hdr*, sizeof(rte_ether_hdr))};
+  if (ipv4_hdr->time_to_live <= 1U) {
+    return false;
+  }
+
+  --ipv4_hdr->time_to_live;
+  ipv4_hdr->hdr_checksum = 0;
+  ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
+  return RecomputeL4Checksum(packet, *ipv4_hdr);
 }
 
 /// Relaxed load from an atomic counter.
@@ -206,19 +366,32 @@ void PrintWorkerLcores(const std::vector<unsigned>& worker_lcores) noexcept {
  * @param context  Worker context with rule table and counters.
  * @param counters  Per-burst counters (updated in place).
  * @param packet    The mbuf to classify.
+ * @return Parsed metadata plus whether a SPI rule matched.
  */
-void ClassifyPacket(WorkerContext& context, BurstCounters& counters, const rte_mbuf& packet) noexcept {
+[[nodiscard]] PacketClassification ClassifyPacket(WorkerContext& context, BurstCounters& counters,
+                                                  const rte_mbuf& packet) noexcept {
   if (const auto metadata{ParsePacket(packet)}) {
     ++counters.parsed;
     if (const auto match{context.rules->Match(*metadata)}) {
       ++counters.matched;
       ++context.rule_match_counts[match->rule_index];
-    } else {
-      ++counters.unknown;
+      return PacketClassification{
+          .metadata = *metadata,
+          .parsed = true,
+          .matched = true,
+      };
     }
-  } else {
-    ++counters.malformed;
+
+    ++counters.unknown;
+    return PacketClassification{
+        .metadata = *metadata,
+        .parsed = true,
+        .matched = false,
+    };
   }
+
+  ++counters.malformed;
+  return {};
 }
 
 /// Prefetch each packet in the burst into the CPU cache.
@@ -229,7 +402,7 @@ void PrefetchPackets(std::span<rte_mbuf*> packets) noexcept {
 }
 
 /**
- * @brief Classify, rewrite MAC, and enqueue for TX.
+ * @brief Classify, optionally rewrite MAC, and enqueue for TX.
  *
  * If the transmit port is out of range, the packet is dropped.
  * @param context           Worker context.
@@ -244,7 +417,36 @@ void ForwardPacket(WorkerContext& context, const std::vector<std::uint16_t>& act
                    rte_mbuf* packet, std::uint16_t receive_port,
                    std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
                    std::vector<std::uint16_t>& transmit_counts) noexcept {
-  const auto transmit_port{GetTransmitPort(active_ports, receive_port)};
+  const auto classification{ClassifyPacket(context, counters, *packet)};
+  if (context.drop_unmatched && !classification.matched) {
+    ++counters.dropped;
+    rte_pktmbuf_free(packet);
+    return;
+  }
+
+  auto transmit_port{GetTransmitPort(active_ports, receive_port)};
+
+  if (context.l3_forwarding) {
+    if (!classification.parsed || context.l3_routes == nullptr || context.ethernet_destinations == nullptr) {
+      ++counters.dropped;
+      rte_pktmbuf_free(packet);
+      return;
+    }
+
+    const auto l3_transmit_port{LookupL3TransmitPort(*context.l3_routes, classification.metadata)};
+    if (!l3_transmit_port) {
+      ++counters.dropped;
+      rte_pktmbuf_free(packet);
+      return;
+    }
+    if (*l3_transmit_port == receive_port) {
+      ++counters.dropped;
+      rte_pktmbuf_free(packet);
+      return;
+    }
+    transmit_port = *l3_transmit_port;
+  }
+
   const auto* transmit_mac{context.environment->GetPortMacAddress(transmit_port)};
   if (transmit_mac == nullptr || transmit_port >= transmit_buffers.size()) {
     ++counters.dropped;
@@ -252,10 +454,20 @@ void ForwardPacket(WorkerContext& context, const std::vector<std::uint16_t>& act
     return;
   }
 
-  ClassifyPacket(context, counters, *packet);
-  UpdateL2ForwardMacs(*packet, *transmit_mac, transmit_port);
-  auto* tx_buffer{transmit_buffers[transmit_port].data()};
-  tx_buffer[transmit_counts[transmit_port]++] = packet;
+  if (context.l3_forwarding) {
+    const auto* destination_mac{GetEthernetDestination(*context.ethernet_destinations, transmit_port)};
+    if (destination_mac == nullptr || !UpdateL3ForwardHeaders(*packet, *transmit_mac, *destination_mac)) {
+      ++counters.dropped;
+      rte_pktmbuf_free(packet);
+      return;
+    }
+  } else if (context.mac_updating) {
+    UpdateL2ForwardMacs(*packet, *transmit_mac, transmit_port);
+  }
+
+  auto& count{transmit_counts[transmit_port]};
+  *std::next(transmit_buffers[transmit_port].data(), static_cast<std::ptrdiff_t>(count)) = packet;
+  ++count;
 }
 
 /**
@@ -281,8 +493,9 @@ void FlushTransmitBuffers(WorkerContext const& context,
     if (sent < count) {
       counters.dropped += static_cast<std::uint64_t>(count - sent);
     }
-    for (auto i{sent}; i < count; ++i) {
-      rte_pktmbuf_free(transmit_buffers[port_id][i]);
+    for (const std::span<rte_mbuf*, kMaxBurstCapacity> buff{transmit_buffers[port_id]};
+         auto*& pkt : buff.subspan(sent, count - sent)) {
+      rte_pktmbuf_free(pkt);
     }
     transmit_counts[port_id] = 0;
   }
@@ -359,12 +572,17 @@ int WorkerLoop(void* arg) noexcept {
 }  // namespace
 
 Pipeline::Pipeline(const dpdk::Environment& environment, const RuleTable& rules, std::uint16_t burst_size,
-                   std::uint16_t worker_count)
+                   std::uint16_t worker_count, bool mac_updating, L3ForwardConfig l3_forward, bool drop_unmatched)
     : environment_{environment},
       rules_{rules},
       rule_match_counts_(rules.Size()),
       worker_contexts_(worker_count),
-      burst_size_{std::clamp(burst_size, kMinBurstCapacity, kMaxBurstCapacity)} {}
+      l3_routes_{BuildL3Routes(l3_forward)},
+      ethernet_destinations_{BuildEthernetDestinations(l3_forward)},
+      burst_size_{std::clamp(burst_size, kMinBurstCapacity, kMaxBurstCapacity)},
+      mac_updating_{mac_updating},
+      l3_forwarding_{l3_forward.enabled},
+      drop_unmatched_{drop_unmatched} {}
 
 Pipeline::~Pipeline() { StopWorkers(); }
 
@@ -420,15 +638,20 @@ void Pipeline::PrepareWorkerContext(WorkerContext& context, const volatile std::
                                     std::uint16_t worker_id) noexcept {
   context.environment = &environment_;
   context.rules = &rules_;
+  context.l3_routes = &l3_routes_;
+  context.ethernet_destinations = &ethernet_destinations_;
   context.counters = &counters_;
   context.rule_match_counts.assign(rules_.Size(), 0);
   context.force_quit = &force_quit;
   context.burst_size = burst_size_;
   context.worker_id = worker_id;
+  context.mac_updating = mac_updating_;
+  context.l3_forwarding = l3_forwarding_;
+  context.drop_unmatched = drop_unmatched_;
 }
 
 std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const volatile std::sig_atomic_t& force_quit,
-                                                                     std::uint32_t timer_period_sec) noexcept {
+                                                                    std::uint32_t timer_period_sec) noexcept {
   const auto& active_ports{environment_.GetActivePorts()};
   auto& context{worker_contexts_[0]};
   PrepareWorkerContext(context, force_quit, 0);
@@ -450,12 +673,12 @@ std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const volati
     MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc);
   }
 
-  rule_match_counts_ = context.rule_match_counts;
+  rule_match_counts_ = std::move(context.rule_match_counts);
   return CollectStats(counters_);
 }
 
 std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const volatile std::sig_atomic_t& force_quit,
-                                                                    std::uint32_t timer_period_sec) noexcept {
+                                                                   std::uint32_t timer_period_sec) noexcept {
   if (const auto started{StartWorkers()}; !started) {
     return std::unexpected(started.error());
   }
@@ -489,7 +712,7 @@ void Pipeline::CollectWorkerRuleCounts() noexcept {
 }
 
 std::expected<PipelineStats, std::string> Pipeline::RunUntilStopped(const volatile std::sig_atomic_t& force_quit,
-                                                                     std::uint32_t timer_period_sec) noexcept {
+                                                                    std::uint32_t timer_period_sec) noexcept {
   if (worker_contexts_.size() == 1) {
     return RunSingleWorker(force_quit, timer_period_sec);
   }

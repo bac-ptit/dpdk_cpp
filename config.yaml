@@ -1,55 +1,137 @@
+# EAL (Environment Abstraction Layer) configuration — the low-level abstraction that
+# allows DPDK to access hardware resources like CPU cores, memory, and network devices.
 eal:
+  # Comma-separated list or range of logical CPU cores to use (e.g., "0-1" means core 0 and core 1).
   cpu_core_list: 0-1
-  file_prefix: ''
+  # Prefix for shared memory and hugepage files to isolate multiple DPDK instances.
+  file_prefix: spifast
+  # Use legacy memory mode (allocate all memory at startup instead of dynamic allocation).
   legacy_memory: true
+  # Log level for DPDK (7 = debug, 6 = info, 5 = warning, 4 = error).
   log_level: '7'
+  # Number of memory channels (depends on motherboard architecture; typically 2 or 4).
   memory_channels: 2
+  # Amount of memory to allocate when legacy_memory is enabled, in kilobytes.
   memory_size: '1337'
+  # Disable the use of hugepages (required when running in virtual environments without hugepage support).
   disable_hugepages: true
+  # Disable PCI device scanning (required when using virtual devices instead of physical PCI hardware).
   disable_pci: true
+  # DPDK process type: "primary" (first instance) or "secondary" (attaches to a primary).
   process_type: primary
+  # Virtual devices — software-based DPDK ports that do not require physical NIC hardware.
   virtual_devices:
-  - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench.pcap,infinite_rx=1
+  # AF_PACKET socket on virtual bridge virbr1 (first virtual bridge, connects to VM1 subnet).
+  # net_af_packet is a DPDK poll-mode driver that uses Linux AF_PACKET sockets.
+  # iface=virbr1 attaches to the bridge named "virbr1".
+  # qpairs=1 means one queue pair (one receive queue + one transmit queue).
+  - net_af_packet0,iface=virbr1,qpairs=1
+  # AF_PACKET socket on virtual bridge virbr2 (second virtual bridge, connects to VM2 subnet).
+  - net_af_packet1,iface=virbr2,qpairs=1
+
+# L2 (Layer 2 / Data Link Layer) forwarding configuration — forwards Ethernet frames
+# between ports with optional MAC address rewriting.
 l2_forward:
+  # Maximum number of packets to receive or transmit in a single burst call.
   burst_size: 64
-  mac_updating: true
+  # Whether to automatically rewrite source and destination MAC addresses on forwarded frames.
+  mac_updating: false
+  # Number of receive queues to allocate per logical core.
   receive_queue_per_lcore: 1
+  # Interval in seconds between periodic statistics output.
   timer_period_sec: 5
+
+# L3 (Layer 3 / Network Layer) forwarding configuration — routes packets based on
+# destination IP address using a routing table (longest prefix match).
+l3_forward:
+  # Enable or disable L3 forwarding. When enabled, L3 routing overrides default L2 port pairing.
+  enabled: true
+  # Routing lookup method: "lpm" (Longest Prefix Match) for IPv4 routing.
+  lookup_method: lpm
+  # Static IPv4 routing table — maps destination subnets to output ports.
+  ipv4_routes:
+  # Traffic destined for 192.168.100.0/24 goes to output port 0 (virtual bridge virbr1).
+  - destination_ip_address: 192.168.100.0
+    prefix_length: 24
+    output_port: 0
+  # Traffic destined for 192.168.200.0/24 goes to output port 1 (virtual bridge virbr2).
+  - destination_ip_address: 192.168.200.0
+    prefix_length: 24
+    output_port: 1
+  # MAC address table — maps each output port to the destination MAC address to write
+  # into the Ethernet header of forwarded packets.
+  ethernet_destinations:
+  # Port 0 delivers to the MAC address of VM1 (the virtual machine on virtual bridge virbr1).
+  - port_id: 0
+    mac_address: 52:54:00:5a:2c:95
+  # Port 1 delivers to the MAC address of VM2 (the virtual machine on virtual bridge virbr2).
+  - port_id: 1
+    mac_address: 52:54:00:fe:7b:5d
+  # Mapping from (port, queue) pairs to the logical core that processes them.
+  queue_mappings:
+  # Port 0, queue 0 is processed by logical core 1.
+  - port_id: 0
+    queue_id: 0
+    lcore_id: 1
+  # Port 1, queue 0 is processed by logical core 1.
+  - port_id: 1
+    queue_id: 0
+    lcore_id: 1
+
+# Mempool (memory buffer pool) configuration — pre-allocated pool of fixed-size packet
+# buffers (mbufs) used by DPDK to store received and transmitted packets.
 mempool:
+  # Per-core cache size: each logical core caches this many mbufs to avoid lock contention.
   cache_size: 256
+  # Size of each individual memory buffer (mbuf) in bytes — must be large enough to hold
+  # the maximum expected packet (including headers).
   memory_buffer_size: 2176
+  # Name of the memory pool, used for identification in DPDK logs and debugging.
   name: mbuf_pool
+  # Total number of memory buffers (mbufs) pre-allocated in the pool.
   memory_buffer_count: 251024
+
+# Port (physical or virtual network interface) configuration for DPDK Ethernet devices.
 port:
+  # Interval in milliseconds between link status polling attempts.
   link_check_interval_ms: 100
+  # Maximum number of link status polling attempts before giving up.
   link_check_max_count: 90
+  # Link speed in megabits per second (0 means auto-negotiate / don't care).
   link_speed: 0
-  port_bitmask: '0x1'
-  promiscuous: false
+  # Bitmask of port indices to enable in hexadecimal format.
+  # '0x3' in binary is 0b0011, meaning ports 0 and 1 are enabled.
+  port_bitmask: '0x3'
+  # Enable promiscuous mode — accept all packets on the port regardless of destination MAC.
+  promiscuous: true
+  # Number of receive descriptors in the hardware ring buffer for each receive queue.
   receive_descriptors: 1024
+  # Number of receive queues to configure on each port.
   receive_queues: 1
+  # Number of transmit descriptors in the hardware ring buffer for each transmit queue.
   transmit_descriptors: 1024
+  # Number of transmit queues to configure on each port.
   transmit_queues: 1
+
+# SPI (Shallow Packet Inspection) configuration — classifies packets by matching
+# header fields (IP addresses, ports, protocol) against a set of user-defined rules.
 spi:
-  rules:
-  - source_ip_address: 10.17.50.1
-    destination_ip_address: 10.17.50.12
-    destination_port: 80
-    label: HTTP
-    protocol: tcp
-  - source_ip_address: 10.17.50.2
-    destination_ip_address: 10.17.50.12
-    destination_port: 443
-    label: HTTPS
-    protocol: tcp
-  - source_ip_address: 10.17.50.3
-    destination_ip_address: 10.17.50.53
-    destination_port: 53
-    label: DNS
-    protocol: udp
-  - source_ip_address: 10.17.50.4
-    destination_ip_address: 10.17.50.215
-    destination_port: 2152
-    label: GTP-U
-    protocol: udp
+  # Number of worker cores dedicated to packet processing.
   worker_count: 1
+  # When true, any packet that does not match any rule is silently dropped.
+  drop_unmatched: true
+  # Ordered list of classification rules (first match wins).
+  rules:
+  # Match TCP packets from VM1 (192.168.100.130) to VM2 destination port 80 (HTTP).
+  # Label identifies the traffic class for statistics and debugging.
+  - source_ip_address: 192.168.100.130
+    destination_ip_address: 192.168.200.180
+    destination_port: 80
+    label: HTTP_REQUEST
+    protocol: tcp
+  # Match TCP packets from VM2 source port 80 (HTTP response) back to VM1.
+  - source_ip_address: 192.168.200.180
+    destination_ip_address: 192.168.100.130
+    source_port: 80
+    label: HTTP_RESPONSE
+    protocol: tcp
