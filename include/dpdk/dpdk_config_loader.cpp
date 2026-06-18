@@ -33,9 +33,9 @@ constexpr std::size_t kIpv6AddressBytes{16};
  * @param condition  The boolean condition to assert.
  * @param ...        Format string and arguments for the error message.
  */
-#define CONFIG_VALIDATE(condition, ...)                 \
+#define CONFIG_VALIDATE(invalid_condition, ...)         \
   do {                                                  \
-    if (!(condition)) {                                 \
+    if (invalid_condition) {                            \
       return std::unexpected(std::format(__VA_ARGS__)); \
     }                                                   \
   } while (0)
