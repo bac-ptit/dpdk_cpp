@@ -95,7 +95,7 @@ class Pipeline final {
    * @param drop_unmatched Whether to drop packets that match no SPI rule.
    */
   Pipeline(const dpdk::Environment& environment, const RuleTable& rules, std::uint16_t burst_size,
-           std::uint16_t worker_count, bool mac_updating, L3ForwardConfig l3_forward, bool drop_unmatched);
+           std::uint16_t worker_count, bool mac_updating, const L3ForwardConfig& l3_forward, bool drop_unmatched);
 
   /// Stop all workers and release per-worker resources.
   ~Pipeline();

@@ -26,13 +26,6 @@ constexpr std::size_t kMacAddressLength{17};
 constexpr std::size_t kMacAddressSeparatorPeriod{3};
 constexpr std::size_t kIpv6AddressBytes{16};
 
-/**
- * @brief Validate a semantic condition and return an error string on failure.
- *
- * Used to check SPI rule constraints before / after YAML loading.
- * @param condition  The boolean condition to assert.
- * @param ...        Format string and arguments for the error message.
- */
 #define CONFIG_VALIDATE(invalid_condition, ...)         \
   do {                                                  \
     if (invalid_condition) {                            \
@@ -142,40 +135,40 @@ constexpr std::size_t kIpv6AddressBytes{16};
  * @return Void on success, or an error string.
  */
 [[nodiscard]] std::expected<void, std::string> ValidateRuleConfig(const SpiRuleConfig& rule,
-                                                                  std::size_t index) noexcept {
-  CONFIG_VALIDATE(IsSupportedProtocol(rule.protocol), "spi.rules[{}].protocol must be 'tcp' or 'udp'", index);
-  CONFIG_VALIDATE(HasMatchField(rule),
+                                                                   std::size_t index) noexcept {
+  CONFIG_VALIDATE(!IsSupportedProtocol(rule.protocol), "spi.rules[{}].protocol must be 'tcp' or 'udp'", index);
+  CONFIG_VALIDATE(!HasMatchField(rule),
                   "spi.rules[{}] must set source_ip_address, destination_ip_address, source_port, "
                   "or dst_port",
                   index);
-  CONFIG_VALIDATE(HasValidIp(rule.source_ip_address), "spi.rules[{}].source_ip_address must be a valid IPv4 address",
+  CONFIG_VALIDATE(!HasValidIp(rule.source_ip_address), "spi.rules[{}].source_ip_address must be a valid IPv4 address",
                   index);
-  CONFIG_VALIDATE(HasValidIp(rule.destination_ip_address),
+  CONFIG_VALIDATE(!HasValidIp(rule.destination_ip_address),
                   "spi.rules[{}].destination_ip_address must be a valid IPv4 address", index);
-  CONFIG_VALIDATE(!HasInvalidPort(rule.source_port), "spi.rules[{}].source_port must be greater than 0", index);
-  CONFIG_VALIDATE(!HasInvalidPort(rule.destination_port), "spi.rules[{}].destination_port must be greater than 0",
+  CONFIG_VALIDATE(HasInvalidPort(rule.source_port), "spi.rules[{}].source_port must be greater than 0", index);
+  CONFIG_VALIDATE(HasInvalidPort(rule.destination_port), "spi.rules[{}].destination_port must be greater than 0",
                   index);
-  CONFIG_VALIDATE(!rule.label.empty(), "spi.rules[{}].label must not be empty", index);
+  CONFIG_VALIDATE(rule.label.empty(), "spi.rules[{}].label must not be empty", index);
 
   return {};
 }
 
 /// Validate an inline IPv4 L3 forwarding route.
 [[nodiscard]] std::expected<void, std::string> ValidateL3Ipv4Route(const L3ForwardConfig::Ipv4Route& route,
-                                                                   std::size_t index) noexcept {
-  CONFIG_VALIDATE(HasValidIpv4Address(route.destination_ip_address),
+                                                                    std::size_t index) noexcept {
+  CONFIG_VALIDATE(!HasValidIpv4Address(route.destination_ip_address),
                   "l3_forward.ipv4_routes[{}].destination_ip_address must be a valid IPv4 address", index);
-  CONFIG_VALIDATE(route.prefix_length <= kDefaultIpv4PrefixLength,
+  CONFIG_VALIDATE(route.prefix_length > kDefaultIpv4PrefixLength,
                   "l3_forward.ipv4_routes[{}].prefix_length must be between 0 and 32", index);
   return {};
 }
 
 /// Validate an inline IPv6 L3 forwarding route.
 [[nodiscard]] std::expected<void, std::string> ValidateL3Ipv6Route(const L3ForwardConfig::Ipv6Route& route,
-                                                                   std::size_t index) noexcept {
-  CONFIG_VALIDATE(HasValidIpv6Address(route.destination_ip_address),
+                                                                    std::size_t index) noexcept {
+  CONFIG_VALIDATE(!HasValidIpv6Address(route.destination_ip_address),
                   "l3_forward.ipv6_routes[{}].destination_ip_address must be a valid IPv6 address", index);
-  CONFIG_VALIDATE(route.prefix_length <= kDefaultIpv6PrefixLength,
+  CONFIG_VALIDATE(route.prefix_length > kDefaultIpv6PrefixLength,
                   "l3_forward.ipv6_routes[{}].prefix_length must be between 0 and 128", index);
   return {};
 }
@@ -183,7 +176,7 @@ constexpr std::size_t kIpv6AddressBytes{16};
 /// Validate one optional L3 destination MAC override.
 [[nodiscard]] std::expected<void, std::string> ValidateL3EthernetDestination(
     const L3ForwardConfig::EthernetDestination& destination, std::size_t index) noexcept {
-  CONFIG_VALIDATE(HasValidMacAddress(destination.mac_address),
+  CONFIG_VALIDATE(!HasValidMacAddress(destination.mac_address),
                   "l3_forward.ethernet_destinations[{}].mac_address must use MM:MM:MM:MM:MM:MM format", index);
   return {};
 }
@@ -203,23 +196,23 @@ constexpr std::size_t kIpv6AddressBytes{16};
 
 /// Validate L3 lookup and packet I/O mode options.
 [[nodiscard]] std::expected<void, std::string> ValidateL3ModeOptions(const L3ForwardConfig& config) noexcept {
-  CONFIG_VALIDATE(IsSupportedL3LookupMethod(config.lookup_method),
+  CONFIG_VALIDATE(!IsSupportedL3LookupMethod(config.lookup_method),
                   "l3_forward.lookup_method must be 'em', 'lpm', 'fib', or 'acl'");
-  CONFIG_VALIDATE(IsSupportedL3Mode(config.mode), "l3_forward.mode must be 'poll' or 'eventdev'");
+  CONFIG_VALIDATE(!IsSupportedL3Mode(config.mode), "l3_forward.mode must be 'poll' or 'eventdev'");
   return {};
 }
 
 /// Validate L3 eventdev-related options.
 [[nodiscard]] std::expected<void, std::string> ValidateL3EventOptions(const L3ForwardConfig& config) noexcept {
-  CONFIG_VALIDATE(IsSupportedEventQueueSchedule(config.event_queue_schedule),
+  CONFIG_VALIDATE(!IsSupportedEventQueueSchedule(config.event_queue_schedule),
                   "l3_forward.event_queue_schedule must be 'ordered', 'atomic', or 'parallel'");
-  CONFIG_VALIDATE(config.event_eth_rx_queues > 0, "l3_forward.event_eth_rx_queues must be greater than 0");
+  CONFIG_VALIDATE(config.event_eth_rx_queues <= 0, "l3_forward.event_eth_rx_queues must be greater than 0");
   return {};
 }
 
 /// Validate L3 ACL-related options.
 [[nodiscard]] std::expected<void, std::string> ValidateL3AclOptions(const L3ForwardConfig& config) noexcept {
-  CONFIG_VALIDATE(IsSupportedAclClassifyAlgorithm(config.acl_classify_algorithm),
+  CONFIG_VALIDATE(!IsSupportedAclClassifyAlgorithm(config.acl_classify_algorithm),
                   "l3_forward.acl_classify_algorithm must be a DPDK ACL classify algorithm or 'default'");
   return {};
 }
@@ -244,7 +237,7 @@ constexpr std::size_t kIpv6AddressBytes{16};
 
 /// Validate the optional L3 exact-match hash entry count.
 [[nodiscard]] std::expected<void, std::string> ValidateL3HashEntryNum(const L3ForwardConfig& config) noexcept {
-  CONFIG_VALIDATE(HasValidOptionalHexUint32(config.hash_entry_num),
+  CONFIG_VALIDATE(!HasValidOptionalHexUint32(config.hash_entry_num),
                   "l3_forward.hash_entry_num must be a hexadecimal uint32 string");
   return {};
 }
@@ -287,7 +280,7 @@ constexpr std::size_t kIpv6AddressBytes{16};
 
 /// Validate L3 requirements that only apply when forwarding is enabled.
 [[nodiscard]] std::expected<void, std::string> ValidateEnabledL3RouteSource(const L3ForwardConfig& config) noexcept {
-  CONFIG_VALIDATE(HasL3RouteSource(config),
+  CONFIG_VALIDATE(!HasL3RouteSource(config),
                   "l3_forward requires ipv4_rule_file, ipv6_rule_file, ipv4_routes, or ipv6_routes when enabled");
   return {};
 }
@@ -295,7 +288,7 @@ constexpr std::size_t kIpv6AddressBytes{16};
 /// Validate poll-mode L3 requirements.
 [[nodiscard]] std::expected<void, std::string> ValidateL3PollModeRequirements(const L3ForwardConfig& config) noexcept {
   if (config.mode == "poll") {
-    CONFIG_VALIDATE(!config.queue_mappings.empty(),
+    CONFIG_VALIDATE(config.queue_mappings.empty(),
                     "l3_forward.queue_mappings must contain at least one entry when enabled in poll mode");
   }
   return {};
@@ -304,7 +297,7 @@ constexpr std::size_t kIpv6AddressBytes{16};
 /// Validate every inline IPv4 route has a destination MAC for its output port.
 [[nodiscard]] std::expected<void, std::string> ValidateL3Ipv4RouteDestinations(const L3ForwardConfig& config) noexcept {
   for (std::size_t i{0}; i < config.ipv4_routes.size(); ++i) {
-    CONFIG_VALIDATE(HasEthernetDestination(config, config.ipv4_routes[i].output_port),
+    CONFIG_VALIDATE(!HasEthernetDestination(config, config.ipv4_routes[i].output_port),
                     "l3_forward.ipv4_routes[{}].output_port={} has no matching ethernet_destinations entry", i,
                     config.ipv4_routes[i].output_port);
   }
@@ -354,8 +347,8 @@ std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexce
   const auto& spi_config{config.spi};
   CONFIG_PROPAGATE(ValidateL3ForwardConfig(config.l3_forward));
 
-  CONFIG_VALIDATE(spi_config.worker_count > 0, "spi.worker_count must be greater than 0");
-  CONFIG_VALIDATE(!spi_config.rules.empty(), "spi.rules must contain at least one rule");
+  CONFIG_VALIDATE(spi_config.worker_count <= 0, "spi.worker_count must be greater than 0");
+  CONFIG_VALIDATE(spi_config.rules.empty(), "spi.rules must contain at least one rule");
 
   for (std::size_t i{0}; i < spi_config.rules.size(); ++i) {
     CONFIG_PROPAGATE(ValidateRuleConfig(spi_config.rules[i], i));
@@ -373,13 +366,11 @@ std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexce
  * @return A validated DpdkConfig on success, or an error string.
  */
 std::expected<DpdkConfig, std::string> LoadConfig(const std::string& path) noexcept {
-  // Parse YAML into the auto-reflected DpdkConfig struct.
   DpdkConfig config;
   if (const auto parse_error{glz::read_file_yaml(config, path)}; parse_error) {
     return std::unexpected(std::format("Failed to parse '{}': {}", path, glz::format_error(parse_error)));
   }
 
-  // Validate semantic constraints before use.
   if (const auto valid{ValidateConfig(config)}; !valid) {
     return std::unexpected(valid.error());
   }
