@@ -60,6 +60,26 @@ require_worker_lcores() {
   fi
 }
 
+# Allocate hugepages if none are configured.
+# Usage: ensure_hugepages <memory_mb>
+ensure_hugepages() {
+  local memory_mb="${1}"
+  local current
+  current="$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)"
+  if [ "$current" -gt 0 ]; then
+    return 0
+  fi
+  local pages=$(( (memory_mb + 1) / 2 + 64 ))  # 2MB pages + margin
+  echo "[*] No hugepages found. Allocating ${pages} x 2MB hugepages (~$((pages * 2))MB)..."
+  sudo sysctl -w "vm.nr_hugepages=${pages}" >/dev/null
+  local free_pages
+  free_pages="$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)"
+  if [ "$free_pages" -lt "$pages" ]; then
+    echo "[!] Warning: requested ${pages} hugepages but only got ${free_pages}."
+  fi
+  echo "[OK] Hugepages allocated: ${free_pages}"
+}
+
 run_app() {
   require_app_binary
   sudo setcap cap_net_raw,cap_ipc_lock,cap_net_admin+ep "$APP_BINARY"
@@ -221,17 +241,17 @@ with open(config_file) as f:
     cfg = yaml.safe_load(f)
 cache_size = cfg['mempool'].get('cache_size', 256)
 extra = cache_size * (workers + 2) + workers * 512
+# infinite_rx pre-allocates 1 mbuf per pcap packet PER QUEUE during setup
+# Total = sum of all packets across all shards = count
 mbuf_needed = count + extra
-# infinite_rx recycles mbufs — pool only needs ring depth + cache, not all count
-rx_desc = cfg['port'].get('receive_descriptors', 1024)
-mbuf_min = rx_desc * workers * 2 + extra
-mbuf_needed = max(mbuf_min, min(mbuf_needed, 65536 + extra))
 memory_mb = int(mbuf_needed * 2300 / (1024 * 1024) * 1.1 + 256)
 rx_streams = [f'rx_pcap={os.path.join(shard_dir, f"bench_q{i}.pcap")}' for i in range(workers)]
 cfg['eal']['virtual_devices'] = ['net_pcap0,' + ','.join(rx_streams) + ',infinite_rx=1']
 cfg['eal']['cpu_core_list'] = f'0-{workers}'
 cfg['eal']['memory_size'] = str(memory_mb)
 cfg['eal']['legacy_memory'] = True
+cfg['eal']['disable_hugepages'] = False
+cfg['eal']['disable_pci'] = True
 cfg['eal'].pop('numa_limit', None)
 cfg['l3_forward']['enabled'] = False
 cfg['mempool']['memory_buffer_size'] = 2176
@@ -250,7 +270,15 @@ with open(config_file, 'w') as f:
 matched = count * match_percent // 100
 print(f'PCAP benchmark: workers={workers}, match_percent={match_percent}, expected_match~={matched}')
 print(f'Config: {count} pkts, {mbuf_needed} mbufs ({extra} extra), {memory_mb}MB')
+# Write memory_mb to a temp file for the shell script to read
+with open(config_file + '.mem', 'w') as mf:
+    mf.write(str(memory_mb))
 PY
+
+  local memory_mb
+  memory_mb="$(cat "$config_file.mem" 2>/dev/null || echo 2697)"
+  rm -f "$config_file.mem"
+  ensure_hugepages "$memory_mb"
 
   cp "$config_file" "$BUILD_DIR/config.yaml"
 
