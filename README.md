@@ -86,11 +86,30 @@ Expected shape:
 received=20 transmitted=20 parsed=20 matched=20 dropped=0
 ```
 
-Benchmark with repeated TCP/80 packets:
+PCAP benchmark with 6 worker queues:
 
 ```bash
-pixi run bench
+pixi run bench-pcap
 ```
+
+The generator creates one `rx_pcap` stream per worker. By default the Pixi task
+generates 300k packets and all packets match the configured SPI rules. The
+PCAP benchmark disables L3 forwarding and omits
+`tx_pcap`, so the PCAP PMD uses TX drop queues instead of measuring file output.
+With `spi.packet_distribution: auto`, `net_pcap` uses the software flow-hash
+dispatcher. Set `spi.packet_distribution: queue` to compare against the old
+queue-per-worker path.
+
+AF_PACKET virtual-NIC benchmark with 16 queue pairs:
+
+```bash
+pixi run bench-afpacket
+```
+
+This uses the current AF_PACKET interfaces from `config.yaml`, sets
+`qpairs=16`, and keeps the live L3/SPI config. Generate many flows from another
+terminal. With `spi.packet_distribution: auto`, `net_af_packet` uses the
+software flow-hash dispatcher; a real RSS-capable NIC uses queue-per-worker.
 
 Throughput is the delta between two stats lines divided by the timer interval
 from `config.yaml`.
@@ -111,15 +130,16 @@ With `timer_period_sec: 5`:
 ## PCAP Benchmark Note
 
 The test script uses DPDK PCAP PMD (`net_pcap`) for repeatable local testing.
-In this environment it supports one RX queue, so the script forces:
+One `rx_pcap` stream exposes one RX queue. For multi-worker tests the script
+generates multiple PCAP shards:
 
 ```text
-rx_queues=1
-tx_queues=1
-worker_count=1
+bench_q0.pcap ... bench_q15.pcap
 ```
 
-For real multi-core scaling, use a NIC/PMD with multiple RX queues and RSS.
+The app prints final per-worker counters so you can verify that every worker
+received traffic. In `flow_hash` mode these counters represent packets dequeued
+from each worker ring, not packets read directly from RX queues.
 
 ## Docs
 

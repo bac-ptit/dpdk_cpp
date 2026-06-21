@@ -43,6 +43,8 @@ int main() {
   const auto timer_period_sec{config->l2_forward.timer_period_sec};
   const auto worker_count{config->spi.worker_count};
   const bool drop_unmatched{config->spi.drop_unmatched};
+  const auto packet_distribution{config->spi.packet_distribution};
+  const auto dispatch_queue_size{config->spi.dispatch_queue_size};
 
   // Environment owns EAL, mempool, ports, queues, and link startup.
   auto env{dpdk::Environment{std::move(*config)}};
@@ -52,7 +54,15 @@ int main() {
   }
 
   // Pipeline receives packets, classifies them, and forwards the mbufs.
-  dpdk::spi::Pipeline pipeline{env, *rule_table, burst_size, worker_count, mac_updating, l3_forward, drop_unmatched};
+  dpdk::spi::Pipeline pipeline{env,
+                               *rule_table,
+                               burst_size,
+                               worker_count,
+                               mac_updating,
+                               l3_forward,
+                               drop_unmatched,
+                               packet_distribution,
+                               dispatch_queue_size};
   const auto stats{pipeline.RunUntilStopped(dpdk::ForceQuitFlag(), timer_period_sec)};
   if (!stats) {
     std::println(stderr, "Pipeline error: {}", stats.error());

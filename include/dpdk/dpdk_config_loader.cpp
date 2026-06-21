@@ -55,6 +55,11 @@ constexpr std::size_t kIpv6AddressBytes{16};
   return mode == "poll" || mode == "eventdev";
 }
 
+/// Whether the SPI packet distribution mode is supported.
+[[nodiscard]] constexpr bool IsSupportedPacketDistribution(std::string_view mode) noexcept {
+  return mode == "auto" || mode == "queue" || mode == "flow_hash";
+}
+
 /// Whether the eventdev scheduling mode is accepted by DPDK l3fwd.
 [[nodiscard]] constexpr bool IsSupportedEventQueueSchedule(std::string_view schedule) noexcept {
   return schedule == "ordered" || schedule == "atomic" || schedule == "parallel";
@@ -74,6 +79,11 @@ constexpr std::size_t kIpv6AddressBytes{16};
 /// Whether an optional port value is present but zero (invalid).
 [[nodiscard]] constexpr bool HasInvalidPort(const std::optional<std::uint16_t>& port) noexcept {
   return port.has_value() && *port == 0;
+}
+
+/// Whether a positive integer is a power of two.
+[[nodiscard]] constexpr bool IsPowerOfTwo(std::uint32_t value) noexcept {
+  return value != 0U && (value & (value - 1U)) == 0U;
 }
 
 /// Whether the rule has at least one match field configured.
@@ -333,6 +343,31 @@ constexpr std::size_t kIpv6AddressBytes{16};
   return {};
 }
 
+/// Validate that every configured worker has a matching RX/TX queue.
+[[nodiscard]] std::expected<void, std::string> ValidateWorkerQueueConfig(const DpdkConfig& config) noexcept {
+  const auto& port_config{config.port};
+  const auto& spi_config{config.spi};
+
+  CONFIG_VALIDATE(port_config.receive_queues == 0, "port.receive_queues must be greater than 0");
+  CONFIG_VALIDATE(port_config.transmit_queues == 0, "port.transmit_queues must be greater than 0");
+  CONFIG_VALIDATE(spi_config.worker_count == 0, "spi.worker_count must be greater than 0");
+  CONFIG_VALIDATE(!IsSupportedPacketDistribution(spi_config.packet_distribution),
+                  "spi.packet_distribution must be 'auto', 'queue', or 'flow_hash'");
+  CONFIG_VALIDATE(!IsPowerOfTwo(spi_config.dispatch_queue_size),
+                  "spi.dispatch_queue_size must be a power of two greater than 0");
+  CONFIG_VALIDATE(spi_config.worker_count > spi_config.dispatch_queue_size,
+                  "spi.worker_count={} exceeds spi.dispatch_queue_size={}", spi_config.worker_count,
+                  spi_config.dispatch_queue_size);
+  CONFIG_VALIDATE(spi_config.packet_distribution == "queue" && spi_config.worker_count > port_config.receive_queues,
+                  "spi.worker_count={} exceeds port.receive_queues={}", spi_config.worker_count,
+                  port_config.receive_queues);
+  CONFIG_VALIDATE(spi_config.worker_count > port_config.transmit_queues,
+                  "spi.worker_count={} exceeds port.transmit_queues={}", spi_config.worker_count,
+                  port_config.transmit_queues);
+
+  return {};
+}
+
 }  // namespace
 
 /**
@@ -346,8 +381,8 @@ constexpr std::size_t kIpv6AddressBytes{16};
 std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexcept {
   const auto& spi_config{config.spi};
   CONFIG_PROPAGATE(ValidateL3ForwardConfig(config.l3_forward));
+  CONFIG_PROPAGATE(ValidateWorkerQueueConfig(config));
 
-  CONFIG_VALIDATE(spi_config.worker_count <= 0, "spi.worker_count must be greater than 0");
   CONFIG_VALIDATE(spi_config.rules.empty(), "spi.rules must contain at least one rule");
 
   for (std::size_t i{0}; i < spi_config.rules.size(); ++i) {

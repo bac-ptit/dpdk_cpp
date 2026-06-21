@@ -14,10 +14,56 @@ if [ ! -d "$BUILD_DIR" ] && [ -d "$PROJECT_DIR/cmake-build-debug" ]; then
   BUILD_DIR="$PROJECT_DIR/cmake-build-debug"
 fi
 APP_BINARY="${APP_BINARY:-$BUILD_DIR/FastAPI}"
+DEFAULT_WORKERS="${DEFAULT_WORKERS:-6}"
+DEFAULT_BENCH_COUNT="${DEFAULT_BENCH_COUNT:-300000}"
+DEFAULT_MATCH_PERCENT="${DEFAULT_MATCH_PERCENT:-100}"
+CONFIG_BACKUP=""
 
 usage() {
-  echo "Usage: $0 {setup|run|send|pcap|bench|teardown}"
+  echo "Usage: $0 {setup|run|send|pcap|bench|bench-pcap|bench-afpacket|teardown}"
   exit 1
+}
+
+restore_config() {
+  local config_file="$PROJECT_DIR/config.yaml"
+  if [ -n "${CONFIG_BACKUP:-}" ] && [ -f "$CONFIG_BACKUP" ]; then
+    echo "[*] Restoring original config..."
+    cp "$CONFIG_BACKUP" "$config_file"
+    cp "$config_file" "$BUILD_DIR/config.yaml"
+    rm -f "$CONFIG_BACKUP"
+    CONFIG_BACKUP=""
+  fi
+}
+
+begin_config_edit() {
+  local config_file="$PROJECT_DIR/config.yaml"
+  CONFIG_BACKUP="$config_file.bak"
+  cp "$config_file" "$CONFIG_BACKUP"
+  trap restore_config EXIT INT TERM
+}
+
+require_app_binary() {
+  if [ ! -f "$APP_BINARY" ]; then
+    echo "[!] Binary not found. Run install.sh first."
+    exit 1
+  fi
+}
+
+require_worker_lcores() {
+  local workers="${1}"
+  local available
+  available="$(nproc)"
+  if [ "$available" -lt $((workers + 1)) ]; then
+    echo "[!] ${workers} workers need $((workers + 1)) logical cores (main + workers), found ${available}."
+    echo "    Pass a smaller worker count or run on a host with more lcores."
+    exit 1
+  fi
+}
+
+run_app() {
+  require_app_binary
+  sudo setcap cap_net_raw,cap_ipc_lock,cap_net_admin+ep "$APP_BINARY"
+  sudo "$APP_BINARY"
 }
 
 cmd_setup() {
@@ -52,12 +98,7 @@ cmd_setup() {
 }
 
 cmd_run() {
-  if [ ! -f "$APP_BINARY" ]; then
-    echo "[!] Binary not found. Run install.sh first."
-    exit 1
-  fi
-  sudo setcap cap_net_raw,cap_ipc_lock,cap_net_admin+ep "$APP_BINARY"
-  sudo "$APP_BINARY"
+  run_app
 }
 
 cmd_send() {
@@ -92,85 +133,196 @@ cmd_pcap() {
   rm -f "$tx_pcap_file"
 
   echo "[*] Creating PCAP config..."
-  cp "$config_file" "$config_file.bak" 2>/dev/null || true
+  begin_config_edit
 
-  python3 -c "
+  python3 - "$config_file" "$pcap_file" "$tx_pcap_file" <<'PY'
+import sys
 import yaml
-with open('$config_file') as f:
+
+config_file, pcap_file, tx_pcap_file = sys.argv[1:4]
+rules = [
+    {'protocol': 'tcp', 'source_ip_address': '10.17.50.1',
+     'destination_ip_address': '10.17.50.12', 'destination_port': 80, 'label': 'HTTP'},
+    {'protocol': 'tcp', 'source_ip_address': '10.17.50.2',
+     'destination_ip_address': '10.17.50.12', 'destination_port': 443, 'label': 'HTTPS'},
+    {'protocol': 'udp', 'source_ip_address': '10.17.50.3',
+     'destination_ip_address': '10.17.50.53', 'destination_port': 53, 'label': 'DNS'},
+    {'protocol': 'udp', 'source_ip_address': '10.17.50.4',
+     'destination_ip_address': '10.17.50.215', 'destination_port': 2152, 'label': 'GTP_U'},
+]
+with open(config_file) as f:
     cfg = yaml.safe_load(f)
-cfg['eal']['virtual_devices'] = ['net_pcap0,rx_pcap=${pcap_file},tx_pcap=${tx_pcap_file},infinite_rx=0']
+cfg['eal']['virtual_devices'] = [f'net_pcap0,rx_pcap={pcap_file},tx_pcap={tx_pcap_file},infinite_rx=0']
 cfg['eal']['cpu_core_list'] = '0-1'
+cfg['l3_forward']['enabled'] = False
 cfg['mempool']['memory_buffer_size'] = 2176
+cfg['port']['port_bitmask'] = '0x1'
 cfg['port']['receive_queues'] = 1
 cfg['port']['transmit_queues'] = 1
 cfg['spi']['worker_count'] = 1
-with open('$config_file', 'w') as f:
+cfg['spi']['packet_distribution'] = 'auto'
+cfg['spi']['dispatch_queue_size'] = 8192
+cfg['spi']['drop_unmatched'] = True
+cfg['spi']['rules'] = rules
+with open(config_file, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
 print('Config updated for PCAP PMD: cpu_core_list=0-1, receive_queues=1, transmit_queues=1, worker_count=1')
-"
+PY
 
   echo "[*] Copying config to build dir..."
   cp "$config_file" "$BUILD_DIR/config.yaml"
 
   echo "[*] Running app..."
-  sudo setcap cap_net_raw,cap_ipc_lock,cap_net_admin+ep "$APP_BINARY"
-  sudo "$APP_BINARY"
-
-  echo "[*] Restoring original config..."
-  cp "$config_file.bak" "$config_file" 2>/dev/null || true
-  cp "$config_file" "$BUILD_DIR/config.yaml"
-  rm -f "$config_file.bak"
+  run_app
+  restore_config
 }
 
 cmd_bench() {
-  local count="${1:-100000}"
-  local pcap_file="$SCRIPT_DIR/bench.pcap"
+  cmd_bench_pcap "$@"
+}
 
-  echo "[*] Generating benchmark pcap with $count packets..."
-  python3 "$SCRIPT_DIR/gen_test_pcap.py" "$pcap_file" --count "$count"
+cmd_bench_pcap() {
+  local count="${1:-$DEFAULT_BENCH_COUNT}"
+  local workers="${2:-$DEFAULT_WORKERS}"
+  local match_percent="${3:-$DEFAULT_MATCH_PERCENT}"
+  local shard_dir="$SCRIPT_DIR/bench_pcap_shards"
 
-  echo "[*] Creating PCAP config with infinite loop..."
+  require_worker_lcores "$workers"
+
+  echo "[*] Generating PCAP benchmark shards: count=$count workers=$workers match=${match_percent}%..."
+  rm -rf "$shard_dir"
+  python3 "$SCRIPT_DIR/gen_test_pcap.py" "$shard_dir" --count "$count" --shards "$workers" \
+    --match-percent "$match_percent"
+
+  echo "[*] Creating multi-queue PCAP config with TX drop..."
   local config_file="$PROJECT_DIR/config.yaml"
-  cp "$config_file" "$config_file.bak" 2>/dev/null || true
+  begin_config_edit
 
-  python3 -c "
+  python3 - "$config_file" "$shard_dir" "$count" "$workers" "$match_percent" <<'PY'
+import os
+import sys
 import yaml
-count = $count
-with open('$config_file') as f:
+
+config_file, shard_dir, count_arg, workers_arg, match_percent_arg = sys.argv[1:6]
+count = int(count_arg)
+workers = int(workers_arg)
+match_percent = int(match_percent_arg)
+rules = [
+    {'protocol': 'tcp', 'source_ip_address': '10.17.50.1',
+     'destination_ip_address': '10.17.50.12', 'destination_port': 80, 'label': 'HTTP'},
+    {'protocol': 'tcp', 'source_ip_address': '10.17.50.2',
+     'destination_ip_address': '10.17.50.12', 'destination_port': 443, 'label': 'HTTPS'},
+    {'protocol': 'udp', 'source_ip_address': '10.17.50.3',
+     'destination_ip_address': '10.17.50.53', 'destination_port': 53, 'label': 'DNS'},
+    {'protocol': 'udp', 'source_ip_address': '10.17.50.4',
+     'destination_ip_address': '10.17.50.215', 'destination_port': 2152, 'label': 'GTP_U'},
+]
+with open(config_file) as f:
     cfg = yaml.safe_load(f)
 cache_size = cfg['mempool'].get('cache_size', 256)
-# PCAP PMD pre-loads ALL pcap packets into an internal ring (count mbufs).
-# Extra mbufs needed for mempool cache + RX/TX bursts + margin.
-extra = cache_size * 2 + 512
+extra = cache_size * (workers + 2) + workers * 512
 mbuf_needed = count + extra
-memory_mb = int(mbuf_needed * 2300 / (1024 * 1024) * 1.5 + 512)
-cfg['eal']['virtual_devices'] = ['net_pcap0,rx_pcap=${pcap_file},infinite_rx=1']
-cfg['eal']['cpu_core_list'] = '0-1'
+# infinite_rx recycles mbufs — pool only needs ring depth + cache, not all count
+rx_desc = cfg['port'].get('receive_descriptors', 1024)
+mbuf_min = rx_desc * workers * 2 + extra
+mbuf_needed = max(mbuf_min, min(mbuf_needed, 65536 + extra))
+memory_mb = int(mbuf_needed * 2300 / (1024 * 1024) * 1.1 + 256)
+rx_streams = [f'rx_pcap={os.path.join(shard_dir, f"bench_q{i}.pcap")}' for i in range(workers)]
+cfg['eal']['virtual_devices'] = ['net_pcap0,' + ','.join(rx_streams) + ',infinite_rx=1']
+cfg['eal']['cpu_core_list'] = f'0-{workers}'
 cfg['eal']['memory_size'] = str(memory_mb)
 cfg['eal']['legacy_memory'] = True
 cfg['eal'].pop('numa_limit', None)
+cfg['l3_forward']['enabled'] = False
 cfg['mempool']['memory_buffer_size'] = 2176
 cfg['mempool']['memory_buffer_count'] = mbuf_needed
-cfg['port']['receive_queues'] = 1
-cfg['port']['transmit_queues'] = 1
-cfg['spi']['worker_count'] = 1
-with open('$config_file', 'w') as f:
+cfg['port']['port_bitmask'] = '0x1'
+cfg['port']['receive_queues'] = workers
+cfg['port']['transmit_queues'] = workers
+cfg['spi']['worker_count'] = workers
+cfg['spi']['packet_distribution'] = 'auto'
+cfg['spi']['dispatch_queue_size'] = 16384
+cfg['spi']['drop_unmatched'] = True
+cfg['l2_forward']['burst_size'] = 64
+cfg['spi']['rules'] = rules
+with open(config_file, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
+matched = count * match_percent // 100
+print(f'PCAP benchmark: workers={workers}, match_percent={match_percent}, expected_match~={matched}')
 print(f'Config: {count} pkts, {mbuf_needed} mbufs ({extra} extra), {memory_mb}MB')
-print('PCAP PMD benchmark: forced cpu_core_list=0-1, receive_queues=1, transmit_queues=1, worker_count=1')
-"
+PY
 
   cp "$config_file" "$BUILD_DIR/config.yaml"
 
   echo "[*] Running app... (Ctrl+C to stop, check stats for throughput)"
-  sudo setcap cap_net_raw,cap_ipc_lock,cap_net_admin+ep "$APP_BINARY"
-  sudo "$APP_BINARY"
+  run_app
 
-  echo "[*] Restoring original config..."
-  cp "$config_file.bak" "$config_file" 2>/dev/null || true
-  cp "$config_file" "$BUILD_DIR/config.yaml"
-  rm -f "$config_file.bak"
+  restore_config
   echo "[OK] Benchmark done."
+}
+
+cmd_bench_afpacket() {
+  local workers="${1:-$DEFAULT_WORKERS}"
+  local config_file="$PROJECT_DIR/config.yaml"
+
+  require_worker_lcores "$workers"
+
+  echo "[*] Creating AF_PACKET config: workers=$workers qpairs=$workers..."
+  begin_config_edit
+
+  python3 - "$config_file" "$workers" <<'PY'
+import re
+import sys
+import yaml
+
+config_file, workers_arg = sys.argv[1:3]
+workers = int(workers_arg)
+
+def iface_for(devices, name, fallback):
+    for dev in devices:
+        if dev.startswith(name + ','):
+            match = re.search(r'(?:^|,)iface=([^,]+)', dev)
+            if match:
+                return match.group(1)
+    return fallback
+
+with open(config_file) as f:
+    cfg = yaml.safe_load(f)
+
+devices = cfg['eal'].get('virtual_devices', [])
+iface0 = iface_for(devices, 'net_af_packet0', 'virbr1')
+iface1 = iface_for(devices, 'net_af_packet1', 'virbr2')
+cfg['eal']['virtual_devices'] = [
+    f'net_af_packet0,iface={iface0},qpairs={workers}',
+    f'net_af_packet1,iface={iface1},qpairs={workers}',
+]
+cfg['eal']['cpu_core_list'] = f'0-{workers}'
+cfg['port']['port_bitmask'] = '0x3'
+cfg['port']['receive_queues'] = workers
+cfg['port']['transmit_queues'] = workers
+cfg['spi']['worker_count'] = workers
+cfg['spi']['packet_distribution'] = 'auto'
+cfg['spi']['dispatch_queue_size'] = 8192
+if cfg.get('l3_forward', {}).get('enabled', False):
+    cfg['l3_forward']['queue_mappings'] = [
+        {'port_id': port_id, 'queue_id': queue_id, 'lcore_id': queue_id + 1}
+        for port_id in (0, 1)
+        for queue_id in range(workers)
+    ]
+
+with open(config_file, 'w') as f:
+    yaml.dump(cfg, f, default_flow_style=False)
+
+print(f'AF_PACKET benchmark: iface0={iface0}, iface1={iface1}, workers={workers}')
+PY
+
+  cp "$config_file" "$BUILD_DIR/config.yaml"
+
+  echo "[*] Running app... generate many live flows from another terminal."
+  run_app
+
+  restore_config
+  echo "[OK] AF_PACKET benchmark done."
 }
 
 case "${1:-}" in
@@ -179,6 +331,8 @@ case "${1:-}" in
   send)     shift; cmd_send "$@" ;;
   pcap)     shift; cmd_pcap "$@" ;;
   bench)    shift; cmd_bench "$@" ;;
+  bench-pcap) shift; cmd_bench_pcap "$@" ;;
+  bench-afpacket) shift; cmd_bench_afpacket "$@" ;;
   teardown) cmd_teardown ;;
   *)        usage ;;
 esac

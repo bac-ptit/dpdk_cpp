@@ -14,6 +14,7 @@
 #include "spi_rule_engine.hpp"
 
 struct rte_mbuf;
+struct rte_ring;
 
 namespace dpdk::spi {
 
@@ -66,7 +67,9 @@ struct WorkerContext {
   const std::vector<L3RouteEntry>* l3_routes{};
   const std::vector<EthernetDestinationEntry>* ethernet_destinations{};
   AtomicCounters* counters{};
+  PipelineStats stats{};
   std::vector<std::uint64_t> rule_match_counts;
+  rte_ring* dispatch_ring{};
   const volatile std::sig_atomic_t* force_quit{};
   std::uint16_t burst_size{};
   std::uint16_t worker_id{};
@@ -95,7 +98,8 @@ class Pipeline final {
    * @param drop_unmatched Whether to drop packets that match no SPI rule.
    */
   Pipeline(const dpdk::Environment& environment, const RuleTable& rules, std::uint16_t burst_size,
-           std::uint16_t worker_count, bool mac_updating, const L3ForwardConfig& l3_forward, bool drop_unmatched);
+           std::uint16_t worker_count, bool mac_updating, const L3ForwardConfig& l3_forward, bool drop_unmatched,
+           std::string packet_distribution, std::uint32_t dispatch_queue_size);
 
   /// Stop all workers and release per-worker resources.
   ~Pipeline();
@@ -120,18 +124,23 @@ class Pipeline final {
   [[nodiscard]] const std::vector<std::uint64_t>& GetRuleMatchCounts() const noexcept { return rule_match_counts_; }
 
  private:
+  using WorkerEntryPoint = int (*)(void*);
+
   /**
    * @brief Launch all workers on remote lcores.
+   * @param entry_point Worker loop function.
    * @return Void on success, or an error string.
    */
-  [[nodiscard]] std::expected<void, std::string> StartWorkers() noexcept;
+  [[nodiscard]] std::expected<void, std::string> StartWorkers(WorkerEntryPoint entry_point) noexcept;
   /**
    * @brief Launch a single worker on the specified lcore.
    * @param worker_id  Zero-based worker index.
    * @param lcore_id   Target lcore for rte_eal_remote_launch.
+   * @param entry_point Worker loop function.
    * @return Void on success, or an error string.
    */
-  [[nodiscard]] std::expected<void, std::string> LaunchWorker(std::size_t worker_id, unsigned lcore_id) noexcept;
+  [[nodiscard]] std::expected<void, std::string> LaunchWorker(std::size_t worker_id, unsigned lcore_id,
+                                                              WorkerEntryPoint entry_point) noexcept;
   /**
    * @brief Run the hot path on the calling (main) lcore.
    * @return Final pipeline statistics.
@@ -144,6 +153,20 @@ class Pipeline final {
    */
   [[nodiscard]] std::expected<PipelineStats, std::string> RunMultiWorker(const volatile std::sig_atomic_t& force_quit,
                                                                          std::uint32_t timer_period_sec) noexcept;
+  /**
+   * @brief Run software flow-hash dispatch on main lcore plus remote workers.
+   * @return Final pipeline statistics.
+   */
+  [[nodiscard]] std::expected<PipelineStats, std::string> RunFlowHashDispatch(
+      const volatile std::sig_atomic_t& force_quit, std::uint32_t timer_period_sec) noexcept;
+  /**
+   * @brief Allocate per-worker rte_rings for flow-hash dispatch mode.
+   */
+  [[nodiscard]] std::expected<void, std::string> CreateDispatchRings() noexcept;
+  /**
+   * @brief Free per-worker rte_rings.
+   */
+  void DestroyDispatchRings() noexcept;
   /**
    * @brief Fill a WorkerContext with pointers to shared state.
    * @param context    Worker context to populate.
@@ -166,8 +189,11 @@ class Pipeline final {
   AtomicCounters counters_;
   std::vector<std::uint64_t> rule_match_counts_;
   std::vector<WorkerContext> worker_contexts_;
+  std::vector<rte_ring*> dispatch_rings_;
   std::vector<L3RouteEntry> l3_routes_;
   std::vector<EthernetDestinationEntry> ethernet_destinations_;
+  std::string packet_distribution_;
+  std::uint32_t dispatch_queue_size_{};
   std::uint16_t burst_size_{};
   bool mac_updating_{true};
   bool l3_forwarding_{false};

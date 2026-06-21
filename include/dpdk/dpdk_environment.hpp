@@ -2,8 +2,10 @@
 #include <rte_ether.h>
 #include <rte_mempool.h>
 
+#include <cstdint>
 #include <expected>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "dpdk_config.hpp"
@@ -65,6 +67,21 @@ class Environment final {
   /// Total Ethernet ports available after EAL init.
   [[nodiscard]] std::uint16_t GetPortCount() const noexcept { return port_count_; }
 
+  /// Configured RX queue count per active port.
+  [[nodiscard]] std::uint16_t GetReceiveQueueCount() const noexcept { return config_.port.receive_queues; }
+
+  /// Configured TX queue count per active port.
+  [[nodiscard]] std::uint16_t GetTransmitQueueCount() const noexcept { return config_.port.transmit_queues; }
+
+  /// Whether any active port is backed by a software/virtual PMD.
+  [[nodiscard]] bool HasSoftwareBackedPort() const noexcept;
+
+  /// Whether every active port reports RSS hash offloads.
+  [[nodiscard]] bool ActivePortsSupportRss() const noexcept;
+
+  /// Driver name reported by the PMD for a port.
+  [[nodiscard]] std::string_view GetPortDriverName(std::uint16_t port_id) const noexcept;
+
   /**
    * @brief Look up the MAC address for a given port.
    * @param port_id  The DPDK port identifier.
@@ -84,6 +101,13 @@ class Environment final {
     rte_eth_conf port_conf{};
     std::uint16_t receive_descriptors{};
     std::uint16_t transmit_descriptors{};
+  };
+
+  /// Runtime PMD information collected from rte_eth_dev_info_get.
+  struct PortRuntimeInfo {
+    std::string driver_name;
+    std::uint64_t rss_offloads{};
+    bool software_backed{false};
   };
 
   // ── Lifecycle steps — called in order by init() ──────────────────────
@@ -164,6 +188,7 @@ class Environment final {
   std::uint16_t port_count_{};
   std::vector<std::uint16_t> active_ports_;
   std::vector<rte_ether_addr> port_mac_addrs_;
+  std::vector<PortRuntimeInfo> port_runtime_infos_;
 
   static constexpr rte_eth_conf default_port_conf_{};
 };

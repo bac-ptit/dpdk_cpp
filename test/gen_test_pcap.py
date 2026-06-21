@@ -7,6 +7,21 @@ import struct
 
 PCAP_MAGIC = 0xa1b2c3d4
 LINKTYPE_ETHERNET = 1
+DEFAULT_MATCH_PERCENT = 70
+
+BENCH_RULES = [
+    ('tcp', '10.17.50.1', '10.17.50.12', 80),
+    ('tcp', '10.17.50.2', '10.17.50.12', 443),
+    ('udp', '10.17.50.3', '10.17.50.53', 53),
+    ('udp', '10.17.50.4', '10.17.50.215', 2152),
+]
+
+BENCH_MISS_RULES = [
+    ('tcp', '10.18.50.1', '10.17.50.12', 8080),
+    ('tcp', '10.18.50.2', '10.17.50.12', 8443),
+    ('udp', '10.18.50.3', '10.17.50.53', 5353),
+    ('udp', '10.18.50.4', '10.17.50.215', 9999),
+]
 
 def pcap_global_header():
     return struct.pack('<IHHiIII', PCAP_MAGIC, 2, 4, 0, 0, 65535, LINKTYPE_ETHERNET)
@@ -50,13 +65,7 @@ def build_small_pcap(path):
     src_mac = '00:00:00:00:00:01'
     pcap = bytearray(pcap_global_header())
     ts = 1000
-    rules = [
-        ('tcp', '10.17.50.1', '10.17.50.12', 80),
-        ('tcp', '10.17.50.2', '10.17.50.12', 443),
-        ('udp', '10.17.50.3', '10.17.50.53', 53),
-        ('udp', '10.17.50.4', '10.17.50.215', 2152),
-    ]
-    for proto, src_ip, dst_ip, port in rules:
+    for proto, src_ip, dst_ip, port in BENCH_RULES:
         for i in range(5):
             pkt = make_packet(proto, dst_mac, src_mac, src_ip, dst_ip, 12345 + i, port)
             pcap.extend(pcap_pkt_hdr(ts, len(pkt)))
@@ -89,14 +98,87 @@ def build_bench_pcap(path, count):
     size_mb = os.path.getsize(path) / (1024 * 1024)
     print(f"Generated {path}: {count} packets ({size_mb:.1f} MB)")
 
+def should_match(index, total, target):
+    """Return true for a stable spread of target matches across total packets."""
+    if total <= 0:
+        return False
+    return ((index + 1) * target // total) > (index * target // total)
+
+def bench_packet(index, matching):
+    """Build one deterministic benchmark packet.
+
+    Matching packets follow BENCH_RULES; miss packets are valid IPv4/TCP/UDP
+    packets that should parse but not match configured SPI rules.
+    """
+    dst_mac = 'a0:36:bc:65:8f:11'
+    src_mac = '00:00:00:00:00:01'
+    rules = BENCH_RULES if matching else BENCH_MISS_RULES
+    proto, src_ip, dst_ip, port = rules[index % len(rules)]
+    sport = 1024 + (index % 60000)
+    return make_packet(proto, dst_mac, src_mac, src_ip, dst_ip, sport, port), matching
+
+def build_sharded_bench_pcaps(directory, count, shards, match_percent, prefix):
+    """Generate benchmark PCAP shards for multi-queue net_pcap tests."""
+    if shards <= 0:
+        raise ValueError('shards must be greater than 0')
+    if not 0 <= match_percent <= 100:
+        raise ValueError('match-percent must be between 0 and 100')
+
+    os.makedirs(directory, exist_ok=True)
+    handles = []
+    paths = []
+    for shard in range(shards):
+        path = os.path.join(directory, f'{prefix}{shard}.pcap')
+        paths.append(path)
+        handle = open(path, 'wb')
+        handle.write(pcap_global_header())
+        handles.append(handle)
+
+    shard_totals = [(count + shards - 1 - shard) // shards for shard in range(shards)]
+    shard_match_targets = [total * match_percent // 100 for total in shard_totals]
+    match_remainder = count * match_percent // 100 - sum(shard_match_targets)
+    for shard in range(match_remainder):
+        shard_match_targets[shard % shards] += 1
+
+    matched = 0
+    shard_counts = [0] * shards
+    try:
+        for index in range(count):
+            shard = index % shards
+            local_index = shard_counts[shard]
+            is_target_match = should_match(local_index, shard_totals[shard], shard_match_targets[shard])
+            packet, is_match = bench_packet(local_index, is_target_match)
+            shard_counts[shard] += 1
+            if is_match:
+                matched += 1
+            handles[shard].write(pcap_pkt_hdr(1000 + index, len(packet)))
+            handles[shard].write(packet)
+    finally:
+        for handle in handles:
+            handle.close()
+
+    missed = count - matched
+    size_mb = sum(os.path.getsize(path) for path in paths) / (1024 * 1024)
+    print(
+        f"Generated {shards} shards in {directory}: {count} packets "
+        f"({matched} match, {missed} miss, {size_mb:.1f} MB)")
+
 def main():
     parser = argparse.ArgumentParser(description='Generate test pcap for DPDK')
     default_path = os.path.join(os.path.dirname(__file__), 'spi_rules.pcap')
     parser.add_argument('path', nargs='?', default=default_path, help='Output pcap path')
     parser.add_argument('--count', type=int, default=0,
                         help='Packet count for benchmark (0 = small correctness test)')
+    parser.add_argument('--shards', type=int, default=0,
+                        help='Generate this many benchmark PCAP shards in path')
+    parser.add_argument('--match-percent', type=int, default=DEFAULT_MATCH_PERCENT,
+                        help='Percentage of generated packets that match SPI rules')
+    parser.add_argument('--prefix', default='bench_q',
+                        help='Filename prefix for sharded benchmark pcaps')
     args = parser.parse_args()
-    if args.count > 0:
+    if args.count > 0 and args.shards > 0:
+        build_sharded_bench_pcaps(args.path, args.count, args.shards, args.match_percent, args.prefix)
+    elif args.count > 0:
         build_bench_pcap(args.path, args.count)
     else:
         build_small_pcap(args.path)

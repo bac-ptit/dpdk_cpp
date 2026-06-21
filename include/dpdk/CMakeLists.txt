@@ -16,6 +16,7 @@ target_include_directories(${FASTAPI_DPDK_TARGET}
 target_compile_options(${FASTAPI_DPDK_TARGET}
         PRIVATE
         -fno-exceptions
+        ${FASTAPI_RELEASE_OPTIONS}
         -Wall
         -Wextra
         -Wpedantic

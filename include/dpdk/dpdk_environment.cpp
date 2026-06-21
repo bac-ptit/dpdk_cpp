@@ -10,6 +10,7 @@
 #include <rte_mbuf.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <expected>
@@ -26,7 +27,12 @@
 namespace {
 
 constexpr std::size_t kEalArgReserve{16};
-constexpr std::uint64_t kDefaultRssHash{RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV4_UDP};
+constexpr std::uint64_t kDefaultRssHash{RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_NONFRAG_IPV4_TCP |
+                                        RTE_ETH_RSS_NONFRAG_IPV4_UDP};
+constexpr std::array<std::string_view, 11> kSoftwareBackedDriverPrefixes{
+    "net_af_packet", "net_pcap",    "net_tap",     "net_ring",    "net_memif",  "net_vhost",
+    "net_virtio",    "net_vmxnet3", "net_null",    "net_softnic", "net_af_xdp",
+};
 
 /// Container for EAL argv that keeps string storage alive.
 struct EalArgs {
@@ -165,6 +171,13 @@ struct EalArgs {
   return static_cast<std::uint32_t>(val);
 }
 
+/// Whether a PMD driver is software-backed or virtualized.
+[[nodiscard]] bool IsSoftwareBackedDriver(std::string_view driver_name) noexcept {
+  return std::ranges::any_of(kSoftwareBackedDriverPrefixes, [driver_name](std::string_view prefix) {
+    return driver_name.starts_with(prefix);
+  });
+}
+
 /// Descriptor counts extracted from the port config for a single port.
 struct DescriptorCounts {
   std::uint16_t receive_descriptors{};
@@ -236,6 +249,7 @@ std::expected<void, DpdkError> Environment::InitEal() noexcept {
     return std::unexpected(DpdkError{.message = "No Ethernet ports available after EAL init", .dpdk_errno = 0});
   }
   port_mac_addrs_.resize(port_count_);
+  port_runtime_infos_.resize(port_count_);
 
   return {};
 }
@@ -373,6 +387,14 @@ std::expected<Environment::PortSetupInfo, DpdkError> Environment::ConfigurePort(
       !info_result) {
     return std::unexpected(info_result.error());
   }
+  const std::string_view driver_name{dev_info.driver_name == nullptr ? "" : dev_info.driver_name};
+  port_runtime_infos_[port_id] = PortRuntimeInfo{
+      .driver_name = std::string{driver_name},
+      .rss_offloads = dev_info.flow_type_rss_offloads,
+      .software_backed = IsSoftwareBackedDriver(driver_name),
+  };
+  std::println("Port {} driver={} rss_offloads=0x{:x}", port_id, driver_name, dev_info.flow_type_rss_offloads);
+
   if (port_config.receive_queues > dev_info.max_rx_queues) {
     return std::unexpected(
         DpdkError{.message = std::format("port {} receive_queues={} exceeds PMD max_rx_queues={}", port_id,
@@ -546,6 +568,25 @@ void Environment::Cleanup() noexcept {
   rte_eal_cleanup();
   std::println("DPDK environment cleaned up");
   initialized_ = false;
+}
+
+bool Environment::HasSoftwareBackedPort() const noexcept {
+  return std::ranges::any_of(active_ports_, [this](std::uint16_t port_id) {
+    return port_id < port_runtime_infos_.size() && port_runtime_infos_[port_id].software_backed;
+  });
+}
+
+bool Environment::ActivePortsSupportRss() const noexcept {
+  return std::ranges::all_of(active_ports_, [this](std::uint16_t port_id) {
+    return port_id < port_runtime_infos_.size() && port_runtime_infos_[port_id].rss_offloads != 0U;
+  });
+}
+
+std::string_view Environment::GetPortDriverName(std::uint16_t port_id) const noexcept {
+  if (port_id >= port_runtime_infos_.size()) {
+    return {};
+  }
+  return port_runtime_infos_[port_id].driver_name;
 }
 
 }  // namespace dpdk

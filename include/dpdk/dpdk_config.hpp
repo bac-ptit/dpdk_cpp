@@ -22,6 +22,7 @@ constexpr std::uint32_t kDefaultTimerPeriodSec{10};
 constexpr std::uint16_t kDefaultIpv4PrefixLength{32};
 constexpr std::uint16_t kDefaultIpv6PrefixLength{128};
 constexpr std::uint16_t kDefaultEventEthRxQueues{1};
+constexpr std::uint32_t kDefaultDispatchQueueSize{8192};
 
 /// EAL configuration — translated directly to DPDK EAL command-line args.
 struct EalConfig {
@@ -208,6 +209,10 @@ struct SpiRuleConfig {
 struct SpiConfig {
   /// Number of worker lcores processing packets.
   std::uint16_t worker_count{1};
+  /// Packet distribution mode: "auto", "queue", or "flow_hash".
+  std::string packet_distribution{"auto"};
+  /// Per-worker rte_ring size for flow_hash dispatcher mode.
+  std::uint32_t dispatch_queue_size{kDefaultDispatchQueueSize};
   /// Drop packets that do not match any SPI rule.
   bool drop_unmatched{false};
   /// Ordered list of classification rules.

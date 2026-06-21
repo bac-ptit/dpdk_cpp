@@ -1,12 +1,15 @@
 #include "spi_pipeline.hpp"
 
+#include <rte_byteorder.h>
 #include <rte_cycles.h>
+#include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_ring.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
 
@@ -52,6 +55,12 @@ struct BurstCounters {
   std::uint64_t dropped{};
 };
 
+/// Runtime packet-distribution mode.
+enum class PacketDistribution {
+  kQueuePerWorker,
+  kFlowHash,
+};
+
 /// Classification outcome for one packet.
 struct PacketClassification {
   PacketMetadata metadata{};
@@ -76,6 +85,65 @@ struct PacketClassification {
     return static_cast<std::uint8_t>(value - 'a' + kHexBase);
   }
   return static_cast<std::uint8_t>(value - 'A' + kHexBase);
+}
+
+/// Mix one 32-bit word into a lightweight FNV-1a hash state.
+[[nodiscard]] constexpr std::uint32_t MixHash(std::uint32_t hash, std::uint32_t value) noexcept {
+  constexpr std::uint32_t kFnvPrime{16777619U};
+  for (std::size_t shift{0}; shift < sizeof(value) * 8U; shift += 8U) {
+    hash ^= static_cast<std::uint8_t>(value >> shift);
+    hash *= kFnvPrime;
+  }
+  return hash;
+}
+
+/// Calculate a flow-stable hash used by software dispatcher mode.
+[[nodiscard]] std::uint32_t HashPacketFlow(const rte_mbuf& packet, std::uint16_t receive_port) noexcept {
+  constexpr std::uint32_t kFnvOffset{2166136261U};
+  std::uint32_t hash{MixHash(kFnvOffset, receive_port)};
+  hash = MixHash(hash, rte_pktmbuf_pkt_len(&packet));
+
+  const auto data_len{rte_pktmbuf_data_len(&packet)};
+  if (data_len < sizeof(rte_ether_hdr)) [[unlikely]] {
+    return hash;
+  }
+
+  const auto* ether_hdr{rte_pktmbuf_mtod(&packet, const rte_ether_hdr*)};
+  const auto ether_type{rte_be_to_cpu_16(ether_hdr->ether_type)};
+  hash = MixHash(hash, ether_type);
+  if (ether_type != RTE_ETHER_TYPE_IPV4 || data_len < sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr)) {
+    return hash;
+  }
+
+  const auto* ipv4_hdr{rte_pktmbuf_mtod_offset(&packet, const rte_ipv4_hdr*, sizeof(rte_ether_hdr))};
+  const auto ipv4_header_len{rte_ipv4_hdr_len(ipv4_hdr)};
+  if (ipv4_header_len < sizeof(rte_ipv4_hdr)) [[unlikely]] {
+    return hash;
+  }
+
+  hash = MixHash(hash, rte_be_to_cpu_32(ipv4_hdr->src_addr));
+  hash = MixHash(hash, rte_be_to_cpu_32(ipv4_hdr->dst_addr));
+  hash = MixHash(hash, ipv4_hdr->next_proto_id);
+
+  const auto l4_offset{static_cast<std::uint16_t>(sizeof(rte_ether_hdr) + ipv4_header_len)};
+  if (data_len < l4_offset + sizeof(rte_udp_hdr)) {
+    return hash;
+  }
+
+  if (ipv4_hdr->next_proto_id == IPPROTO_TCP) {
+    if (data_len < l4_offset + sizeof(rte_tcp_hdr)) [[unlikely]] {
+      return hash;
+    }
+    const auto* tcp_hdr{rte_pktmbuf_mtod_offset(&packet, const rte_tcp_hdr*, l4_offset)};
+    hash = MixHash(hash, rte_be_to_cpu_16(tcp_hdr->src_port));
+    hash = MixHash(hash, rte_be_to_cpu_16(tcp_hdr->dst_port));
+  } else if (ipv4_hdr->next_proto_id == IPPROTO_UDP) {
+    const auto* udp_hdr{rte_pktmbuf_mtod_offset(&packet, const rte_udp_hdr*, l4_offset)};
+    hash = MixHash(hash, rte_be_to_cpu_16(udp_hdr->src_port));
+    hash = MixHash(hash, rte_be_to_cpu_16(udp_hdr->dst_port));
+  }
+
+  return hash;
 }
 
 /// Parse a validated MM:MM:MM:MM:MM:MM MAC address.
@@ -295,6 +363,27 @@ void AddBurstCounters(AtomicCounters& counters, const BurstCounters& burst) noex
   counters.dropped.fetch_add(burst.dropped, std::memory_order_relaxed);
 }
 
+/// Fold worker-side counters in dispatcher mode without double-counting RX.
+void AddDispatchedWorkerCounters(AtomicCounters& counters, const BurstCounters& burst) noexcept {
+  counters.transmitted.fetch_add(burst.transmitted, std::memory_order_relaxed);
+  counters.parsed.fetch_add(burst.parsed, std::memory_order_relaxed);
+  counters.matched.fetch_add(burst.matched, std::memory_order_relaxed);
+  counters.unknown.fetch_add(burst.unknown, std::memory_order_relaxed);
+  counters.malformed.fetch_add(burst.malformed, std::memory_order_relaxed);
+  counters.dropped.fetch_add(burst.dropped, std::memory_order_relaxed);
+}
+
+/// Add per-burst counters to a worker-local stats snapshot.
+void AddBurstStats(PipelineStats& stats, const BurstCounters& burst) noexcept {
+  stats.received += burst.received;
+  stats.transmitted += burst.transmitted;
+  stats.parsed += burst.parsed;
+  stats.matched += burst.matched;
+  stats.unknown += burst.unknown;
+  stats.malformed += burst.malformed;
+  stats.dropped += burst.dropped;
+}
+
 /// Print the current counter state to stdout.
 void PrintStats(const AtomicCounters& counters) noexcept {
   std::println(
@@ -330,6 +419,18 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
   }
 }
 
+/// Print final packet counters for each worker queue.
+void PrintWorkerStats(const std::vector<WorkerContext>& contexts) noexcept {
+  for (const auto& context : contexts) {
+    const auto& stats{context.stats};
+    std::println(
+        "Worker {} stats: received={} transmitted={} parsed={} matched={} "
+        "unknown={} malformed={} dropped={}",
+        context.worker_id, stats.received, stats.transmitted, stats.parsed, stats.matched, stats.unknown,
+        stats.malformed, stats.dropped);
+  }
+}
+
 /// Print forward mapping from receive port to transmit port.
 void PrintForwardMap(const std::vector<std::uint16_t>& active_ports) noexcept {
   for (const auto port_id : active_ports) {
@@ -342,6 +443,47 @@ void PrintQueueMap(std::size_t worker_count) noexcept {
   for (std::size_t worker_id{0}; worker_id < worker_count; ++worker_id) {
     std::println("Queue map: worker {} -> receive queue {} / transmit queue {}", worker_id, worker_id, worker_id);
   }
+}
+
+/// Print software dispatcher assignment per worker.
+void PrintDispatchMap(std::size_t worker_count, std::uint32_t queue_size) noexcept {
+  std::println("Dispatch map: main lcore receives packets and flow-hashes into {} worker rings", worker_count);
+  for (std::size_t worker_id{0}; worker_id < worker_count; ++worker_id) {
+    std::println("Dispatch map: worker {} -> ring size {} / transmit queue {}", worker_id, queue_size, worker_id);
+  }
+}
+
+/// Select queue-per-worker or software flow-hash packet distribution.
+[[nodiscard]] PacketDistribution ResolvePacketDistribution(const dpdk::Environment& environment,
+                                                           std::string_view configured_mode,
+                                                           std::size_t worker_count) noexcept {
+  if (configured_mode == "queue") {
+    std::println("Packet distribution: queue (forced by config)");
+    return PacketDistribution::kQueuePerWorker;
+  }
+  if (configured_mode == "flow_hash") {
+    std::println("Packet distribution: flow_hash (forced by config)");
+    return PacketDistribution::kFlowHash;
+  }
+  if (worker_count <= 1) {
+    std::println("Packet distribution: queue (auto, single worker)");
+    return PacketDistribution::kQueuePerWorker;
+  }
+  if (environment.HasSoftwareBackedPort()) {
+    std::println("Packet distribution: flow_hash (auto, software/vNIC PMD detected)");
+    return PacketDistribution::kFlowHash;
+  }
+  if (!environment.ActivePortsSupportRss()) {
+    std::println("Packet distribution: flow_hash (auto, active ports report no RSS offloads)");
+    return PacketDistribution::kFlowHash;
+  }
+  if (environment.GetReceiveQueueCount() < worker_count) {
+    std::println("Packet distribution: flow_hash (auto, RX queues < worker count)");
+    return PacketDistribution::kFlowHash;
+  }
+
+  std::println("Packet distribution: queue (auto, NIC RSS path)");
+  return PacketDistribution::kQueuePerWorker;
 }
 
 /**
@@ -434,6 +576,7 @@ void DropPacket(BurstCounters& counters, rte_mbuf* packet) noexcept {
   if (transmit_mac == nullptr) [[unlikely]] {
     return false;
   }
+  [[assume(transmit_mac != nullptr)]];
 
   if (context.l3_forwarding) {
     const auto* destination_mac{GetEthernetDestination(*context.ethernet_destinations, transmit_port)};
@@ -450,6 +593,7 @@ void DropPacket(BurstCounters& counters, rte_mbuf* packet) noexcept {
 void EnqueuePacket(rte_mbuf* packet, std::uint16_t transmit_port,
                    std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
                    std::vector<std::uint16_t>& transmit_counts) noexcept {
+  [[assume(transmit_port < transmit_buffers.size())]];
   auto& count{transmit_counts[transmit_port]};
   *std::next(transmit_buffers[transmit_port].data(), static_cast<std::ptrdiff_t>(count)) = packet;
   ++count;
@@ -516,6 +660,7 @@ void FlushTransmitBuffers(WorkerContext const& context,
     }
 
     const auto sent{rte_eth_tx_burst(port_id, context.worker_id, transmit_buffers[port_id].data(), count)};
+    [[assume(sent <= count)]];
     counters.transmitted += sent;
     if (sent < count) [[unlikely]] {
       counters.dropped += static_cast<std::uint64_t>(count - sent);
@@ -543,6 +688,8 @@ void ProcessPortBurst(WorkerContext& context, const std::vector<std::uint16_t>& 
                       std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
                       std::vector<std::uint16_t>& transmit_counts, BurstCounters& counters) noexcept {
   const auto received{rte_eth_rx_burst(port_id, context.worker_id, packets.data(), context.burst_size)};
+  [[assume(received <= kMaxBurstCapacity)]];
+  [[assume(received <= context.burst_size)]];
   counters.received += received;
 
   const std::span received_packets{packets.data(), received};
@@ -575,7 +722,72 @@ void ProcessWorkerIteration(WorkerContext& context, std::array<rte_mbuf*, kMaxBu
   }
 
   FlushTransmitBuffers(context, transmit_buffers, transmit_counts, burst_counters);
+  AddBurstStats(context.stats, burst_counters);
   AddBurstCounters(*context.counters, burst_counters);
+}
+
+/// Enqueue one received packet to the worker ring selected by flow hash.
+void DispatchPacketToWorker(rte_mbuf* packet, std::uint16_t receive_port, std::span<rte_ring*> dispatch_rings,
+                            BurstCounters& counters) noexcept {
+  packet->port = receive_port;
+  const auto worker_id{HashPacketFlow(*packet, receive_port) % dispatch_rings.size()};
+  if (rte_ring_sp_enqueue(dispatch_rings[worker_id], packet) != 0) [[unlikely]] {
+    DropPacket(counters, packet);
+  }
+}
+
+/// Receive one burst from a selected RX queue and dispatch packets to workers.
+void DispatchPortQueueBurst(std::uint16_t port_id, std::uint16_t queue_id, std::uint16_t burst_size,
+                            std::array<rte_mbuf*, kMaxBurstCapacity>& packets, std::span<rte_ring*> dispatch_rings,
+                            BurstCounters& counters) noexcept {
+  const auto received{rte_eth_rx_burst(port_id, queue_id, packets.data(), burst_size)};
+  [[assume(received <= kMaxBurstCapacity)]];
+  [[assume(received <= burst_size)]];
+  counters.received += received;
+
+  const std::span received_packets{packets.data(), received};
+  PrefetchPackets(received_packets);
+  for (auto* packet : received_packets) {
+    DispatchPacketToWorker(packet, port_id, dispatch_rings, counters);
+  }
+}
+
+/// Run one full dispatcher iteration on the main lcore.
+void ProcessDispatchIteration(const dpdk::Environment& environment, std::uint16_t burst_size,
+                              std::array<rte_mbuf*, kMaxBurstCapacity>& packets, std::span<rte_ring*> dispatch_rings,
+                              AtomicCounters& counters) noexcept {
+  BurstCounters burst_counters;
+  for (const auto port_id : environment.GetActivePorts()) {
+    for (std::uint16_t queue_id{0}; queue_id < environment.GetReceiveQueueCount(); ++queue_id) {
+      DispatchPortQueueBurst(port_id, queue_id, burst_size, packets, dispatch_rings, burst_counters);
+    }
+  }
+  AddBurstCounters(counters, burst_counters);
+}
+
+/// Run one worker iteration in software-dispatch mode.
+void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbuf*, kMaxBurstCapacity>& packets,
+                                      std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
+                                      std::vector<std::uint16_t>& transmit_counts) noexcept {
+  BurstCounters burst_counters;
+  std::ranges::fill(transmit_counts, 0);
+
+  const auto received{rte_ring_sc_dequeue_burst(context.dispatch_ring, reinterpret_cast<void**>(packets.data()),
+                                                context.burst_size, nullptr)};
+  [[assume(received <= kMaxBurstCapacity)]];
+  [[assume(received <= context.burst_size)]];
+  burst_counters.received += received;
+
+  const std::span received_packets{packets.data(), received};
+  PrefetchPackets(received_packets);
+  const auto& active_ports{context.environment->GetActivePorts()};
+  for (auto* packet : received_packets) {
+    ForwardPacket(context, active_ports, burst_counters, packet, packet->port, transmit_buffers, transmit_counts);
+  }
+
+  FlushTransmitBuffers(context, transmit_buffers, transmit_counts, burst_counters);
+  AddBurstStats(context.stats, burst_counters);
+  AddDispatchedWorkerCounters(*context.counters, burst_counters);
 }
 
 /**
@@ -596,24 +808,43 @@ int WorkerLoop(void* arg) noexcept {
   return 0;
 }
 
+/// Entry point for workers that receive packets from software dispatch rings.
+int DispatchWorkerLoop(void* arg) noexcept {
+  auto* context{static_cast<WorkerContext*>(arg)};
+  std::array<rte_mbuf*, kMaxBurstCapacity> packets{};
+  std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>> transmit_buffers(context->environment->GetPortCount());
+  std::vector<std::uint16_t> transmit_counts(context->environment->GetPortCount());
+
+  while (*context->force_quit == 0) {
+    ProcessDispatchedWorkerIteration(*context, packets, transmit_buffers, transmit_counts);
+  }
+  return 0;
+}
+
 }  // namespace
 
 Pipeline::Pipeline(const dpdk::Environment& environment, const RuleTable& rules, std::uint16_t burst_size,
-                   std::uint16_t worker_count, bool mac_updating, const L3ForwardConfig& l3_forward, bool drop_unmatched)
+                   std::uint16_t worker_count, bool mac_updating, const L3ForwardConfig& l3_forward,
+                   bool drop_unmatched, std::string packet_distribution, std::uint32_t dispatch_queue_size)
     : environment_{environment},
       rules_{rules},
       rule_match_counts_(rules.Size()),
       worker_contexts_(worker_count),
       l3_routes_{BuildL3Routes(l3_forward)},
       ethernet_destinations_{BuildEthernetDestinations(l3_forward)},
+      packet_distribution_{std::move(packet_distribution)},
+      dispatch_queue_size_{dispatch_queue_size},
       burst_size_{std::clamp(burst_size, kMinBurstCapacity, kMaxBurstCapacity)},
       mac_updating_{mac_updating},
       l3_forwarding_{l3_forward.enabled},
       drop_unmatched_{drop_unmatched} {}
 
-Pipeline::~Pipeline() { StopWorkers(); }
+Pipeline::~Pipeline() {
+  StopWorkers();
+  DestroyDispatchRings();
+}
 
-std::expected<void, std::string> Pipeline::StartWorkers() noexcept {
+std::expected<void, std::string> Pipeline::StartWorkers(WorkerEntryPoint entry_point) noexcept {
   if (workers_started_) {
     return {};
   }
@@ -627,7 +858,7 @@ std::expected<void, std::string> Pipeline::StartWorkers() noexcept {
 
   worker_force_quit_ = 0;
   for (std::size_t worker_id{0}; worker_id < worker_contexts_.size(); ++worker_id) {
-    if (const auto launched{LaunchWorker(worker_id, worker_lcores[worker_id])}; !launched) {
+    if (const auto launched{LaunchWorker(worker_id, worker_lcores[worker_id], entry_point)}; !launched) {
       return std::unexpected(launched.error());
     }
   }
@@ -636,11 +867,12 @@ std::expected<void, std::string> Pipeline::StartWorkers() noexcept {
   return {};
 }
 
-std::expected<void, std::string> Pipeline::LaunchWorker(std::size_t worker_id, unsigned lcore_id) noexcept {
+std::expected<void, std::string> Pipeline::LaunchWorker(std::size_t worker_id, unsigned lcore_id,
+                                                        WorkerEntryPoint entry_point) noexcept {
   auto& context{worker_contexts_[worker_id]};
   PrepareWorkerContext(context, worker_force_quit_, static_cast<std::uint16_t>(worker_id));
 
-  const int ret{rte_eal_remote_launch(WorkerLoop, &context, lcore_id)};
+  const int ret{rte_eal_remote_launch(entry_point, &context, lcore_id)};
   if (ret == 0) {
     return {};
   }
@@ -668,13 +900,44 @@ void Pipeline::PrepareWorkerContext(WorkerContext& context, const volatile std::
   context.l3_routes = &l3_routes_;
   context.ethernet_destinations = &ethernet_destinations_;
   context.counters = &counters_;
+  context.stats = {};
   context.rule_match_counts.assign(rules_.Size(), 0);
+  context.dispatch_ring = worker_id < dispatch_rings_.size() ? dispatch_rings_[worker_id] : nullptr;
   context.force_quit = &force_quit;
   context.burst_size = burst_size_;
   context.worker_id = worker_id;
   context.mac_updating = mac_updating_;
   context.l3_forwarding = l3_forwarding_;
   context.drop_unmatched = drop_unmatched_;
+}
+
+std::expected<void, std::string> Pipeline::CreateDispatchRings() noexcept {
+  if (!dispatch_rings_.empty()) {
+    return {};
+  }
+
+  dispatch_rings_.reserve(worker_contexts_.size());
+  for (std::size_t worker_id{0}; worker_id < worker_contexts_.size(); ++worker_id) {
+    const auto ring_name{std::format("spi_dispatch_{}", worker_id)};
+    rte_ring* ring{rte_ring_create(ring_name.c_str(), dispatch_queue_size_, rte_socket_id(),
+                                   RING_F_SP_ENQ | RING_F_SC_DEQ)};
+    if (ring == nullptr) {
+      DestroyDispatchRings();
+      return std::unexpected(std::format("rte_ring_create '{}' failed (rte_errno={}: {})", ring_name, rte_errno,
+                                         rte_strerror(rte_errno)));
+    }
+    dispatch_rings_.push_back(ring);
+  }
+  return {};
+}
+
+void Pipeline::DestroyDispatchRings() noexcept {
+  for (auto* ring : dispatch_rings_) {
+    if (ring != nullptr) {
+      rte_ring_free(ring);
+    }
+  }
+  dispatch_rings_.clear();
 }
 
 std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const volatile std::sig_atomic_t& force_quit,
@@ -701,12 +964,22 @@ std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const volati
   }
 
   rule_match_counts_ = std::move(context.rule_match_counts);
+  PrintWorkerStats(worker_contexts_);
   return CollectStats(counters_);
 }
 
 std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const volatile std::sig_atomic_t& force_quit,
                                                                    std::uint32_t timer_period_sec) noexcept {
-  if (const auto started{StartWorkers()}; !started) {
+  if (environment_.GetReceiveQueueCount() < worker_contexts_.size()) {
+    return std::unexpected(std::format("queue mode needs receive_queues >= worker_count ({} < {})",
+                                       environment_.GetReceiveQueueCount(), worker_contexts_.size()));
+  }
+  if (environment_.GetTransmitQueueCount() < worker_contexts_.size()) {
+    return std::unexpected(std::format("queue mode needs transmit_queues >= worker_count ({} < {})",
+                                       environment_.GetTransmitQueueCount(), worker_contexts_.size()));
+  }
+
+  if (const auto started{StartWorkers(WorkerLoop)}; !started) {
     return std::unexpected(started.error());
   }
 
@@ -724,6 +997,43 @@ std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const volatil
   }
 
   StopWorkers();
+  PrintWorkerStats(worker_contexts_);
+  CollectWorkerRuleCounts();
+  return CollectStats(counters_);
+}
+
+std::expected<PipelineStats, std::string> Pipeline::RunFlowHashDispatch(
+    const volatile std::sig_atomic_t& force_quit, std::uint32_t timer_period_sec) noexcept {
+  if (environment_.GetTransmitQueueCount() < worker_contexts_.size()) {
+    return std::unexpected(std::format("flow_hash mode needs transmit_queues >= worker_count ({} < {})",
+                                       environment_.GetTransmitQueueCount(), worker_contexts_.size()));
+  }
+
+  if (const auto rings_created{CreateDispatchRings()}; !rings_created) {
+    return std::unexpected(rings_created.error());
+  }
+  if (const auto started{StartWorkers(DispatchWorkerLoop)}; !started) {
+    return std::unexpected(started.error());
+  }
+
+  const auto& active_ports{environment_.GetActivePorts()};
+  std::println("Entering SPI packet-processing loop");
+  std::println("Software flow-hash dispatcher mode on main lcore");
+  PrintForwardMap(active_ports);
+  PrintDispatchMap(worker_contexts_.size(), dispatch_queue_size_);
+
+  std::array<rte_mbuf*, kMaxBurstCapacity> packets{};
+  std::uint64_t previous_tsc{rte_rdtsc()};
+  std::uint64_t timer_tsc{};
+  const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
+  const std::span dispatch_rings{dispatch_rings_.data(), dispatch_rings_.size()};
+  while (force_quit == 0) {
+    ProcessDispatchIteration(environment_, burst_size_, packets, dispatch_rings, counters_);
+    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc);
+  }
+
+  StopWorkers();
+  PrintWorkerStats(worker_contexts_);
   CollectWorkerRuleCounts();
   return CollectStats(counters_);
 }
@@ -742,6 +1052,12 @@ std::expected<PipelineStats, std::string> Pipeline::RunUntilStopped(const volati
                                                                     std::uint32_t timer_period_sec) noexcept {
   if (worker_contexts_.size() == 1) {
     return RunSingleWorker(force_quit, timer_period_sec);
+  }
+
+  const auto packet_distribution{
+      ResolvePacketDistribution(environment_, packet_distribution_, worker_contexts_.size())};
+  if (packet_distribution == PacketDistribution::kFlowHash) {
+    return RunFlowHashDispatch(force_quit, timer_period_sec);
   }
   return RunMultiWorker(force_quit, timer_period_sec);
 }

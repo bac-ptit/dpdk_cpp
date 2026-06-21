@@ -1,8 +1,8 @@
 # EAL (Environment Abstraction Layer) configuration — the low-level abstraction that
 # allows DPDK to access hardware resources like CPU cores, memory, and network devices.
 eal:
-  # Comma-separated list or range of logical CPU cores to use (e.g., "0-1" means core 0 and core 1).
-  cpu_core_list: 0-1
+  # Comma-separated list or range of logical CPU cores to use (0 = main, 1-6 = workers).
+  cpu_core_list: 0-6
   # Prefix for shared memory and hugepage files to isolate multiple DPDK instances.
   file_prefix: spifast
   # Use legacy memory mode (allocate all memory at startup instead of dynamic allocation).
@@ -11,8 +11,8 @@ eal:
   log_level: '7'
   # Number of memory channels (depends on motherboard architecture; typically 2 or 4).
   memory_channels: 2
-  # Amount of memory to allocate when legacy_memory is enabled, in kilobytes.
-  memory_size: '1337'
+  # Amount of memory to allocate when legacy_memory is enabled, in megabytes.
+  memory_size: '768'
   # Disable the use of hugepages (required when running in virtual environments without hugepage support).
   disable_hugepages: true
   # Disable PCI device scanning (required when using virtual devices instead of physical PCI hardware).
@@ -24,10 +24,10 @@ eal:
   # AF_PACKET socket on virtual bridge virbr1 (first virtual bridge, connects to VM1 subnet).
   # net_af_packet is a DPDK poll-mode driver that uses Linux AF_PACKET sockets.
   # iface=virbr1 attaches to the bridge named "virbr1".
-  # qpairs=1 means one queue pair (one receive queue + one transmit queue).
-  - net_af_packet0,iface=virbr1,qpairs=1
+  # qpairs=6 means six queue pairs (six receive queues + six transmit queues).
+  - net_af_packet0,iface=virbr1,qpairs=6,qdisc_bypass=1,fanout_mode=hash,framecnt=4096
   # AF_PACKET socket on virtual bridge virbr2 (second virtual bridge, connects to VM2 subnet).
-  - net_af_packet1,iface=virbr2,qpairs=1
+  - net_af_packet1,iface=virbr2,qpairs=6,qdisc_bypass=1,fanout_mode=hash,framecnt=4096
 
 # L2 (Layer 2 / Data Link Layer) forwarding configuration — forwards Ethernet frames
 # between ports with optional MAC address rewriting.
@@ -69,14 +69,42 @@ l3_forward:
     mac_address: 52:54:00:fe:7b:5d
   # Mapping from (port, queue) pairs to the logical core that processes them.
   queue_mappings:
-  # Port 0, queue 0 is processed by logical core 1.
   - port_id: 0
     queue_id: 0
     lcore_id: 1
-  # Port 1, queue 0 is processed by logical core 1.
+  - port_id: 0
+    queue_id: 1
+    lcore_id: 2
+  - port_id: 0
+    queue_id: 2
+    lcore_id: 3
+  - port_id: 0
+    queue_id: 3
+    lcore_id: 4
+  - port_id: 0
+    queue_id: 4
+    lcore_id: 5
+  - port_id: 0
+    queue_id: 5
+    lcore_id: 6
   - port_id: 1
     queue_id: 0
     lcore_id: 1
+  - port_id: 1
+    queue_id: 1
+    lcore_id: 2
+  - port_id: 1
+    queue_id: 2
+    lcore_id: 3
+  - port_id: 1
+    queue_id: 3
+    lcore_id: 4
+  - port_id: 1
+    queue_id: 4
+    lcore_id: 5
+  - port_id: 1
+    queue_id: 5
+    lcore_id: 6
 
 # Mempool (memory buffer pool) configuration — pre-allocated pool of fixed-size packet
 # buffers (mbufs) used by DPDK to store received and transmitted packets.
@@ -89,7 +117,7 @@ mempool:
   # Name of the memory pool, used for identification in DPDK logs and debugging.
   name: mbuf_pool
   # Total number of memory buffers (mbufs) pre-allocated in the pool.
-  memory_buffer_count: 251024
+  memory_buffer_count: 131072
 
 # Port (physical or virtual network interface) configuration for DPDK Ethernet devices.
 port:
@@ -106,18 +134,25 @@ port:
   promiscuous: true
   # Number of receive descriptors in the hardware ring buffer for each receive queue.
   receive_descriptors: 1024
-  # Number of receive queues to configure on each port.
-  receive_queues: 1
-  # Number of transmit descriptors in the hardware ring buffer for each transmit queue.
+  # Number of receiver queues to configure on each port.
+  receive_queues: 6
+  # Number of transmitted descriptors in the hardware ring buffer for each transmit queue.
   transmit_descriptors: 1024
-  # Number of transmit queues to configure on each port.
-  transmit_queues: 1
+  # Number of transmitted queues to configure on each port.
+  transmit_queues: 6
 
 # SPI (Shallow Packet Inspection) configuration — classifies packets by matching
 # header fields (IP addresses, ports, protocol) against a set of user-defined rules.
 spi:
   # Number of worker cores dedicated to packet processing.
-  worker_count: 1
+  worker_count: 6
+  # Packet distribution mode:
+  # - auto: queue mode for RSS-capable real NICs, flow_hash for vNIC/PCAP/software PMDs.
+  # - queue: one RX/TX queue per worker.
+  # - flow_hash: main lcore receives packets and hashes flows to worker rings.
+  packet_distribution: auto
+  # Per-worker rte_ring size used only by flow_hash mode.
+  dispatch_queue_size: 16384
   # When true, any packet that does not match any rule is silently dropped.
   drop_unmatched: true
   # Ordered list of classification rules (first match wins).
