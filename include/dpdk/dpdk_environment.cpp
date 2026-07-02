@@ -1,5 +1,5 @@
 // NOLINTBEGIN(misc-include-cleaner)
-#include "dpdk_environment.hpp"
+#include "dpdk/dpdk_environment.hpp"
 
 #include <rte_cycles.h>
 #include <rte_eal.h>
@@ -22,16 +22,15 @@
 #include <utility>
 #include <vector>
 
-#include "dpdk_config.hpp"
+#include "dpdk/config/dpdk_config.hpp"
 
 namespace {
 
 constexpr std::size_t kEalArgReserve{16};
-constexpr std::uint64_t kDefaultRssHash{RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_NONFRAG_IPV4_TCP |
-                                        RTE_ETH_RSS_NONFRAG_IPV4_UDP};
+constexpr std::uint64_t kDefaultRssHash{RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV4_UDP};
 constexpr std::array<std::string_view, 11> kSoftwareBackedDriverPrefixes{
-    "net_af_packet", "net_pcap",    "net_tap",     "net_ring",    "net_memif",  "net_vhost",
-    "net_virtio",    "net_vmxnet3", "net_null",    "net_softnic", "net_af_xdp",
+    "net_af_packet", "net_pcap",    "net_tap",  "net_ring",    "net_memif",  "net_vhost",
+    "net_virtio",    "net_vmxnet3", "net_null", "net_softnic", "net_af_xdp",
 };
 
 /// Container for EAL argv that keeps string storage alive.
@@ -173,27 +172,8 @@ struct EalArgs {
 
 /// Whether a PMD driver is software-backed or virtualized.
 [[nodiscard]] bool IsSoftwareBackedDriver(std::string_view driver_name) noexcept {
-  return std::ranges::any_of(kSoftwareBackedDriverPrefixes, [driver_name](std::string_view prefix) {
-    return driver_name.starts_with(prefix);
-  });
-}
-
-/// Descriptor counts extracted from the port config for a single port.
-struct DescriptorCounts {
-  std::uint16_t receive_descriptors{};
-  std::uint16_t transmit_descriptors{};
-};
-
-/**
- * @brief Extract configured descriptor counts from the port config.
- * @param port_config  The port configuration struct.
- * @return DescriptorCounts with both RX and TX counts.
- */
-[[nodiscard]] constexpr DescriptorCounts GetDescriptorCounts(const dpdk::PortConfig& port_config) noexcept {
-  return {
-      .receive_descriptors = port_config.receive_descriptors,
-      .transmit_descriptors = port_config.transmit_descriptors,
-  };
+  return std::ranges::any_of(kSoftwareBackedDriverPrefixes,
+                             [driver_name](const std::string_view prefix) { return driver_name.starts_with(prefix); });
 }
 
 }  // namespace
@@ -262,17 +242,17 @@ std::expected<void, DpdkError> Environment::InitEal() noexcept {
  * @return Void on success, or a DpdkError.
  */
 std::expected<void, DpdkError> Environment::CreateMempool() noexcept {
-  const auto& mempool_config{config_.mempool};
+  const auto& [name, memory_buffer_count, cache_size, memory_buffer_size]{config_.mempool};
   const auto num_mbufs{static_cast<unsigned>(
-      std::max(mempool_config.memory_buffer_count, static_cast<std::size_t>(port_count_) * 1024U))};
+      std::max(memory_buffer_count, static_cast<std::size_t>(port_count_) * 1024U))};
 
   memory_buffer_pool_ = rte_pktmbuf_pool_create(
-      mempool_config.name.c_str(), num_mbufs, static_cast<unsigned>(mempool_config.cache_size), 0,
-      static_cast<unsigned>(mempool_config.memory_buffer_size), static_cast<int>(rte_socket_id()));
+      name.c_str(), num_mbufs, static_cast<unsigned>(cache_size), 0,
+      static_cast<unsigned>(memory_buffer_size), static_cast<int>(rte_socket_id()));
 
-  if (memory_buffer_pool_ == nullptr) {
+  if (memory_buffer_pool_ != nullptr) {
     return std::unexpected(DpdkError{.message = std::format("rte_pktmbuf_pool_create '{}' failed (rte_errno={}: {})",
-                                                            mempool_config.name, rte_errno, rte_strerror(rte_errno)),
+                                                            name, rte_errno, rte_strerror(rte_errno)),
                                      .dpdk_errno = rte_errno});
   }
 
@@ -294,7 +274,7 @@ std::expected<void, DpdkError> Environment::SetupPorts() noexcept {
 
   std::uint16_t nb_ports_available{0};
   for (std::uint16_t port_id{0}; port_id < port_count_; ++port_id) {
-    if (((*port_mask) & (1U << port_id)) == 0U) {
+    if ((*port_mask & 1U << port_id) == 0U) {
       std::println("Skipping disabled port {}", port_id);
       continue;
     }
@@ -375,18 +355,53 @@ std::expected<void, DpdkError> Environment::SetupPort(std::uint16_t port_id) noe
 }
 
 /**
- * @brief Query device info, validate queue counts, configure RSS and port.
- * @param port_id      DPDK port identifier.
- * @param port_config  Port configuration from DpdkConfig.
- * @return PortSetupInfo on success, or a DpdkError.
+ * @brief Query device info, validate queues, configure port, get MAC.
+ *
+ * Orchestrates six focused steps: query → store → validate → build conf →
+ * apply → retrieve MAC. Each step is a separate helper for readability.
  */
 std::expected<Environment::PortSetupInfo, DpdkError> Environment::ConfigurePort(
     std::uint16_t port_id, const PortConfig& port_config) noexcept {
+  auto dev_info{QueryDeviceInfo(port_id)};
+  if (!dev_info) {
+    return std::unexpected(dev_info.error());
+  }
+
+  StoreRuntimeInfo(port_id, *dev_info);
+
+  if (const auto queue_result{ValidateQueueCounts(port_id, port_config, *dev_info)}; !queue_result) {
+    return std::unexpected(queue_result.error());
+  }
+
+  auto local_port_conf{BuildPortConf(port_config, *dev_info, port_id)};
+
+  auto descriptors{ApplyConfiguration(port_id, port_config, local_port_conf)};
+  if (!descriptors) {
+    return std::unexpected(descriptors.error());
+  }
+
+  if (const auto mac_result{RetrieveMacAddress(port_id)}; !mac_result) {
+    return std::unexpected(mac_result.error());
+  }
+
+  return PortSetupInfo{
+      .dev_info = *dev_info,
+      .port_conf = local_port_conf,
+      .receive_descriptors = descriptors->receive_descriptors,
+      .transmit_descriptors = descriptors->transmit_descriptors,
+  };
+}
+
+std::expected<rte_eth_dev_info, DpdkError> Environment::QueryDeviceInfo(std::uint16_t port_id) const noexcept {
   rte_eth_dev_info dev_info{};
   if (const auto info_result{CheckNonZeroResult(rte_eth_dev_info_get(port_id, &dev_info), "rte_eth_dev_info_get")};
       !info_result) {
     return std::unexpected(info_result.error());
   }
+  return dev_info;
+}
+
+void Environment::StoreRuntimeInfo(std::uint16_t port_id, const rte_eth_dev_info& dev_info) noexcept {
   const std::string_view driver_name{dev_info.driver_name == nullptr ? "" : dev_info.driver_name};
   port_runtime_infos_[port_id] = PortRuntimeInfo{
       .driver_name = std::string{driver_name},
@@ -394,7 +409,11 @@ std::expected<Environment::PortSetupInfo, DpdkError> Environment::ConfigurePort(
       .software_backed = IsSoftwareBackedDriver(driver_name),
   };
   std::println("Port {} driver={} rss_offloads=0x{:x}", port_id, driver_name, dev_info.flow_type_rss_offloads);
+}
 
+std::expected<void, DpdkError> Environment::ValidateQueueCounts(std::uint16_t port_id,
+                                                                const PortConfig& port_config,
+                                                                const rte_eth_dev_info& dev_info) const noexcept {
   if (port_config.receive_queues > dev_info.max_rx_queues) {
     return std::unexpected(
         DpdkError{.message = std::format("port {} receive_queues={} exceeds PMD max_rx_queues={}", port_id,
@@ -407,17 +426,24 @@ std::expected<Environment::PortSetupInfo, DpdkError> Environment::ConfigurePort(
                                          port_config.transmit_queues, dev_info.max_tx_queues),
                   .dpdk_errno = 0});
   }
+  return {};
+}
 
-  auto local_port_conf{default_port_conf_};
+rte_eth_conf Environment::BuildPortConf(const PortConfig& port_config,
+                                        const rte_eth_dev_info& dev_info,
+                                        std::uint16_t port_id) const noexcept {
+  auto port_conf{default_port_conf_};
+
   if ((dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) != 0UL) {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
-    local_port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
   }
+
   if (port_config.receive_queues > 1) {
     const auto rss_hf{kDefaultRssHash & dev_info.flow_type_rss_offloads};
     if (rss_hf != 0U) {
-      local_port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-      local_port_conf.rx_adv_conf.rss_conf.rss_hf = rss_hf;
+      port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+      port_conf.rx_adv_conf.rss_conf.rss_hf = rss_hf;
     } else {
       std::println(stderr,
                    "Warning: port {} has {} RX queues but PMD reports no "
@@ -426,14 +452,20 @@ std::expected<Environment::PortSetupInfo, DpdkError> Environment::ConfigurePort(
     }
   }
 
+  return port_conf;
+}
+
+std::expected<Environment::DescriptorCounts, DpdkError> Environment::ApplyConfiguration(
+    std::uint16_t port_id, const PortConfig& port_config, const rte_eth_conf& port_conf) noexcept {
   if (const auto configure_result{CheckNegativeResult(
-          rte_eth_dev_configure(port_id, port_config.receive_queues, port_config.transmit_queues, &local_port_conf),
+          rte_eth_dev_configure(port_id, port_config.receive_queues, port_config.transmit_queues, &port_conf),
           "rte_eth_dev_configure")};
       !configure_result) {
     return std::unexpected(configure_result.error());
   }
 
-  auto [receive_descriptors, transmit_descriptors]{GetDescriptorCounts(port_config)};
+  auto receive_descriptors{port_config.receive_descriptors};
+  auto transmit_descriptors{port_config.transmit_descriptors};
   if (const auto adjust_result{
           CheckNegativeResult(rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &receive_descriptors, &transmit_descriptors),
                               "rte_eth_dev_adjust_nb_rx_tx_desc")};
@@ -441,23 +473,24 @@ std::expected<Environment::PortSetupInfo, DpdkError> Environment::ConfigurePort(
     return std::unexpected(adjust_result.error());
   }
 
+  return DescriptorCounts{
+      .receive_descriptors = receive_descriptors,
+      .transmit_descriptors = transmit_descriptors,
+  };
+}
+
+std::expected<void, DpdkError> Environment::RetrieveMacAddress(std::uint16_t port_id) noexcept {
   rte_ether_addr mac_addr{};
   if (const auto mac_result{CheckNegativeResult(rte_eth_macaddr_get(port_id, &mac_addr), "rte_eth_macaddr_get")};
       !mac_result) {
     return std::unexpected(mac_result.error());
   }
   port_mac_addrs_[port_id] = mac_addr;
-
-  return PortSetupInfo{
-      .dev_info = dev_info,
-      .port_conf = local_port_conf,
-      .receive_descriptors = receive_descriptors,
-      .transmit_descriptors = transmit_descriptors,
-  };
+  return {};
 }
 
 /**
- * @brief Set up all receive queues for a port.
+ * @brief Set up all receiver queues for a port.
  * @param port_id              DPDK port identifier.
  * @param dev_info             Device info for default rxconf.
  * @param port_conf            Port config for RX offloads.
@@ -485,7 +518,7 @@ std::expected<void, DpdkError> Environment::SetupReceiveQueues(std::uint16_t por
 }
 
 /**
- * @brief Set up all transmit queues for a port.
+ * @brief Set up all transmitted queues for a port.
  * @param port_id               DPDK port identifier.
  * @param dev_info              Device info for default txconf.
  * @param port_conf             Port config for TX offloads.
@@ -529,9 +562,9 @@ std::expected<void, DpdkError> Environment::CheckLinkStatus() const noexcept {
 
     for (const auto port_id : active_ports_) {
       rte_eth_link link{};
-      const int dpdk_result{rte_eth_link_get_nowait(port_id, &link)};
       // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
-      if (dpdk_result < 0 || link.link_status == RTE_ETH_LINK_DOWN) {
+      if (const int dpdk_result{rte_eth_link_get_nowait(port_id, &link)};
+          dpdk_result < 0 || link.link_status == RTE_ETH_LINK_DOWN) {
         all_ports_up = false;
         break;
       }

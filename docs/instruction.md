@@ -250,7 +250,7 @@ Important:
   MAC addresses.
 - `output_port: 0` means traffic goes out `virbr1`.
 - `output_port: 1` means traffic goes out `virbr2`.
-- `l2_forward.mac_updating` does not control this L3 path when
+- `app.mac_updating` does not control this L3 path when
   `l3_forward.enabled: true`.
 
 SPI rules should allow both directions:

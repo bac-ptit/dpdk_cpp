@@ -19,6 +19,7 @@ Checks: "*,
         -misc-use-internal-linkage,
         -cppcoreguidelines-avoid-do-while,
         -bugprone-easily-swappable-parameters,
+        -misc-const-correctness,
 "
 WarningsAsErrors: '*'
 HeaderFilterRegex: ''

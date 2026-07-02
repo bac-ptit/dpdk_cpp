@@ -29,16 +29,13 @@ eal:
   # AF_PACKET socket on virtual bridge virbr2 (second virtual bridge, connects to VM2 subnet).
   - net_af_packet1,iface=virbr2,qpairs=6,qdisc_bypass=1,fanout_mode=hash,framecnt=4096
 
-# L2 (Layer 2 / Data Link Layer) forwarding configuration — forwards Ethernet frames
-# between ports with optional MAC address rewriting.
-l2_forward:
+# Application-level settings — burst size, MAC update, stats interval.
+app:
   # Maximum number of packets to receive or transmit in a single burst call.
   burst_size: 64
   # Whether to automatically rewrite source and destination MAC addresses on forwarded frames.
   mac_updating: false
-  # Number of receive queues to allocate per logical core.
-  receive_queue_per_lcore: 1
-  # Interval in seconds between periodic statistics output.
+  # Interval in seconds between periodic statistics output (0 = disable).
   timer_period_sec: 5
 
 # L3 (Layer 3 / Network Layer) forwarding configuration — routes packets based on
@@ -155,18 +152,108 @@ spi:
   dispatch_queue_size: 16384
   # When true, any packet that does not match any rule is silently dropped.
   drop_unmatched: true
-  # Ordered list of classification rules (first match wins).
-  rules:
-  # Match TCP packets from VM1 (192.168.100.130) to VM2 destination port 80 (HTTP).
-  # Label identifies the traffic class for statistics and debugging.
-  - source_ip_address: 192.168.100.130
-    destination_ip_address: 192.168.200.180
-    destination_port: 80
-    label: HTTP_REQUEST
-    protocol: tcp
-  # Match TCP packets from VM2 source port 80 (HTTP response) back to VM1.
-  - source_ip_address: 192.168.200.180
-    destination_ip_address: 192.168.100.130
-    source_port: 80
-    label: HTTP_RESPONSE
-    protocol: tcp
+  # Hierarchical filter groups — sorted by precedence (ascending, smallest = highest priority).
+  # Any filter matching within a group means the group matches. First matching group wins.
+  filter_groups:
+    # --- Facebook (precedence 100) ---
+    - name: fg_l34_facebook
+      precedence: 100
+      action: forward
+      filters:
+        - {destination_ip_address: "31.13.64.0/18", protocol: tcp, label: facebook_1}
+        - {destination_ip_address: "66.220.144.0/20", protocol: tcp, label: facebook_2}
+        - {destination_ip_address: "69.63.176.0/20", protocol: tcp, label: facebook_3}
+        - {destination_ip_address: "157.240.0.0/16", protocol: tcp, label: facebook_4}
+        - {destination_ip_address: "69.220.144.5", protocol: tcp, label: facebook_5}
+
+    # --- YouTube (precedence 101) ---
+    - name: fg_l34_youtube
+      precedence: 101
+      action: forward
+      filters:
+        - {destination_ip_address: "142.250.0.0/15", destination_port: 443, protocol: tcp, label: youtube_1}
+        - {destination_ip_address: "172.217.0.0/16", destination_port: 443, protocol: tcp, label: youtube_2}
+        - {destination_ip_address: "216.58.192.0/19", destination_port: 443, protocol: tcp, label: youtube_3}
+        - {destination_ip_address: "74.125.0.1", destination_port: 443, protocol: tcp, label: youtube_4}
+
+    # --- HTTP (precedence 102) ---
+    - name: fg_l34_http
+      precedence: 102
+      action: forward
+      filters:
+        - {destination_port: 80, protocol: tcp, label: http_all}
+
+    # --- HTTPS (precedence 103) ---
+    - name: fg_l34_https
+      precedence: 103
+      action: forward
+      filters:
+        - {destination_port: 443, protocol: tcp, label: https_all}
+
+    # --- DNS (precedence 104) ---
+    - name: fg_l34_dns
+      precedence: 104
+      action: forward
+      filters:
+        - {destination_port: 53, protocol: udp, label: dns_udp}
+        - {destination_port: 53, protocol: tcp, label: dns_tcp}
+
+# DPI (Deep Packet Inspection) — L7 hostname classification via TLS SNI / HTTP Host.
+# Extracts hostname from first data packet of each TCP connection.
+dpi:
+  enabled: true
+  filters:
+    # --- Facebook (priority 10) ---
+    - {hostname_pattern: "*.facebook.com", filter_group: fg_l7_facebook, priority: 10, label: facebook}
+    - {hostname_pattern: "*.fbcdn.net", filter_group: fg_l7_facebook, priority: 10, label: facebook_cdn}
+    - {hostname_pattern: "*.messenger.com", filter_group: fg_l7_facebook, priority: 10, label: messenger}
+    - {hostname_pattern: "*.instagram.com", filter_group: fg_l7_facebook, priority: 10, label: instagram}
+    - {hostname_pattern: "*.whatsapp.net", filter_group: fg_l7_facebook, priority: 10, label: whatsapp}
+    # --- Google (priority 30) ---
+    - {hostname_pattern: "*.google.com", filter_group: fg_l7_google, priority: 30, label: google}
+    - {hostname_pattern: "*.googleapis.com", filter_group: fg_l7_google, priority: 30, label: googleapis}
+    - {hostname_pattern: "*.gstatic.com", filter_group: fg_l7s_google, priority: 30, label: gstatic}
+    - {hostname_pattern: "*.googleusercontent.com", filter_group: fg_l7_google, priority: 30, label: googleusercontent}
+    - {hostname_pattern: "*.google.vn", filter_group: fg_l7_google, priority: 30, label: google_vn}
+    # --- YouTube (priority 20) ---
+    - {hostname_pattern: "*.youtube.com", filter_group: fg_l7_youtube, priority: 20, label: youtube}
+    - {hostname_pattern: "*.youtu.be", filter_group: fg_l7_youtube, priority: 20, label: youtu_be}
+    - {hostname_pattern: "*.googlevideo.com", filter_group: fg_l7_youtube, priority: 20, label: googlevideo}
+    - {hostname_pattern: "*.ytimg.com", filter_group: fg_l7_youtube, priority: 20, label: ytimg}
+    # --- TikTok (priority 40) ---
+    - {hostname_pattern: "*.tiktok.com", filter_group: fg_l7_tiktok, priority: 40, label: tiktok}
+    - {hostname_pattern: "*.tiktokcdn.com", filter_group: fg_l7_tiktok, priority: 40, label: tiktokcdn}
+    - {hostname_pattern: "*.byteoversea.com", filter_group: fg_l7_tiktok, priority: 40, label: byteoversea}
+    - {hostname_pattern: "*.bytecdn.com", filter_group: fg_l7_tiktok, priority: 40, label: bytecdn}
+    # --- Zalo (priority 50) ---
+    - {hostname_pattern: "*.zalo.me", filter_group: fg_l7_zalo, priority: 50, label: zalo}
+    - {hostname_pattern: "*.zalopay.vn", filter_group: fg_l7_zalo, priority: 50, label: zalopay}
+    - {hostname_pattern: "*.zing.vn", filter_group: fg_l7_zalo, priority: 50, label: zing}
+    # --- Netflix (priority 60) ---
+    - {hostname_pattern: "*.netflix.com", filter_group: fg_l7_netflix, priority: 60, label: netflix}
+    - {hostname_pattern: "*.nflxvideo.net", filter_group: fg_l7_netflix, priority: 60, label: netflix_video}
+    # --- Telegram (priority 70) ---
+    - {hostname_pattern: "*.telegram.org", filter_group: fg_l7_telegram, priority: 70, label: telegram}
+    - {hostname_pattern: "*.t.me", filter_group: fg_l7_telegram, priority: 70, label: t_me}
+    # --- Microsoft Teams (priority 80) ---
+    - {hostname_pattern: "*.teams.microsoft.com", filter_group: fg_l7_teams, priority: 80, label: teams}
+    # --- Office 365 (priority 90) ---
+    - {hostname_pattern: "*.office365.com", filter_group: fg_l7_office365, priority: 90, label: office365}
+    - {hostname_pattern: "*.outlook.com", filter_group: fg_l7_office365, priority: 90, label: outlook}
+    # --- Zoom (priority 100) ---
+    - {hostname_pattern: "*.zoom.us", filter_group: fg_l7_zoom, priority: 100, label: zoom}
+    # --- AI services (priority 110) ---
+    - {hostname_pattern: "*.openai.com", filter_group: fg_l7_ai, priority: 110, label: chatgpt}
+    - {hostname_pattern: "*.anthropic.com", filter_group: fg_l7_ai, priority: 110, label: claude}
+    - {hostname_pattern: "*.gemini.google.com", filter_group: fg_l7_ai, priority: 110, label: gemini}
+    # --- Music (priority 120) ---
+    - {hostname_pattern: "*.spotify.com", filter_group: fg_l7_music, priority: 120, label: spotify}
+    - {hostname_pattern: "*.soundcloud.com", filter_group: fg_l7_music, priority: 120, label: soundcloud}
+    # --- Government (priority 130) ---
+    - {hostname_pattern: "*.gov.vn", filter_group: fg_l7_gov, priority: 130, label: gov_vn}
+    # --- DNS-over-HTTPS (priority 140) ---
+    - {hostname_pattern: "dns.google", filter_group: fg_l7_doh, priority: 140, label: doh_google}
+    - {hostname_pattern: "cloudflare-dns.com", filter_group: fg_l7_doh, priority: 140, label: doh_cloudflare}
+    - {hostname_pattern: "dns.quad9.net", filter_group: fg_l7_doh, priority: 140, label: doh_quad9}
+    # --- Catch-all (priority 999) ---
+    - {hostname_pattern: "*", filter_group: fg_l7_https_default, priority: 999, label: https_default}

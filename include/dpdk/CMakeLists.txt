@@ -1,29 +1,17 @@
+add_subdirectory(config)
+add_subdirectory(spi)
+add_subdirectory(dpi)
+
 add_library(${FASTAPI_DPDK_TARGET} STATIC
         app_signal.cpp
-        dpdk_config_loader.cpp
-        dpdk_environment.cpp
-        spi_ip_address.cpp
-        spi_packet_parser.cpp
-        spi_pipeline.cpp
-        spi_rule_engine.cpp)
+        dpdk_environment.cpp)
 
 add_library(${FASTAPI_DPDK_ALIAS} ALIAS ${FASTAPI_DPDK_TARGET})
 
-target_include_directories(${FASTAPI_DPDK_TARGET}
-        PUBLIC
-        ${PROJECT_SOURCE_DIR}/include)
-
-target_compile_options(${FASTAPI_DPDK_TARGET}
-        PRIVATE
-        -fno-exceptions
-        ${FASTAPI_RELEASE_OPTIONS}
-        -Wall
-        -Wextra
-        -Wpedantic
-        -Werror)
-
 target_link_libraries(${FASTAPI_DPDK_TARGET}
         PUBLIC
+        fastapi_common
+        ${FASTAPI_CONFIG_ALIAS}
         PkgConfig::DPDK
         PRIVATE
         glaze::glaze)

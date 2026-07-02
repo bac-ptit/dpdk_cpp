@@ -1,0 +1,61 @@
+DPI Rules,,,,,,,,,,
+No,l7-filter,l7-filter-group,host-name,l7-uri,,,,Thứ tự ưu tiên l7 filter group,,
+1,f_l7_fb_01,fg_l7_facebook,*.facebook.com,NA,,,,Priority,l7-filter-group,Mục đích
+2,f_l7_fb_02,fg_l7_facebook,*.fbcdn.net,NA,,,,10,fg_l7_facebook,"Facebook, Messenger, Instagram, WhatsApp"
+3,f_l7_fb_03,fg_l7_facebook,*.messenger.com,NA,,,,20,fg_l7_youtube,Youtube và CDN Youtube
+4,f_l7_fb_04,fg_l7_facebook,*.instagram.com,NA,,,,30,fg_l7_google,"Google Search, Google Services"
+5,f_l7_fb_05,fg_l7_facebook,*.whatsapp.net,NA,,,,40,fg_l7_tiktok,TikTok
+6,f_l7_google_01,fg_l7_google,*.google.com,NA,,,,50,fg_l7_zalo,"Zalo, ZaloPay, Zing"
+7,f_l7_google_02,fg_l7_google,*.googleapis.com,NA,,,,60,fg_l7_netflix,Netflix
+8,f_l7_google_03,fg_l7_google,*.gstatic.com,NA,,,,70,fg_l7_telegram,Telegram
+9,f_l7_google_04,fg_l7_google,*.googleusercontent.com,NA,,,,80,fg_l7_teams,Microsoft Teams
+10,f_l7_google_05,fg_l7_google,*.google.vn,NA,,,,90,fg_l7_office365,"Office365, Exchange Online"
+11,f_l7_youtube_01,fg_l7_youtube,*.youtube.com,NA,,,,100,fg_l7_zoom,Zoom
+12,f_l7_youtube_02,fg_l7_youtube,*.youtu.be,NA,,,,110,fg_l7_ai,"ChatGPT, Gemini, Claude"
+13,f_l7_youtube_03,fg_l7_youtube,*.googlevideo.com,NA,,,,120,fg_l7_music,"Spotify, SoundCloud"
+14,f_l7_youtube_04,fg_l7_youtube,*.ytimg.com,NA,,,,130,fg_l7_gov,"Chính phủ, cơ quan nhà nước"
+15,f_l7_tiktok_01,fg_l7_tiktok,*.tiktok.com,NA,,,,140,fg_l7_doh,DNS-over-HTTPS
+16,f_l7_tiktok_02,fg_l7_tiktok,*.tiktokcdn.com,NA,,,,900,fg_l7_http_default,HTTP Catch-All
+17,f_l7_tiktok_03,fg_l7_tiktok,*.byteoversea.com,NA,,,,999,fg_l7_https_default,HTTPS Catch-All
+18,f_l7_tiktok_04,fg_l7_tiktok,*.bytecdn.com,NA,,,,,,
+19,f_l7_zalo_01,fg_l7_zalo,*.zalo.me,NA,,,,,,
+20,f_l7_zalo_02,fg_l7_zalo,*.zalopay.vn,NA,,,,,,
+21,f_l7_zalo_03,fg_l7_zalo,*.zing.vn,NA,,,,,,
+22,f_l7_gov_01,fg_l7_gov,*.gov.vn,NA,,,,,,
+23,f_l7_music_01,fg_l7_music,*.musical.com,NA,,,,,,
+24,f_l7_music_02,fg_l7_music,*.spotify.com,NA,,,,,,
+25,f_l7_music_03,fg_l7_music,*.soundcloud.com,NA,,,,,,
+26,f_l7_doh_01,fg_l7_doh,dns.google,NA,,,,,,
+27,f_l7_doh_02,fg_l7_doh,cloudflare-dns.com,NA,,,,,,
+28,f_l7_doh_03,fg_l7_doh,dns.quad9.net,NA,,,,,,
+29,f_l7_http_default,fg_l7_http_default,*,http://*,,,,,,
+30,f_l7_https_default,fg_l7_https_default,*,NA,,,,,,
+,,,,,,,,,,
+,,,,,,,,,,
+SPI Rules,,,,,,,,,,
+no.,l34-filter,l34-filter-group,"network-prefix
+(destination IP)","network-address
+(destination IP)","network-port
+(destination Port)",protocol,src-ip,src-prefix,src-port,
+1,f_l34_facebook_1,fg_l34_facebook,31.13.64.0/18,NA,any,any,NA,NA,any,
+2,f_l34_facebook_2,fg_l34_facebook,66.220.144.0/20,NA,any,any,NA,NA,any,
+3,f_l34_facebook_3,fg_l34_facebook,69.63.176.0/20,NA,any,any,NA,NA,any,
+4,f_l34_facebook_4,fg_l34_facebook,157.240.0.0/16,NA,any,any,NA,NA,any,
+5,f_l34_facebook_4,fg_l34_facebook,NA,69.220.144.5,any,any,NA,NA,any,
+6,f_l34_youtube_1,fg_l34_youtube,142.250.0.0/15,NA,443,tcp,NA,NA,any,
+7,f_l34_youtube_2,fg_l34_youtube,172.217.0.0/16,NA,443,tcp,NA,NA,any,
+8,f_l34_youtube_3,fg_l34_youtube,216.58.192.0/19,NA,443,tcp,NA,NA,any,
+9,f_l34_youtube_4,fg_l34_youtube,N/A,74.125.0.1,443,tcp,NA,NA,any,
+10,f_l34_http_all,fg_l34_http_sdf1003,NA,NA,80,tcp,NA,NA,any,
+11,f_l34_https_all,fg_l34_https_sdf1004,NA,NA,443,tcp,NA,NA,any,
+12,f_l34_dns_udp,fg_l34_dns_sdf1005,NA,NA,53,udp,NA,NA,any,
+13,f_l34_dns_tcp,fg_l34_dns_sdf1005,NA,NA,53,tcp,NA,NA,any,
+,,,,,,,,,,
+No,Precedence,l34-filter-group,Action,,,,,,,
+1,100,fg_l34_facebook,forward,,,,,,,
+2,101,fg_l34_youtube,forward,,,,,,,
+3,102,fg_l34_http_sdf1003,forward,,,,,,,
+4,103,fg_l34_https_sdf1004,forward,,,,,,,
+5,104,fg_l34_dns_sdf1005,forward,,,,,,,
+6,105,fg_l34_dns_sdf1005,forward,,,,,,,
+7,106,fg_l34_udp_sdf1006,Drop,,,,,,,

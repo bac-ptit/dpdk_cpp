@@ -1,10 +1,8 @@
 #pragma once
 
-#include "app_signal.hpp"
-#include "dpdk_config.hpp"
-#include "dpdk_config_loader.hpp"
-#include "dpdk_environment.hpp"
-#include "spi_ip_address.hpp"
-#include "spi_packet_parser.hpp"
-#include "spi_pipeline.hpp"
-#include "spi_rule_engine.hpp"
+#include "dpdk/app_signal.hpp"
+#include "dpdk/config/config.hpp"
+#include "dpdk/dpdk_environment.hpp"
+#include "dpdk/dpi/dpi.hpp"
+#include "dpdk/spi/spi.hpp"
+#include "helpers/format_helpers.hpp"

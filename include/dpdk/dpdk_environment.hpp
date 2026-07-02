@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-#include "dpdk_config.hpp"
+#include "dpdk/config/dpdk_config.hpp"
 
 namespace dpdk {
 
@@ -110,6 +110,12 @@ class Environment final {
     bool software_backed{false};
   };
 
+  /// Descriptor counts extracted from port config.
+  struct DescriptorCounts {
+    std::uint16_t receive_descriptors{};
+    std::uint16_t transmit_descriptors{};
+  };
+
   // ── Lifecycle steps — called in order by init() ──────────────────────
 
   /**
@@ -147,13 +153,38 @@ class Environment final {
   // ── SetupPort helpers ────────────────────────────────────────────────
 
   /**
-   * @brief Gather device info, validate queue counts, configure port.
+   * @brief Gather device info, validate queues, configure port, get MAC.
    * @param port_id      DPDK port identifier.
    * @param port_config  Port configuration from config.
    * @return PortSetupInfo on success, or a DpdkError.
    */
   [[nodiscard]] std::expected<PortSetupInfo, DpdkError> ConfigurePort(std::uint16_t port_id,
                                                                       const PortConfig& port_config) noexcept;
+
+  /// Query PMD device info for a port.
+  [[nodiscard]] std::expected<rte_eth_dev_info, DpdkError> QueryDeviceInfo(std::uint16_t port_id) const noexcept;
+
+  /// Store driver name, RSS offloads, and software-backed flag.
+  void StoreRuntimeInfo(std::uint16_t port_id, const rte_eth_dev_info& dev_info) noexcept;
+
+  /// Validate configured RX/TX queue counts against PMD maximums.
+  [[nodiscard]] std::expected<void, DpdkError> ValidateQueueCounts(std::uint16_t port_id,
+                                                                   const PortConfig& port_config,
+                                                                   const rte_eth_dev_info& dev_info) const noexcept;
+
+  /// Build rte_eth_conf with TX fast-free offload and RSS if multi-queue.
+  [[nodiscard]] rte_eth_conf BuildPortConf(const PortConfig& port_config,
+                                           const rte_eth_dev_info& dev_info,
+                                           std::uint16_t port_id) const noexcept;
+
+  /// Apply rte_eth_dev_configure and adjust descriptor counts.
+  [[nodiscard]] std::expected<DescriptorCounts, DpdkError> ApplyConfiguration(std::uint16_t port_id,
+                                                                              const PortConfig& port_config,
+                                                                              const rte_eth_conf& port_conf) noexcept;
+
+  /// Retrieve and store the MAC address for a port.
+  [[nodiscard]] std::expected<void, DpdkError> RetrieveMacAddress(std::uint16_t port_id) noexcept;
+
   /**
    * @brief Set up all receiver queues for the given port.
    * @param port_id              DPDK port identifier.

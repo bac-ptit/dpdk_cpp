@@ -25,4 +25,11 @@ bench-pcap = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build
 bench-pcap-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000 15 100"
 bench-afpacket = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh bench-afpacket 16"
 bench-afpacket-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-afpacket 16"
+# Run app with generated PCAP test traffic (SPI + DPI rules from config.yaml)
+test-pcap-debug = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"
+# Run app with a custom PCAP file (pass path as argument)
+run-pcap = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"
+# Verify SPI rules match lv3.csv — generate traffic, run app, check stats
+test-spi = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH python3 test/test_spi_rules.py"
+verify-rules-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH python3 test/verify_rules.py --build-dir cmake-build-release"
 docs = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH doxygen Doxyfile"

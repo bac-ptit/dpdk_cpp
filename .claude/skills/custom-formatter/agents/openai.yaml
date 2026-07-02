@@ -1,0 +1,4 @@
+interface:
+  display_name: "Custom std::formatter Generator"
+  short_description: "Generate std::formatter specializations for C++ types"
+  default_prompt: "Create a custom std::formatter for my type"

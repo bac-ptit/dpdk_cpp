@@ -25,10 +25,12 @@ cd /home/bac/programming/viettel/dpdk_cpp/cmake-build-debug && cmake --build . -
 ## Code Rules
 
 Read ALL rule files before generating or reviewing code:
-- `.claude/commands/dpdk-rules.md` — DPDK lifecycle, error handling, RAII
-- `.claude/commands/performance-rules.md` — noexcept, zero-overhead, attributes
-- `.claude/commands/code-style-rules.md` — Google C++ naming, formatting
-- `.claude/commands/modern-cpp-rules.md` — brace init, if-init, expected
+- `.claude/skills/dpdk-rules.md` — DPDK lifecycle, error handling, RAII
+- `.claude/skills/performance-rules.md` — noexcept, zero-overhead, attributes
+- `.claude/skills/code-style-rules.md` — Google C++ naming, formatting
+- `.claude/skills/modern-cpp-rules.md` — brace init, if-init, expected
+- `.claude/skills/custom-formatter/SKILL.md` — std::formatter<T> conventions
+- `.claude/skills/performance-attributes/SKILL.md` — C++23/C++26 + GCC performance attributes
 
 ## Key Conventions
 
@@ -65,15 +67,85 @@ Read ALL rule files before generating or reviewing code:
 ## Dependencies
 - DPDK: `pkg_check_modules(DPDK REQUIRED IMPORTED_TARGET libdpdk)`
 - Glaze: fetched via `FetchContent` (YAML/JSON serialization)
-- yaml-cpp: `find_package(yaml-cpp REQUIRED)`
+
+## Namespaces
+
+| Namespace | Purpose |
+|-----------|---------|
+| `dpdk` | Core EAL, environment, signals |
+| `dpdk::config` | Config structs, YAML loader |
+| `dpdk::spi` | SPI (L3/L4) packet classification |
+| `dpdk::dpi` | DPI (L7) hostname/URI classification |
+
+## Architecture
+
+### SPI Rule System (Hierarchical ACL)
+
+```
+filter_groups (sorted by precedence ASC):
+  ┌─ fg_l34_facebook (precedence=100, action=forward)
+  │    ├─ filter: 31.13.64.0/18, tcp
+  │    └─ filter: 157.240.0.0/16, tcp
+  ├─ fg_l34_dns (precedence=104, action=drop)
+  │    ├─ filter: port=53, udp
+  │    └─ filter: port=53, tcp
+
+Packet → FlowTable.Lookup(5-tuple)
+  HIT → cached action (skip SPI)
+  MISS → RuleTable.Match(groups in precedence order)
+       → FlowTable.Insert(result)
+       → forward or drop
+```
+
+### Double-Buffer Hot-Reload
+
+- `RuleTableManager` — atomic pointer swap, zero hot-path overhead
+- `SIGUSR1` → `kill -USR1 $(pidof FastAPI)` triggers config reload
+- Main lcore polls `ReloadFlag()` in idle loop
+- Workers load fresh pointer per batch — no locks, no contention
 
 ## File Structure
 ```
-main.cpp                    — entry point, config loading
+main.cpp                          — entry point, config loading
 include/
   dpdk/
-    dpdk.hpp                — umbrella public include
-    dpdk_config.hpp         — config structs (EalConfig, PortConfig, MempoolConfig, L2fwdConfig)
-    dpdk_environment.hpp    — Environment class declaration
-    dpdk_environment.cpp    — Environment class implementation
+    dpdk.hpp                      — top-level umbrella (includes all subfolders)
+    dpdk_environment.hpp/cpp      — Environment class (EAL, mempool, ports)
+    app_signal.hpp/cpp            — signal handlers (SIGINT, SIGTERM, SIGUSR1)
+  helpers/
+    format_helpers.hpp            — all std::formatter<T> specializations
+  config/
+    config.hpp                    — umbrella for config/
+    dpdk_config.hpp               — config structs (SpiFilterGroupConfig, etc.)
+    dpdk_config_loader.hpp/cpp    — LoadConfig(), ValidateConfig()
+  spi/
+    spi.hpp                       — umbrella for spi/
+    spi_rule_engine.hpp/cpp       — CompiledFilterGroup, RuleTable, Match()
+    spi_rule_table_manager.hpp    — double-buffer RuleTableManager
+    spi_flow_table.hpp/cpp        — FlowTable (rte_hash flow cache)
+    spi_packet_parser.hpp/cpp     — ParsePacket(), L7 extraction
+    spi_ip_address.hpp/cpp        — ParseIpv4Address(), ParseCidr()
+    spi_pipeline.hpp/cpp          — Pipeline, WorkerContext, PipelineStats
+  helpers/
+    format_helpers.hpp            — all std::formatter<T> specializations
+  dpi/
+    dpi.hpp                       — umbrella for dpi/
+    dpi_rule_engine.hpp/cpp       — DpiRuleTable, hostname matching
+```
+
+## Dynamic Config Reload
+
+```bash
+# Edit config.yaml
+vim /path/to/config.yaml
+
+# Send reload signal
+kill -USR1 $(pidof FastAPI)
+
+# App automatically:
+# 1. Main lcore detects flag
+# 2. LoadConfig() — parse new YAML
+# 3. CompileRuleTable() — build new rule table
+# 4. RuleTableManager::Swap() — atomic pointer swap
+# 5. Print: "Rules reloaded: 5 groups, 13 filters"
 ```

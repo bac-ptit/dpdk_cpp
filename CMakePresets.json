@@ -13,6 +13,7 @@
       "binaryDir": "${sourceDir}/cmake-build-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_STANDARD": "26",
         "CMAKE_PREFIX_PATH": "${sourceDir}/.pixi/envs/default",
         "yaml-cpp_DIR": "${sourceDir}/.pixi/envs/default/lib/cmake/yaml-cpp"

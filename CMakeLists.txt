@@ -6,6 +6,12 @@ project(${FASTAPI_PROJECT_NAME})
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(FASTAPI_APP_TARGET ${PROJECT_NAME})
+set(FASTAPI_CONFIG_TARGET ${PROJECT_NAME}_config)
+set(FASTAPI_CONFIG_ALIAS ${PROJECT_NAME}::config)
+set(FASTAPI_SPI_TARGET ${PROJECT_NAME}_spi)
+set(FASTAPI_SPI_ALIAS ${PROJECT_NAME}::spi)
+set(FASTAPI_DPI_TARGET ${PROJECT_NAME}_dpi)
+set(FASTAPI_DPI_ALIAS ${PROJECT_NAME}::dpi)
 set(FASTAPI_DPDK_TARGET ${PROJECT_NAME}_dpdk)
 set(FASTAPI_DPDK_ALIAS ${PROJECT_NAME}::dpdk)
 
@@ -20,11 +26,20 @@ else()
 endif()
 
 set(FASTAPI_RELEASE_OPTIONS
-        $<$<CONFIG:Release>:-march=native>
-        $<$<CONFIG:Release>:-mtune=native>
         $<$<CONFIG:Release>:-fno-plt>)
 
-# pkg-config để tìm DPDK (tên gói trên Fedora/Ubuntu là 'libdpdk')
+# DPDK headers require native ISA features (e.g. -mssse3) in all configs.
+add_compile_options(-march=native -mtune=native)
+
+# Shared compile options and include directories for all project targets.
+add_library(fastapi_common INTERFACE)
+target_compile_options(fastapi_common INTERFACE
+        -fno-exceptions
+        ${FASTAPI_RELEASE_OPTIONS}
+        -Wall -Wextra -Wpedantic -Werror)
+target_include_directories(fastapi_common INTERFACE
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
+
 pkg_check_modules(DPDK REQUIRED IMPORTED_TARGET libdpdk)
 get_target_property(FASTAPI_DPDK_COMPILE_OPTIONS
         PkgConfig::DPDK
@@ -48,11 +63,14 @@ FetchContent_MakeAvailable(glaze)
 add_subdirectory(include)
 
 add_executable(${FASTAPI_APP_TARGET} main.cpp)
-target_compile_options(${FASTAPI_APP_TARGET} PRIVATE
-        -fno-exceptions
-        ${FASTAPI_RELEASE_OPTIONS})
-target_link_libraries(${FASTAPI_APP_TARGET} PRIVATE ${FASTAPI_DPDK_ALIAS})
-target_compile_options(${FASTAPI_APP_TARGET} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_link_libraries(${FASTAPI_APP_TARGET} PRIVATE
+        fastapi_common
+        -Wl,--start-group
+        ${FASTAPI_CONFIG_ALIAS}
+        ${FASTAPI_SPI_ALIAS}
+        ${FASTAPI_DPI_ALIAS}
+        ${FASTAPI_DPDK_ALIAS}
+        -Wl,--end-group)
 target_compile_definitions(${FASTAPI_APP_TARGET} PRIVATE CONFIG_PATH="${CMAKE_CURRENT_BINARY_DIR}/config.yaml")
 
 # Copy config.yaml to build dir so it sits next to the executable

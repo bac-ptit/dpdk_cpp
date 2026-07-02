@@ -160,15 +160,23 @@ import sys
 import yaml
 
 config_file, pcap_file, tx_pcap_file = sys.argv[1:4]
-rules = [
-    {'protocol': 'tcp', 'source_ip_address': '10.17.50.1',
-     'destination_ip_address': '10.17.50.12', 'destination_port': 80, 'label': 'HTTP'},
-    {'protocol': 'tcp', 'source_ip_address': '10.17.50.2',
-     'destination_ip_address': '10.17.50.12', 'destination_port': 443, 'label': 'HTTPS'},
-    {'protocol': 'udp', 'source_ip_address': '10.17.50.3',
-     'destination_ip_address': '10.17.50.53', 'destination_port': 53, 'label': 'DNS'},
-    {'protocol': 'udp', 'source_ip_address': '10.17.50.4',
-     'destination_ip_address': '10.17.50.215', 'destination_port': 2152, 'label': 'GTP_U'},
+filter_groups = [
+    {'name': 'bench_http', 'precedence': 100, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'source_ip_address': '10.17.50.1',
+         'destination_ip_address': '10.17.50.12', 'destination_port': 80, 'label': 'HTTP'},
+    ]},
+    {'name': 'bench_https', 'precedence': 101, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'source_ip_address': '10.17.50.2',
+         'destination_ip_address': '10.17.50.12', 'destination_port': 443, 'label': 'HTTPS'},
+    ]},
+    {'name': 'bench_dns', 'precedence': 102, 'action': 'forward', 'filters': [
+        {'protocol': 'udp', 'source_ip_address': '10.17.50.3',
+         'destination_ip_address': '10.17.50.53', 'destination_port': 53, 'label': 'DNS'},
+    ]},
+    {'name': 'bench_gtp', 'precedence': 103, 'action': 'forward', 'filters': [
+        {'protocol': 'udp', 'source_ip_address': '10.17.50.4',
+         'destination_ip_address': '10.17.50.215', 'destination_port': 2152, 'label': 'GTP_U'},
+    ]},
 ]
 with open(config_file) as f:
     cfg = yaml.safe_load(f)
@@ -183,7 +191,7 @@ cfg['spi']['worker_count'] = 1
 cfg['spi']['packet_distribution'] = 'auto'
 cfg['spi']['dispatch_queue_size'] = 8192
 cfg['spi']['drop_unmatched'] = True
-cfg['spi']['rules'] = rules
+cfg['spi']['filter_groups'] = filter_groups
 with open(config_file, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
 print('Config updated for PCAP PMD: cpu_core_list=0-1, receive_queues=1, transmit_queues=1, worker_count=1')
@@ -227,15 +235,23 @@ config_file, shard_dir, count_arg, workers_arg, match_percent_arg = sys.argv[1:6
 count = int(count_arg)
 workers = int(workers_arg)
 match_percent = int(match_percent_arg)
-rules = [
-    {'protocol': 'tcp', 'source_ip_address': '10.17.50.1',
-     'destination_ip_address': '10.17.50.12', 'destination_port': 80, 'label': 'HTTP'},
-    {'protocol': 'tcp', 'source_ip_address': '10.17.50.2',
-     'destination_ip_address': '10.17.50.12', 'destination_port': 443, 'label': 'HTTPS'},
-    {'protocol': 'udp', 'source_ip_address': '10.17.50.3',
-     'destination_ip_address': '10.17.50.53', 'destination_port': 53, 'label': 'DNS'},
-    {'protocol': 'udp', 'source_ip_address': '10.17.50.4',
-     'destination_ip_address': '10.17.50.215', 'destination_port': 2152, 'label': 'GTP_U'},
+filter_groups = [
+    {'name': 'bench_http', 'precedence': 100, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'source_ip_address': '10.17.50.1',
+         'destination_ip_address': '10.17.50.12', 'destination_port': 80, 'label': 'HTTP'},
+    ]},
+    {'name': 'bench_https', 'precedence': 101, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'source_ip_address': '10.17.50.2',
+         'destination_ip_address': '10.17.50.12', 'destination_port': 443, 'label': 'HTTPS'},
+    ]},
+    {'name': 'bench_dns', 'precedence': 102, 'action': 'forward', 'filters': [
+        {'protocol': 'udp', 'source_ip_address': '10.17.50.3',
+         'destination_ip_address': '10.17.50.53', 'destination_port': 53, 'label': 'DNS'},
+    ]},
+    {'name': 'bench_gtp', 'precedence': 103, 'action': 'forward', 'filters': [
+        {'protocol': 'udp', 'source_ip_address': '10.17.50.4',
+         'destination_ip_address': '10.17.50.215', 'destination_port': 2152, 'label': 'GTP_U'},
+    ]},
 ]
 with open(config_file) as f:
     cfg = yaml.safe_load(f)
@@ -263,8 +279,8 @@ cfg['spi']['worker_count'] = workers
 cfg['spi']['packet_distribution'] = 'auto'
 cfg['spi']['dispatch_queue_size'] = 16384
 cfg['spi']['drop_unmatched'] = True
-cfg['l2_forward']['burst_size'] = 64
-cfg['spi']['rules'] = rules
+cfg['app']['burst_size'] = 64
+cfg['spi']['filter_groups'] = filter_groups
 with open(config_file, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
 matched = count * match_percent // 100

@@ -15,7 +15,17 @@ namespace dpdk {
 [[nodiscard]] volatile std::sig_atomic_t& ForceQuitFlag() noexcept;
 
 /**
- * @brief Install signal handlers for graceful Ctrl+C / SIGTERM shutdown.
+ * @brief Return the global reload-request flag.
+ *
+ * Set to 1 by the SIGUSR1 handler. The main lcore polls this flag
+ * and triggers a config reload when non-zero.
+ * @return Mutable reference to the global `volatile sig_atomic_t` flag.
+ */
+[[nodiscard]] volatile std::sig_atomic_t& ReloadFlag() noexcept;
+
+/**
+ * @brief Install signal handlers for graceful Ctrl+C / SIGTERM shutdown
+ * and SIGUSR1 config reload.
  *
  * Registers a handler that sets the force-quit flag (see @ref ForceQuitFlag)
  * on SIGINT and SIGTERM, allowing the packet loop to exit cleanly.
