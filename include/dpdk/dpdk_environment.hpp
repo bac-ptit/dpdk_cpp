@@ -79,6 +79,13 @@ class Environment final {
   /// Whether every active port reports RSS hash offloads.
   [[nodiscard]] bool ActivePortsSupportRss() const noexcept;
 
+  /// Whether any active port is the net_pcap PMD (multi-queue via rx_pcap shards).
+  ///
+  /// net_pcap distributes traffic across RX queues by binding each `rx_pcap=...`
+  /// argument to its own queue, so the per-worker queue distribution mode is
+  /// correct without needing a software flow-hash dispatcher.
+  [[nodiscard]] bool HasPcapPort() const noexcept;
+
   /// Driver name reported by the PMD for a port.
   [[nodiscard]] std::string_view GetPortDriverName(std::uint16_t port_id) const noexcept;
 

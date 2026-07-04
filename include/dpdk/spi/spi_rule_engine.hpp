@@ -14,7 +14,7 @@
 
 namespace dpdk::spi {
 
-/// Number of 5-tuple fields for ACL matching.
+/// Number of fields for ACL matching.
 constexpr uint32_t kAclNumFields{5};
 
 /// ACL field indices in the 5-tuple.
@@ -27,7 +27,6 @@ enum AclFieldIndex : uint8_t {
 };
 
 /// 5-tuple input for rte_acl_classify (all fields in network byte order).
-/// Each member is naturally aligned — no padding between fields.
 struct AclInputData {
   uint32_t src_ip_be;
   uint32_t dst_ip_be;
@@ -75,6 +74,7 @@ struct CompiledFilter {
   std::uint32_t destination_ip_address{};
   std::uint32_t destination_network{};
   std::uint32_t destination_prefix_mask{};
+  std::uint32_t destination_prefix_length{};
   std::uint16_t source_port{};
   std::uint16_t destination_port{};
   bool match_source_ip{false};
@@ -101,17 +101,17 @@ struct CompiledFilterGroup {
   ~CompiledFilterGroup();
 };
 
-/// Shared ACL field definitions used by all filter groups.
+/// Shared ACL field definitions — MASK type with bitmask values.
 inline constexpr rte_acl_field_def kAclFieldDefs[kAclNumFields]{
-    {.type = RTE_ACL_FIELD_TYPE_BITMASK, .size = sizeof(uint32_t), .field_index = kAclFieldSrcIp, .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = kAclFieldSrcIp, .input_index = 0,
      .offset = offsetof(AclInputData, src_ip_be)},
-    {.type = RTE_ACL_FIELD_TYPE_BITMASK, .size = sizeof(uint32_t), .field_index = kAclFieldDstIp, .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = kAclFieldDstIp, .input_index = 0,
      .offset = offsetof(AclInputData, dst_ip_be)},
-    {.type = RTE_ACL_FIELD_TYPE_BITMASK, .size = sizeof(uint16_t), .field_index = kAclFieldSrcPort, .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint16_t), .field_index = kAclFieldSrcPort, .input_index = 0,
      .offset = offsetof(AclInputData, src_port_be)},
-    {.type = RTE_ACL_FIELD_TYPE_BITMASK, .size = sizeof(uint16_t), .field_index = kAclFieldDstPort, .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint16_t), .field_index = kAclFieldDstPort, .input_index = 0,
      .offset = offsetof(AclInputData, dst_port_be)},
-    {.type = RTE_ACL_FIELD_TYPE_BITMASK, .size = sizeof(uint8_t), .field_index = kAclFieldProtocol, .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint8_t), .field_index = kAclFieldProtocol, .input_index = 0,
      .offset = offsetof(AclInputData, protocol)},
 };
 

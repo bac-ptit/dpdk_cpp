@@ -40,8 +40,16 @@
 namespace dpdk::spi {
 namespace {
 
-constexpr std::uint16_t kMaxBurstCapacity{64};
+constexpr std::uint16_t kMaxBurstCapacity{256};
 constexpr std::uint16_t kMinBurstCapacity{1};
+/// Drain worker-local counters into the shared atomic counters once per this
+/// many iterations. Skipping the per-burst atomic fetch_add avoids cache-line
+/// bouncing across all workers on every burst.
+// Larger interval → fewer atomic cache-line bounces per second → less mem-pool
+// ring + atomic-counter contention. Trade-off: stats lag behind more, but
+// the stats are only sampled every `timer_period_sec`, so the user-visible
+// delay is unchanged.
+constexpr std::uint32_t kAtomicFlushBurstInterval{256};
 constexpr std::size_t kBitsPerByte{8};
 constexpr std::uint8_t kHexBase{10};
 constexpr std::size_t kLocalAdminMacByteIndex{0};
@@ -51,17 +59,7 @@ constexpr std::uint16_t kTlsPort{443};
 constexpr std::uint16_t kHttpPort{80};
 
 /// Per-burst counters accumulated in a single worker iteration.
-struct BurstCounters {
-  std::uint64_t received{};
-  std::uint64_t transmitted{};
-  std::uint64_t parsed{};
-  std::uint64_t matched{};
-  std::uint64_t unknown{};
-  std::uint64_t malformed{};
-  std::uint64_t dropped{};
-  std::uint64_t dropped_by_rule{};
-  std::uint64_t flow_cache_hits{};
-};
+// BurstCounters is defined in spi_pipeline.hpp so WorkerContext can hold one.
 
 /// Runtime packet-distribution mode.
 enum class PacketDistribution : std::uint8_t {
@@ -393,6 +391,21 @@ void AddBurstStats(PipelineStats& stats, const BurstCounters& burst) noexcept {
   stats.flow_cache_hits += burst.flow_cache_hits;
 }
 
+/// Fold per-burst counters into a worker-local pending accumulator. Used
+/// between atomic flushes so that per-burst updates never touch shared
+/// cache lines.
+void AddBurstCounters(BurstCounters& accumulator, const BurstCounters& burst) noexcept {
+  accumulator.received += burst.received;
+  accumulator.transmitted += burst.transmitted;
+  accumulator.parsed += burst.parsed;
+  accumulator.matched += burst.matched;
+  accumulator.unknown += burst.unknown;
+  accumulator.malformed += burst.malformed;
+  accumulator.dropped += burst.dropped;
+  accumulator.dropped_by_rule += burst.dropped_by_rule;
+  accumulator.flow_cache_hits += burst.flow_cache_hits;
+}
+
 /// Print the current counter state to stdout.
 /**
  * @brief Conditionally print stats if the timer period has elapsed.
@@ -401,9 +414,10 @@ void AddBurstStats(PipelineStats& stats, const BurstCounters& burst) noexcept {
  * @param stats_period_tsc  Ticks between prints.
  * @param previous_tsc      Previous TSC value (updated in place).
  * @param timer_tsc         Accumulated ticks (updated in place).
+ * @param start_tsc
  */
 void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_sec, std::uint64_t stats_period_tsc,
-                     std::uint64_t& previous_tsc, std::uint64_t& timer_tsc) noexcept {
+                     std::uint64_t& previous_tsc, std::uint64_t& timer_tsc, std::uint64_t start_tsc) noexcept {
   if (timer_period_sec == 0) {
     return;
   }
@@ -414,12 +428,16 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
   timer_tsc += diff_tsc;
 
   if (timer_tsc >= stats_period_tsc) {
-    std::println("SPI stats: {}", CollectStats(counters));
+    const auto stats{CollectStats(counters)};
+    const auto elapsed_sec{static_cast<double>(current_tsc - start_tsc) / static_cast<double>(rte_get_tsc_hz())};
+    const auto mpps{static_cast<double>(stats.received) / elapsed_sec / 1e6};
+    std::println("SPI stats: received={} matched={} elapsed={:.1f}s Mpps={:.2f}", stats.received, stats.matched,
+                 elapsed_sec, mpps);
     timer_tsc = 0;
   }
 }
 
-/// Check reload flag and hot-swap rules if requested.
+/// Check the reload flag and hot-swap rules if requested.
 [[gnu::cold]] void MaybeReload(RuleTableManager& rule_manager, volatile std::sig_atomic_t* reload_flag,
                                const std::string& config_path) noexcept {
   if (reload_flag == nullptr || *reload_flag == 0) {
@@ -482,6 +500,12 @@ void PrintQueueMap(std::size_t worker_count) noexcept {
     std::println("Packet distribution: queue (auto, single worker)");
     return PacketDistribution::kQueuePerWorker;
   }
+  // net_pcap binds each rx_pcap shard to its own RX queue, so workers can
+  // drain shards in parallel directly. Don't route through the dispatcher.
+  if (environment.HasPcapPort()) {
+    std::println("Packet distribution: queue (auto, net_pcap shards feed separate queues)");
+    return PacketDistribution::kQueuePerWorker;
+  }
   if (environment.HasSoftwareBackedPort()) {
     std::println("Packet distribution: flow_hash (auto, software/vNIC PMD detected)");
     return PacketDistribution::kFlowHash;
@@ -517,21 +541,14 @@ void PrintQueueMap(std::size_t worker_count) noexcept {
   return worker_lcores;
 }
 
-/// Copy a string_view into a fixed-size char buffer without heap allocation.
-void CopyStringView(std::span<char> dst, std::string_view src) noexcept {
-  const auto len{std::min(src.size(), dst.size() - 1)};
-  std::memcpy(dst.data(), src.data(), len);
-  dst[len] = '\0';
-}
-
 /// Build a matched PacketClassification and insert into flow cache.
 [[nodiscard, gnu::always_inline]] inline PacketClassification MakeMatched(
-    const PacketMetadata& metadata, Action action, std::uint32_t precedence, std::string_view group_name,
-    std::string_view label, const FlowKey& key, const WorkerContext& context, BurstCounters& counters) noexcept {
+    const PacketMetadata& metadata, Action action, const FlowKey& key, const WorkerContext& context,
+    BurstCounters& counters) noexcept {
   ++counters.matched;
-  FlowEntry entry{.action = action, .group_precedence = precedence};
-  CopyStringView(std::span{entry.group_name}, group_name);
-  CopyStringView(std::span{entry.label}, label);
+  // Only `action` is hot-path read on subsequent hits. `match_count = 1` marks
+  // the slot as populated (the lookup-zero check is `entry->match_count == 0`).
+  FlowEntry entry{.action = action, .match_count = 1};
   context.flow_table->Insert(key, entry);
   return {.metadata = metadata, .action = action, .parsed = true, .matched = true};
 }
@@ -598,7 +615,6 @@ struct DpiMatch {
 
     // Cache hit — fast path.
     if (auto* cached = context.flow_table->Lookup(key)) [[likely]] {
-      ++cached->match_count;
       ++counters.flow_cache_hits;
       return {.metadata = metadata, .action = cached->action, .parsed = true, .matched = true};
     }
@@ -614,14 +630,13 @@ struct DpiMatch {
       ExtractHostname(packet, metadata);
       if (auto dpi{MatchDpi(context, metadata)}) {
         const auto action{spi_match.matched ? spi_match.action : Action::kForward};
-        return MakeMatched(metadata, action, dpi->priority, dpi->filter_group, dpi->label, key, context, counters);
+        return MakeMatched(metadata, action, key, context, counters);
       }
     }
 
     // SPI match.
     if (spi_match.matched) {
-      return MakeMatched(metadata, spi_match.action, spi_match.group_precedence, spi_match.group_name, spi_match.label,
-                         key, context, counters);
+      return MakeMatched(metadata, spi_match.action, key, context, counters);
     }
 
     ++counters.unknown;
@@ -688,13 +703,6 @@ struct DpiMatch {
   auto& count{transmit_counts[transmit_port]};
   *std::next(transmit_buffers[transmit_port].data(), static_cast<std::ptrdiff_t>(count)) = packet;
   ++count;
-}
-
-/// Prefetch each packet in the burst into the CPU cache.
-void PrefetchPackets(std::span<rte_mbuf*> packets) noexcept {
-  for (auto* packet : packets) {
-    rte_prefetch0(rte_pktmbuf_mtod(packet, void*));
-  }
 }
 
 /**
@@ -791,11 +799,18 @@ void PrefetchPackets(std::span<rte_mbuf*> packets) noexcept {
   [[assume(received <= context.burst_size)]];
   counters.received += received;
 
+  // Interleaved prefetch: prefetch packet header K packets ahead of the
+  // current iteration, so the L1 line is warm when ForwardPacket reads it.
+  // Pattern matches l3fwd_fib.c (FIB_PREFETCH_OFFSET=4) and l3fwd.h
+  // (PREFETCH_OFFSET=3). Earlier code prefetched all packets at once,
+  // which is wasteful for short bursts and ineffective for long bursts.
+  constexpr auto kPrefetchDistance{4UZ};
   const std::span received_packets{packets.data(), received};
-  PrefetchPackets(received_packets);
-
-  for (auto* packet : received_packets) {
-    ForwardPacket(context, active_ports, counters, packet, port_id, transmit_buffers, transmit_counts);
+  for (auto i{0UZ}; i < received_packets.size(); ++i) {
+    if (i + kPrefetchDistance < received_packets.size()) [[likely]] {
+      rte_prefetch0(rte_pktmbuf_mtod(received_packets[i + kPrefetchDistance], void*));
+    }
+    ForwardPacket(context, active_ports, counters, received_packets[i], port_id, transmit_buffers, transmit_counts);
   }
 }
 
@@ -822,7 +837,15 @@ void PrefetchPackets(std::span<rte_mbuf*> packets) noexcept {
 
   FlushTransmitBuffers(context, transmit_buffers, transmit_counts, burst_counters);
   AddBurstStats(context.stats, burst_counters);
-  AddBurstCounters(*context.counters, burst_counters);
+  // Rate-limit the cross-core atomic flush: accumulate locally and drain
+  // every kAtomicFlushBurstInterval iterations to keep shared cache lines
+  // quiescent for the rest of the time.
+  AddBurstCounters(context.pending_burst, burst_counters);
+  if (++context.bursts_since_flush >= kAtomicFlushBurstInterval) {
+    FlushAtomicCounters(*context.counters, context.pending_burst);
+    context.pending_burst = {};
+    context.bursts_since_flush = 0;
+  }
 }
 
 /// Enqueue one received packet to the worker ring selected by flow hash.
@@ -845,10 +868,13 @@ void DispatchPortQueueBurst(std::uint16_t port_id, std::uint16_t queue_id, std::
   [[assume(received <= burst_size)]];
   counters.received += received;
 
+  constexpr auto kPrefetchDistance{4UZ};
   const std::span received_packets{packets.data(), received};
-  PrefetchPackets(received_packets);
-  for (auto* packet : received_packets) {
-    DispatchPacketToWorker(packet, port_id, dispatch_rings, counters);
+  for (auto i{0UZ}; i < received_packets.size(); ++i) {
+    if (i + kPrefetchDistance < received_packets.size()) [[likely]] {
+      rte_prefetch0(rte_pktmbuf_mtod(received_packets[i + kPrefetchDistance], void*));
+    }
+    DispatchPacketToWorker(received_packets[i], port_id, dispatch_rings, counters);
   }
 }
 
@@ -879,17 +905,27 @@ void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbu
   [[assume(received <= context.burst_size)]];
   burst_counters.received += received;
 
+  constexpr auto kPrefetchDistance{4UZ};
   const std::span received_packets{packets.data(), received};
-  PrefetchPackets(received_packets);
   const auto& active_ports{context.environment->GetActivePorts()};
-  for (auto* packet : received_packets) {
+  for (auto i{0UZ}; i < received_packets.size(); ++i) {
+    if (i + kPrefetchDistance < received_packets.size()) [[likely]] {
+      rte_prefetch0(rte_pktmbuf_mtod(received_packets[i + kPrefetchDistance], void*));
+    }
+    auto* packet{received_packets[i]};
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
     ForwardPacket(context, active_ports, burst_counters, packet, packet->port, transmit_buffers, transmit_counts);
   }
 
   FlushTransmitBuffers(context, transmit_buffers, transmit_counts, burst_counters);
   AddBurstStats(context.stats, burst_counters);
-  AddDispatchedWorkerCounters(*context.counters, burst_counters);
+  // Rate-limited atomic flush (see ProcessWorkerIteration for rationale).
+  AddBurstCounters(context.pending_burst, burst_counters);
+  if (++context.bursts_since_flush >= kAtomicFlushBurstInterval) {
+    AddDispatchedWorkerCounters(*context.counters, context.pending_burst);
+    context.pending_burst = {};
+    context.bursts_since_flush = 0;
+  }
 }
 
 /**
@@ -907,6 +943,9 @@ void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbu
   while (*context->force_quit == 0) {
     ProcessWorkerIteration(*context, packets, transmit_buffers, transmit_counts);
   }
+  // Drain any unflushed counters so final stats are accurate.
+  FlushAtomicCounters(*context->counters, context->pending_burst);
+  context->pending_burst = {};
   return 0;
 }
 
@@ -920,10 +959,28 @@ void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbu
   while (*context->force_quit == 0) {
     ProcessDispatchedWorkerIteration(*context, packets, transmit_buffers, transmit_counts);
   }
+  // Drain any unflushed counters so final stats are accurate.
+  AddDispatchedWorkerCounters(*context->counters, context->pending_burst);
+  context->pending_burst = {};
   return 0;
 }
 
 }  // namespace
+
+/// Public: drain pending BurstCounters into the shared AtomicCounters.
+/// Defined out-of-line in dpdk::spi (not in the anonymous namespace) so
+/// the forward declaration in spi_pipeline.hpp matches this definition.
+void FlushAtomicCounters(AtomicCounters& counters, const BurstCounters& pending) noexcept {
+  counters.received.fetch_add(pending.received, std::memory_order_relaxed);
+  counters.transmitted.fetch_add(pending.transmitted, std::memory_order_relaxed);
+  counters.parsed.fetch_add(pending.parsed, std::memory_order_relaxed);
+  counters.matched.fetch_add(pending.matched, std::memory_order_relaxed);
+  counters.unknown.fetch_add(pending.unknown, std::memory_order_relaxed);
+  counters.malformed.fetch_add(pending.malformed, std::memory_order_relaxed);
+  counters.dropped.fetch_add(pending.dropped, std::memory_order_relaxed);
+  counters.dropped_by_rule.fetch_add(pending.dropped_by_rule, std::memory_order_relaxed);
+  counters.flow_cache_hits.fetch_add(pending.flow_cache_hits, std::memory_order_relaxed);
+}
 
 Pipeline::Pipeline(const dpdk::Environment& environment, RuleTable initial_rules,
                    std::unique_ptr<dpi::DpiRuleTable> dpi_rules, std::uint16_t burst_size, std::uint16_t worker_count,
@@ -1013,6 +1070,8 @@ void Pipeline::PrepareWorkerContext(WorkerContext& context, const volatile std::
   context.ethernet_destinations = &ethernet_destinations_;
   context.counters = &counters_;
   context.stats = {};
+  context.pending_burst = {};
+  context.bursts_since_flush = 0;
   context.rule_match_counts.assign(rule_manager_.Load()->GroupCount(), 0);
   context.dispatch_ring = worker_id < dispatch_rings_.size() ? dispatch_rings_[worker_id] : nullptr;
   context.force_quit = &force_quit;
@@ -1067,13 +1126,14 @@ std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const volati
   std::array<rte_mbuf*, kMaxBurstCapacity> packets{};
   std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>> transmit_buffers(environment_.GetPortCount());
   std::vector<std::uint16_t> transmit_counts(environment_.GetPortCount());
-  std::uint64_t previous_tsc{rte_rdtsc()};
+  const auto start_tsc{rte_rdtsc()};
+  std::uint64_t previous_tsc{start_tsc};
   std::uint64_t timer_tsc{};
   const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
 
   while (force_quit == 0) {
     ProcessWorkerIteration(context, packets, transmit_buffers, transmit_counts);
-    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc);
+    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
     MaybeReload(rule_manager_, reload_flag_, config_path_);
     // Purge expired flow cache entries periodically (same cadence as stats print).
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
@@ -1106,11 +1166,12 @@ std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const volatil
   PrintForwardMap(active_ports);
   PrintQueueMap(worker_contexts_.size());
 
-  std::uint64_t previous_tsc{rte_rdtsc()};
+  const auto start_tsc{rte_rdtsc()};
+  std::uint64_t previous_tsc{start_tsc};
   std::uint64_t timer_tsc{};
   const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
   while (force_quit == 0) {
-    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc);
+    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
     MaybeReload(rule_manager_, reload_flag_, config_path_);
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
       flow_table_.PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
@@ -1151,13 +1212,14 @@ std::expected<PipelineStats, std::string> Pipeline::RunFlowHashDispatch(const vo
   }
 
   std::array<rte_mbuf*, kMaxBurstCapacity> packets{};
-  std::uint64_t previous_tsc{rte_rdtsc()};
+  const auto start_tsc{rte_rdtsc()};
+  std::uint64_t previous_tsc{start_tsc};
   std::uint64_t timer_tsc{};
   const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
   const std::span dispatch_rings{dispatch_rings_.data(), dispatch_rings_.size()};
   while (force_quit == 0) {
     ProcessDispatchIteration(environment_, burst_size_, packets, dispatch_rings, counters_);
-    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc);
+    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
     MaybeReload(rule_manager_, reload_flag_, config_path_);
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
       flow_table_.PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());

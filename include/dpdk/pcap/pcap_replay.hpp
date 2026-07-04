@@ -3,6 +3,7 @@
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 
+#include <csignal>
 #include <cstdint>
 #include <expected>
 #include <string>

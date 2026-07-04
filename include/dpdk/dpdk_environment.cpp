@@ -250,7 +250,7 @@ std::expected<void, DpdkError> Environment::CreateMempool() noexcept {
       name.c_str(), num_mbufs, static_cast<unsigned>(cache_size), 0,
       static_cast<unsigned>(memory_buffer_size), static_cast<int>(rte_socket_id()));
 
-  if (memory_buffer_pool_ != nullptr) {
+  if (memory_buffer_pool_ == nullptr) {
     return std::unexpected(DpdkError{.message = std::format("rte_pktmbuf_pool_create '{}' failed (rte_errno={}: {})",
                                                             name, rte_errno, rte_strerror(rte_errno)),
                                      .dpdk_errno = rte_errno});
@@ -612,6 +612,13 @@ bool Environment::HasSoftwareBackedPort() const noexcept {
 bool Environment::ActivePortsSupportRss() const noexcept {
   return std::ranges::all_of(active_ports_, [this](std::uint16_t port_id) {
     return port_id < port_runtime_infos_.size() && port_runtime_infos_[port_id].rss_offloads != 0U;
+  });
+}
+
+bool Environment::HasPcapPort() const noexcept {
+  return std::ranges::any_of(active_ports_, [this](std::uint16_t port_id) {
+    return port_id < port_runtime_infos_.size() &&
+           port_runtime_infos_[port_id].driver_name.starts_with("net_pcap");
   });
 }
 

@@ -48,6 +48,22 @@ struct alignas(64) AtomicCounters {
   std::atomic<std::uint64_t> flow_cache_hits{};
 };
 
+/// Per-burst counters accumulated in a single worker iteration.
+struct BurstCounters {
+  std::uint64_t received{};
+  std::uint64_t transmitted{};
+  std::uint64_t parsed{};
+  std::uint64_t matched{};
+  std::uint64_t unknown{};
+  std::uint64_t malformed{};
+  std::uint64_t dropped{};
+  std::uint64_t dropped_by_rule{};
+  std::uint64_t flow_cache_hits{};
+};
+
+/// Flush pending BurstCounters into the shared AtomicCounters.
+void FlushAtomicCounters(AtomicCounters& counters, const BurstCounters& pending) noexcept;
+
 /// Startup-compiled IPv4 route used by the L3 forwarding path.
 struct L3RouteEntry {
   /// Destination network in host byte order.
@@ -78,6 +94,12 @@ struct alignas(64) WorkerContext {
   const std::vector<EthernetDestinationEntry>* ethernet_destinations{};
   AtomicCounters* counters{};
   PipelineStats stats{};
+  /// Counters accumulated since the last atomic flush — drained every
+  /// `kAtomicFlushBurstInterval` iterations to avoid hammering shared
+  /// cache lines on every burst.
+  BurstCounters pending_burst{};
+  /// Iterations elapsed since the last atomic flush.
+  std::uint32_t bursts_since_flush{};
   std::vector<std::uint64_t> rule_match_counts;
   rte_ring* dispatch_ring{};
   const volatile std::sig_atomic_t* force_quit{};

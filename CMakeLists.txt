@@ -14,6 +14,8 @@ set(FASTAPI_DPI_TARGET ${PROJECT_NAME}_dpi)
 set(FASTAPI_DPI_ALIAS ${PROJECT_NAME}::dpi)
 set(FASTAPI_DPDK_TARGET ${PROJECT_NAME}_dpdk)
 set(FASTAPI_DPDK_ALIAS ${PROJECT_NAME}::dpdk)
+set(FASTAPI_PCAP_TARGET ${PROJECT_NAME}_pcap)
+set(FASTAPI_PCAP_ALIAS ${PROJECT_NAME}::pcap)
 
 find_package(PkgConfig REQUIRED)
 include(CheckIPOSupported)
@@ -70,6 +72,7 @@ target_link_libraries(${FASTAPI_APP_TARGET} PRIVATE
         ${FASTAPI_SPI_ALIAS}
         ${FASTAPI_DPI_ALIAS}
         ${FASTAPI_DPDK_ALIAS}
+        ${FASTAPI_PCAP_ALIAS}
         -Wl,--end-group)
 target_compile_definitions(${FASTAPI_APP_TARGET} PRIVATE CONFIG_PATH="${CMAKE_CURRENT_BINARY_DIR}/config.yaml")
 

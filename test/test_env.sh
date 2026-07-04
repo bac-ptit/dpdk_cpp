@@ -60,24 +60,27 @@ require_worker_lcores() {
   fi
 }
 
-# Allocate hugepages if none are configured.
+# Allocate hugepages if none are configured, or increase if insufficient.
 # Usage: ensure_hugepages <memory_mb>
 ensure_hugepages() {
   local memory_mb="${1}"
   local current
   current="$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)"
-  if [ "$current" -gt 0 ]; then
+  local current_mb=$((current * 2))
+  if [ "$current_mb" -ge "$memory_mb" ]; then
+    echo "[OK] Sufficient hugepages already allocated: ${current_mb}MB"
     return 0
   fi
-  local pages=$(( (memory_mb + 1) / 2 + 64 ))  # 2MB pages + margin
-  echo "[*] No hugepages found. Allocating ${pages} x 2MB hugepages (~$((pages * 2))MB)..."
+  local pages=$(( (memory_mb + memory_mb / 4) / 2 ))  # 25% margin, 2MB pages
+  echo "[*] Insufficient hugepages (${current_mb}MB < ${memory_mb}MB). Allocating ${pages} x 2MB hugepages (~$((pages * 2))MB)..."
   sudo sysctl -w "vm.nr_hugepages=${pages}" >/dev/null
   local free_pages
   free_pages="$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)"
   if [ "$free_pages" -lt "$pages" ]; then
     echo "[!] Warning: requested ${pages} hugepages but only got ${free_pages}."
+    echo "    Try freeing memory or reducing worker count."
   fi
-  echo "[OK] Hugepages allocated: ${free_pages}"
+  echo "[OK] Hugepages allocated: $((free_pages * 2))MB"
 }
 
 run_app() {
@@ -211,9 +214,23 @@ cmd_bench() {
 
 cmd_bench_pcap() {
   local count="${1:-$DEFAULT_BENCH_COUNT}"
-  local workers="${2:-$DEFAULT_WORKERS}"
+  local workers="${2:-}"
   local match_percent="${3:-$DEFAULT_MATCH_PERCENT}"
   local shard_dir="$SCRIPT_DIR/bench_pcap_shards"
+
+  # If workers not provided, fall back to spi.worker_count in config.yaml so
+  # `pixi run bench` honors the single source of truth.
+  if [ -z "$workers" ]; then
+    local config_file="$PROJECT_DIR/config.yaml"
+    if [ -f "$config_file" ]; then
+      workers="$(python3 - "$config_file" <<'PY' 2>/dev/null || true
+import sys, yaml
+print(yaml.safe_load(open(sys.argv[1]))['spi']['worker_count'])
+PY
+      )"
+    fi
+    workers="${workers:-$DEFAULT_WORKERS}"
+  fi
 
   require_worker_lcores "$workers"
 
@@ -235,22 +252,33 @@ config_file, shard_dir, count_arg, workers_arg, match_percent_arg = sys.argv[1:6
 count = int(count_arg)
 workers = int(workers_arg)
 match_percent = int(match_percent_arg)
+# SPI rules from docs/lv3.csv
 filter_groups = [
-    {'name': 'bench_http', 'precedence': 100, 'action': 'forward', 'filters': [
-        {'protocol': 'tcp', 'source_ip_address': '10.17.50.1',
-         'destination_ip_address': '10.17.50.12', 'destination_port': 80, 'label': 'HTTP'},
+    {'name': 'fg_l34_facebook', 'precedence': 100, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'destination_ip_address': '31.13.64.0/18', 'label': 'facebook_1'},
+        {'protocol': 'tcp', 'destination_ip_address': '66.220.144.0/20', 'label': 'facebook_2'},
+        {'protocol': 'tcp', 'destination_ip_address': '69.63.176.0/20', 'label': 'facebook_3'},
+        {'protocol': 'tcp', 'destination_ip_address': '157.240.0.0/16', 'label': 'facebook_4'},
+        {'protocol': 'tcp', 'destination_ip_address': '69.220.144.5', 'label': 'facebook_5'},
     ]},
-    {'name': 'bench_https', 'precedence': 101, 'action': 'forward', 'filters': [
-        {'protocol': 'tcp', 'source_ip_address': '10.17.50.2',
-         'destination_ip_address': '10.17.50.12', 'destination_port': 443, 'label': 'HTTPS'},
+    {'name': 'fg_l34_youtube', 'precedence': 101, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'destination_ip_address': '142.250.0.0/15', 'destination_port': 443, 'label': 'youtube_1'},
+        {'protocol': 'tcp', 'destination_ip_address': '172.217.0.0/16', 'destination_port': 443, 'label': 'youtube_2'},
+        {'protocol': 'tcp', 'destination_ip_address': '216.58.192.0/19', 'destination_port': 443, 'label': 'youtube_3'},
+        {'protocol': 'tcp', 'destination_ip_address': '74.125.0.1', 'destination_port': 443, 'label': 'youtube_4'},
     ]},
-    {'name': 'bench_dns', 'precedence': 102, 'action': 'forward', 'filters': [
-        {'protocol': 'udp', 'source_ip_address': '10.17.50.3',
-         'destination_ip_address': '10.17.50.53', 'destination_port': 53, 'label': 'DNS'},
+    {'name': 'fg_l34_http', 'precedence': 102, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'destination_port': 80, 'label': 'http_all'},
     ]},
-    {'name': 'bench_gtp', 'precedence': 103, 'action': 'forward', 'filters': [
-        {'protocol': 'udp', 'source_ip_address': '10.17.50.4',
-         'destination_ip_address': '10.17.50.215', 'destination_port': 2152, 'label': 'GTP_U'},
+    {'name': 'fg_l34_https', 'precedence': 103, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'destination_port': 443, 'label': 'https_all'},
+    ]},
+    {'name': 'fg_l34_dns', 'precedence': 104, 'action': 'forward', 'filters': [
+        {'protocol': 'udp', 'destination_port': 53, 'label': 'dns_udp'},
+        {'protocol': 'tcp', 'destination_port': 53, 'label': 'dns_tcp'},
+    ]},
+    {'name': 'fg_l34_udp_sdf1006', 'precedence': 106, 'action': 'drop', 'filters': [
+        {'protocol': 'udp', 'destination_port': 9999, 'label': 'udp_drop'},
     ]},
 ]
 with open(config_file) as f:
@@ -260,7 +288,7 @@ extra = cache_size * (workers + 2) + workers * 512
 # infinite_rx pre-allocates 1 mbuf per pcap packet PER QUEUE during setup
 # Total = sum of all packets across all shards = count
 mbuf_needed = count + extra
-memory_mb = int(mbuf_needed * 2300 / (1024 * 1024) * 1.1 + 256)
+memory_mb = int(mbuf_needed * 2300 / (1024 * 1024) * 2.0 + workers * 64 + 512)
 rx_streams = [f'rx_pcap={os.path.join(shard_dir, f"bench_q{i}.pcap")}' for i in range(workers)]
 cfg['eal']['virtual_devices'] = ['net_pcap0,' + ','.join(rx_streams) + ',infinite_rx=1']
 cfg['eal']['cpu_core_list'] = f'0-{workers}'
@@ -277,9 +305,9 @@ cfg['port']['receive_queues'] = workers
 cfg['port']['transmit_queues'] = workers
 cfg['spi']['worker_count'] = workers
 cfg['spi']['packet_distribution'] = 'auto'
-cfg['spi']['dispatch_queue_size'] = 16384
+cfg['spi']['dispatch_queue_size'] = 32768
 cfg['spi']['drop_unmatched'] = True
-cfg['app']['burst_size'] = 64
+cfg['app']['burst_size'] = 256
 cfg['spi']['filter_groups'] = filter_groups
 with open(config_file, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)

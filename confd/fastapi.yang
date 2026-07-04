@@ -1,0 +1,241 @@
+module fastapi {
+  yang-version 1.1;
+  namespace "urn:fastapi:dpdk";
+  prefix fastapi;
+
+  organization "FastAPI DPDK";
+  description "YANG model for FastAPI DPDK SPI/DPI packet processor configuration.";
+
+  container fastapi {
+    description "Top-level DPDK configuration.";
+
+    container eal {
+      description "EAL (Environment Abstraction Layer) configuration.";
+      leaf cpu_core_list {
+        type string;
+        default "0-4";
+        description "Comma-separated list or range of CPU cores.";
+      }
+      leaf memory_channels {
+        type uint16;
+        default 4;
+        description "Number of memory channels.";
+      }
+      leaf memory_size {
+        type string;
+        default "1024";
+        description "Memory to allocate in MB (legacy mode).";
+      }
+      leaf disable_hugepages {
+        type boolean;
+        default false;
+        description "Disable hugepage allocation.";
+      }
+      leaf disable_pci {
+        type boolean;
+        default false;
+        description "Disable PCI device scanning.";
+      }
+      leaf file_prefix {
+        type string;
+        default "spifast";
+        description "DPDK file prefix for multi-process isolation.";
+      }
+      leaf log_level {
+        type string {
+          pattern "[0-9]";
+        }
+        default "6";
+        description "DPDK log level (7=debug, 6=info, 5=warn, 4=error).";
+      }
+      leaf-list virtual_devices {
+        type string;
+        description "Virtual device (--vdev) strings.";
+      }
+    }
+
+    container port {
+      description "Port configuration.";
+      leaf port_bitmask {
+        type string;
+        default "0x1";
+        description "Hex bitmask of ports to enable.";
+      }
+      leaf receive_queues {
+        type uint16;
+        default 1;
+        description "RX queues per port.";
+      }
+      leaf transmit_queues {
+        type uint16;
+        default 1;
+        description "TX queues per port.";
+      }
+      leaf receive_descriptors {
+        type uint16;
+        default 1024;
+        description "RX descriptors per queue.";
+      }
+      leaf transmit_descriptors {
+        type uint16;
+        default 1024;
+        description "TX descriptors per queue.";
+      }
+      leaf promiscuous {
+        type boolean;
+        default true;
+        description "Enable promiscuous mode.";
+      }
+    }
+
+    container mempool {
+      description "Mempool configuration.";
+      leaf name {
+        type string;
+        default "mbuf_pool";
+        description "Mempool name.";
+      }
+      leaf memory_buffer_count {
+        type uint32;
+        default 65536;
+        description "Total number of mbufs.";
+      }
+      leaf memory_buffer_size {
+        type uint16;
+        default 2176;
+        description "Mbuf data buffer size in bytes.";
+      }
+      leaf cache_size {
+        type uint32;
+        default 256;
+        description "Per-core mbuf cache size.";
+      }
+    }
+
+    container app {
+      description "Application settings.";
+      leaf burst_size {
+        type uint16;
+        default 64;
+        description "Packets per rx/tx burst.";
+      }
+      leaf mac_updating {
+        type boolean;
+        default false;
+        description "Rewrite MAC addresses on forwarded packets.";
+      }
+      leaf timer_period_sec {
+        type uint32;
+        default 5;
+        description "Stats print interval in seconds (0=off).";
+      }
+    }
+
+    container spi {
+      description "SPI (Shallow Packet Inspection) configuration.";
+      leaf worker_count {
+        type uint16;
+        default 1;
+        description "Number of worker lcores.";
+      }
+      leaf packet_distribution {
+        type string {
+          pattern "auto|queue|flow_hash";
+        }
+        default "auto";
+        description "Packet distribution mode.";
+      }
+      leaf dispatch_queue_size {
+        type uint32;
+        default 8192;
+        description "Per-worker ring size (flow_hash mode).";
+      }
+      leaf drop_unmatched {
+        type boolean;
+        default true;
+        description "Drop packets that match no rule.";
+      }
+      leaf flow_ttl_sec {
+        type uint32;
+        default 300;
+        description "Flow table entry TTL in seconds.";
+      }
+      list filter-groups {
+        key "name";
+        description "Hierarchical filter groups sorted by precedence.";
+        leaf name {
+          type string;
+          mandatory true;
+        }
+        leaf precedence {
+          type uint32;
+          default 100;
+          description "Lower = higher priority.";
+        }
+        leaf action {
+          type string {
+            pattern "forward|drop";
+          }
+          default "forward";
+        }
+        list filters {
+          description "Individual filter rules within the group.";
+          leaf protocol {
+            type string {
+              pattern "tcp|udp";
+            }
+            mandatory true;
+          }
+          leaf source_ip_address {
+            type string;
+            description "Source IP or CIDR (e.g. 10.0.0.0/8).";
+          }
+          leaf destination_ip_address {
+            type string;
+            description "Destination IP or CIDR.";
+          }
+          leaf source_port {
+            type uint16;
+          }
+          leaf destination_port {
+            type uint16;
+          }
+          leaf label {
+            type string;
+            default "";
+          }
+        }
+      }
+    }
+
+    container dpi {
+      description "DPI (Deep Packet Inspection) configuration.";
+      leaf enabled {
+        type boolean;
+        default false;
+        description "Enable DPI hostname classification.";
+      }
+      list filters {
+        key "hostname_pattern";
+        description "Hostname matching rules.";
+        leaf hostname_pattern {
+          type string;
+          mandatory true;
+          description "Pattern like *.facebook.com or exact match.";
+        }
+        leaf filter_group {
+          type string;
+          default "";
+        }
+        leaf priority {
+          type uint32;
+          default 100;
+        }
+        leaf label {
+          type string;
+          default "";
+        }
+      }
+    }
+  }
+}

@@ -74,6 +74,7 @@ namespace {
 [[nodiscard]] bool IsCidr(const std::string& address) noexcept { return address.find('/') != std::string::npos; }
 
 /// Build one rte_acl_rule from a parsed CompiledFilter.
+/// MASK type with bitmask values. Port/protocol also set but verified in C++.
 void BuildAclRule(struct rte_acl_rule* rule, const CompiledFilter& filter, uint32_t rule_index) noexcept {
   std::memset(rule, 0, static_cast<std::size_t>(RTE_ACL_RULE_SZ(kAclNumFields)));
 
@@ -105,7 +106,7 @@ void BuildAclRule(struct rte_acl_rule* rule, const CompiledFilter& filter, uint3
   rule->field[kAclFieldDstPort].value.u16 = rte_cpu_to_be_16(filter.destination_port);
   rule->field[kAclFieldDstPort].mask_range.u16 = filter.match_destination_port ? UINT16_MAX : 0;
 
-  // protocol (always specified)
+  // protocol
   rule->field[kAclFieldProtocol].value.u8 = ProtocolToIpProto(filter.protocol);
   rule->field[kAclFieldProtocol].mask_range.u8 = UINT8_MAX;
 }
@@ -132,6 +133,7 @@ void BuildAclRule(struct rte_acl_rule* rule, const CompiledFilter& filter, uint3
   std::uint32_t dest_ip{};
   std::uint32_t dest_network{};
   std::uint32_t dest_mask{};
+  std::uint32_t dest_prefix_len{};
   bool is_cidr{false};
 
   if (filter_config.destination_ip_address) {
@@ -143,6 +145,10 @@ void BuildAclRule(struct rte_acl_rule* rule, const CompiledFilter& filter, uint3
       }
       dest_network = parsed->first;
       dest_mask = parsed->second;
+      // Extract prefix length from CIDR string (e.g. "31.13.64.0/18" → 18).
+      const auto slash{filter_config.destination_ip_address->find('/')};
+      const auto prefix_str{filter_config.destination_ip_address->substr(slash + 1)};
+      dest_prefix_len = static_cast<std::uint32_t>(std::strtoul(prefix_str.c_str(), nullptr, 10));
       is_cidr = true;
     } else {
       const auto parsed{ParseIpv4Address(*filter_config.destination_ip_address)};
@@ -160,6 +166,7 @@ void BuildAclRule(struct rte_acl_rule* rule, const CompiledFilter& filter, uint3
       .destination_ip_address = dest_ip,
       .destination_network = dest_network,
       .destination_prefix_mask = dest_mask,
+      .destination_prefix_length = dest_prefix_len,
       .source_port = filter_config.source_port.value_or(0),
       .destination_port = filter_config.destination_port.value_or(0),
       .match_source_ip = filter_config.source_ip_address.has_value(),
@@ -179,13 +186,25 @@ void BuildAclRule(struct rte_acl_rule* rule, const CompiledFilter& filter, uint3
 
 RuleTable::RuleTable(std::vector<CompiledFilterGroup> groups) noexcept : groups_{std::move(groups)} {}
 
+/// Check if a filter's port/protocol constraints match the packet.
+[[nodiscard, gnu::always_inline]] inline bool FilterMatchesPortProtocol(const CompiledFilter& filter,
+                                                                        const PacketMetadata& packet) noexcept {
+  if (filter.protocol != packet.protocol) {
+    return false;
+  }
+  if (filter.match_destination_port && filter.destination_port != packet.destination_port) {
+    return false;
+  }
+  if (filter.match_source_port && filter.source_port != packet.source_port) {
+    return false;
+  }
+  return true;
+}
+
 ClassificationResult RuleTable::Match(const PacketMetadata& packet) const noexcept {
   AclInputData acl_input;
   acl_input.src_ip_be = rte_cpu_to_be_32(packet.source_ip_address);
   acl_input.dst_ip_be = rte_cpu_to_be_32(packet.destination_ip_address);
-  acl_input.src_port_be = rte_cpu_to_be_16(packet.source_port);
-  acl_input.dst_port_be = rte_cpu_to_be_16(packet.destination_port);
-  acl_input.protocol = ProtocolToIpProto(packet.protocol);
 
   const uint8_t* data[1] = {reinterpret_cast<const uint8_t*>(&acl_input)};
   uint32_t results[1]{};
@@ -195,14 +214,18 @@ ClassificationResult RuleTable::Match(const PacketMetadata& packet) const noexce
       continue;
     }
 
+    results[0] = 0;
     const int ret{rte_acl_classify(group.acl_ctx, data, results, 1, 1)};
-    if (ret == 0) [[likely]] {
-      if (results[0] != 0) {
-        const auto filter_index{results[0] - 1};
-        const auto& label = filter_index < group.filters.size() ? group.filters[filter_index].label : "";
-
+    if (ret == 0 && results[0] != 0) [[likely]] {
+      const auto filter_index{results[0] - 1};
+      if (filter_index < group.filters.size() &&
+          FilterMatchesPortProtocol(group.filters[filter_index], packet)) [[likely]] {
         return ClassificationResult{
-            .group_name = group.name, .label = label, .action = group.action, .group_precedence = group.precedence, .matched = true,
+            .group_name = group.name,
+            .label = group.filters[filter_index].label,
+            .action = group.action,
+            .group_precedence = group.precedence,
+            .matched = true,
         };
       }
     }

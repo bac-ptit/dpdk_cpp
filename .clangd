@@ -1,0 +1,15 @@
+CompileFlags:
+  CompilationDatabase: cmake-build-debug
+
+# clangd auto-discovers compile_commands.json from the project root, but pointing
+# it explicitly at cmake-build-debug avoids picking up a stale/foreign one and
+# matches the binaryDir defined in CMakePresets.json.
+Diagnostics:
+  # Project uses -fno-exceptions, so do not flag throws/missing handlers.
+  UnusedIncludes: None
+  MissingIncludes: None
+Index:
+  Background: Build
+
+# Heavy DPDK/glaze headers — let clangd skip them when they are pure noise.
+HeaderSourceSwitch: Source

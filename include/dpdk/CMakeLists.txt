@@ -1,6 +1,7 @@
 add_subdirectory(config)
 add_subdirectory(spi)
 add_subdirectory(dpi)
+add_subdirectory(pcap)
 
 add_library(${FASTAPI_DPDK_TARGET} STATIC
         app_signal.cpp
