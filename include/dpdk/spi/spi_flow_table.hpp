@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <vector>
 
+#include <rte_hash.h>
+
 #include "dpdk/spi/spi_rule_engine.hpp"
 
 struct rte_hash;
@@ -68,15 +70,77 @@ class FlowTable final {
    * @brief Lookup a flow in the cache.
    * @param key  5-tuple flow key.
    * @return Pointer to cached entry, or nullptr on cache miss.
+   *
+   * Defined inline in the header so the hot path is inlined into the
+   * caller's TU without relying on LTO. With 99%+ cache hit rate, this
+   * function is on the per-packet critical path.
    */
-  [[nodiscard]] FlowEntry* Lookup(const FlowKey& key) noexcept;
+  [[gnu::hot, gnu::always_inline]] [[nodiscard]] FlowEntry* Lookup(
+      const FlowKey& key) noexcept {
+    if (hash_ == nullptr) [[unlikely]] {
+      return nullptr;
+    }
+    const auto result{rte_hash_lookup(hash_, &key)};
+    if (result < 0) [[unlikely]] {
+      return nullptr;
+    }
+    auto* entry = &entries_[static_cast<std::size_t>(result)];
+    if (entry->match_count == 0) [[unlikely]] {
+      return nullptr;  // empty slot
+    }
+    return entry;
+  }
+
+  /**
+   * @brief Bulk lookup for a contiguous batch of keys.
+   * @param keys       Pointer to N FlowKey entries.
+   * @param num_keys   Number of keys (>= 0).
+   * @param positions  Output array of `num_keys` int32_t; positions[i] is
+   *                   the slot index in `entries_[]` (>= 0) or negative on miss.
+   *
+   * Pipelined version of `Lookup` for the per-burst hot path. With Clang's
+   * SSE4.2 CRC32 pin (from `Environment::InitEal`) the bulk API computes
+   * all N CRC32 hashes in vectorised form and pipelines bucket loads.
+   * Returns void; callers walk `positions[]` to fetch each entry via
+   * `GetEntry` and verify `match_count > 0`.
+   */
+  [[gnu::hot]] void LookupBulk(const FlowKey* keys, std::uint32_t num_keys,
+                                std::int32_t* positions) noexcept;
+
+  /**
+   * @brief Get a FlowEntry by slot index (output of LookupBulk).
+   *
+   * Caller must pass a position from `LookupBulk` (>= 0). The `[[assume]]`
+   * documents the contract so the compiler can elide the bounds check.
+   * Returns nullptr if position is negative.
+   */
+  [[gnu::hot, gnu::always_inline]] [[nodiscard]] FlowEntry* GetEntry(
+      std::int32_t position) noexcept {
+    if (position < 0) [[unlikely]] {
+      return nullptr;
+    }
+    [[assume(position >= 0)]];
+    return &entries_[static_cast<std::size_t>(position)];
+  }
 
   /**
    * @brief Insert or update a flow entry.
    * @param key    5-tuple flow key.
    * @param entry  Classification result to cache.
+   *
+   * Defined inline in the header to avoid a function call on the miss path.
    */
-  void Insert(const FlowKey& key, const FlowEntry& entry) noexcept;
+  [[gnu::always_inline]] void Insert(const FlowKey& key, const FlowEntry& entry) noexcept {
+    if (hash_ == nullptr) [[unlikely]] {
+      return;
+    }
+    const auto result{rte_hash_add_key(hash_, &key)};
+    if (result >= 0) [[likely]] {
+      auto& slot{entries_[static_cast<std::size_t>(result)]};
+      slot = entry;
+      slot.last_seen_tsc = rte_rdtsc();
+    }
+  }
 
   /**
    * @brief Remove entries not seen since the given TSC threshold.

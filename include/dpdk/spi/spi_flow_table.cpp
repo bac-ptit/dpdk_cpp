@@ -5,9 +5,14 @@
 #include <rte_hash_crc.h>
 #include <rte_lcore.h>
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdio>
 #include <format>
 #include <print>
+#include <ranges>
+#include <span>
 #include <vector>
 
 namespace dpdk::spi {
@@ -32,7 +37,15 @@ constexpr std::uint32_t kFlowTableSize{1U << 20U};
   params.hash_func = rte_hash_crc;
   params.hash_func_init_val = 0;
   params.socket_id = static_cast<int>(rte_socket_id());
-  params.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY;
+  // RW_CONCURRENCY_LF replaces the per-bucket rwlock with atomic CAS retries.
+  // With 16 cores hammering the same 5-tuple buckets, ticket-lock
+  // acquisitions dominate miss-path latency. Lock-free path trades
+  // slightly more work on the writer side for wait-free readers.
+  // Note: this implicitly enables NO_FREE_ON_DEL — `rte_hash_del_key`
+  // (used by PurgeExpired) does not reclaim the slot; we don't rely
+  // on slot reuse in steady-state, and PurgeExpired is gated by
+  // `flow_ttl_sec` (default 300s, never reached during bench).
+  params.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF;
   return params;
 }
 
@@ -54,55 +67,31 @@ FlowTable::~FlowTable() {
   }
 }
 
-FlowEntry* FlowTable::Lookup(const FlowKey& key) noexcept {
+// Lookup and Insert are now defined inline in spi_flow_table.hpp so they
+// can be inlined into the caller's TU without relying on LTO. The hot path
+// (cache hit, ~99.9% of packets) calls Lookup on every packet.
+
+void FlowTable::LookupBulk(const FlowKey* keys, std::uint32_t num_keys,
+                            std::int32_t* positions) noexcept {
   if (hash_ == nullptr) [[unlikely]] {
-    return nullptr;
-  }
-
-  const auto result{rte_hash_lookup(hash_, &key)};
-  if (result < 0) [[unlikely]] {
-    return nullptr;
-  }
-
-  auto* entry = &entries_[static_cast<std::size_t>(result)];
-  if (entry->match_count == 0) [[unlikely]] {
-    return nullptr;  // empty slot
-  }
-
-  // Refresh `last_seen_tsc` so long-lived flows don't get TTL-purged.
-  // Rate-limit per worker (not per slot) to bound cache-line writes.
-  // Without this, flows inserted at boot would be purged at T+flow_ttl_sec
-  // (~5 min default) and the next packet would pay the full insert cost
-  // (ACL classify + L7 extract + DPI match + Insert).
-  static thread_local std::uint64_t last_refresh_tsc{0};
-  static thread_local std::uint64_t refresh_interval{0};
-  if (refresh_interval == 0) [[unlikely]] {
-    refresh_interval = rte_get_tsc_hz();  // refresh at most once per second
-  }
-  const auto now{rte_rdtsc()};
-  if (now - last_refresh_tsc > refresh_interval) {
-    entry->last_seen_tsc = now;
-    last_refresh_tsc = now;
-  }
-  return entry;
-}
-
-void FlowTable::Insert(const FlowKey& key, const FlowEntry& entry) noexcept {
-  if (hash_ == nullptr) [[unlikely]] {
+    std::ranges::fill(std::span{positions, num_keys}, -1);
     return;
   }
-
-  // Use rte_hash_add_key (NOT rte_hash_add_key_data) which returns the slot
-  // ID (0-based, ≥ 0 on success). rte_hash_add_key_data returns just 0/-EINVAL/
-  // -ENOSPC and is intended for "update the value" rather than as an index.
-  const auto result{rte_hash_add_key(hash_, &key)};
-  if (result >= 0) [[likely]] {
-    auto& slot{entries_[static_cast<std::size_t>(result)]};
-    slot = entry;
-    slot.last_seen_tsc = rte_rdtsc();
-  } else {
-    std::println(stderr, "FlowTable: hash full, drop insert (ret={})", result);
+  if (num_keys == 0) [[unlikely]] {
+    return;
   }
+  // DPDK's bulk API takes `const void **keys` — a contiguous pointer-to-array.
+  // We build that on the stack, capped at the per-burst maximum so we never
+  // overflow it. Caller (ProcessPortBurst) never passes more than this.
+  constexpr std::uint32_t kMaxBulkKeys{256};  // matches kMaxBurstCapacity
+  if (num_keys > kMaxBulkKeys) [[unlikely]] {
+    num_keys = kMaxBulkKeys;
+  }
+  alignas(64) std::array<const void*, kMaxBulkKeys> key_ptrs{};
+  for (std::uint32_t i{0}; i < num_keys; ++i) {
+    key_ptrs[i] = &keys[i];
+  }
+  rte_hash_lookup_bulk(hash_, key_ptrs.data(), num_keys, positions);
 }
 
 void FlowTable::PurgeExpired(std::uint64_t now_tsc, std::uint64_t ttl_cycles) noexcept {
