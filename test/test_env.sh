@@ -252,7 +252,9 @@ config_file, shard_dir, count_arg, workers_arg, match_percent_arg = sys.argv[1:6
 count = int(count_arg)
 workers = int(workers_arg)
 match_percent = int(match_percent_arg)
-# SPI rules from docs/lv3.csv
+
+# SPI rules that match the synthetic pcap traffic. These are the only rules
+# that produce non-zero matches for the bench shards.
 filter_groups = [
     {'name': 'fg_l34_facebook', 'precedence': 100, 'action': 'forward', 'filters': [
         {'protocol': 'tcp', 'destination_ip_address': '31.13.64.0/18', 'label': 'facebook_1'},
@@ -281,42 +283,39 @@ filter_groups = [
         {'protocol': 'udp', 'destination_port': 9999, 'label': 'udp_drop'},
     ]},
 ]
+
+# Read the user's config.yaml. Cách 3: preserve all user settings (burst_size,
+# worker_count, mempool, queues, drop_unmatched, ...). Only override the two
+# fields the bench REQUIRES for the test traffic to flow correctly.
 with open(config_file) as f:
     cfg = yaml.safe_load(f)
-cache_size = cfg['mempool'].get('cache_size', 256)
-extra = cache_size * (workers + 2) + workers * 512
-# infinite_rx pre-allocates 1 mbuf per pcap packet PER QUEUE during setup
-# Total = sum of all packets across all shards = count
-mbuf_needed = count + extra
-memory_mb = int(mbuf_needed * 2300 / (1024 * 1024) * 2.0 + workers * 64 + 512)
+
+# Override 1: pcap shards the bench just generated (must point to bench_pcap_shards).
+# User's existing virtual_devices (or absence thereof) is replaced.
 rx_streams = [f'rx_pcap={os.path.join(shard_dir, f"bench_q{i}.pcap")}' for i in range(workers)]
 cfg['eal']['virtual_devices'] = ['net_pcap0,' + ','.join(rx_streams) + ',infinite_rx=1']
-cfg['eal']['cpu_core_list'] = f'0-{workers}'
-cfg['eal']['memory_size'] = str(memory_mb)
-cfg['eal']['legacy_memory'] = True
-cfg['eal']['disable_hugepages'] = False
-cfg['eal']['disable_pci'] = True
-cfg['eal'].pop('numa_limit', None)
-cfg['l3_forward']['enabled'] = False
-cfg['mempool']['memory_buffer_size'] = 2176
-cfg['mempool']['memory_buffer_count'] = mbuf_needed
-cfg['port']['port_bitmask'] = '0x1'
-cfg['port']['receive_queues'] = workers
-cfg['port']['transmit_queues'] = workers
-cfg['spi']['worker_count'] = workers
-cfg['spi']['packet_distribution'] = 'auto'
-cfg['spi']['dispatch_queue_size'] = 32768
-cfg['spi']['drop_unmatched'] = True
-cfg['app']['burst_size'] = 256
+
+# Override 2: filter groups matching the synthetic pcap traffic. The bench shards
+# are generated with specific destination IP / port values that match only these
+# rules. User's own filter_groups would not match the bench traffic, so we
+# replace them with the bench's rules. After the run, restore_config puts
+# the user's original groups back.
 cfg['spi']['filter_groups'] = filter_groups
+
 with open(config_file, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
-matched = count * match_percent // 100
-print(f'PCAP benchmark: workers={workers}, match_percent={match_percent}, expected_match~={matched}')
-print(f'Config: {count} pkts, {mbuf_needed} mbufs ({extra} extra), {memory_mb}MB')
-# Write memory_mb to a temp file for the shell script to read
+
+# Compute hugepages needed from the user's mempool config (1.5x safety margin).
+# If user's mbufs exceed free hugepages, ensure_hugepages will allocate more.
+mbuf_count = cfg.get('mempool', {}).get('memory_buffer_count', 32768)
+mbuf_size = cfg.get('mempool', {}).get('memory_buffer_size', 2176)
+memory_mb = max(2048, int(mbuf_count * mbuf_size / (1024 * 1024) * 1.5) + workers * 64 + 512)
 with open(config_file + '.mem', 'w') as mf:
     mf.write(str(memory_mb))
+
+matched = count * match_percent // 100
+print(f'PCAP benchmark: workers={workers}, match_percent={match_percent}, expected_match~={matched}')
+print(f'Config: user settings preserved; mbufs={mbuf_count}, hugepages_needed={memory_mb}MB')
 PY
 
   local memory_mb
