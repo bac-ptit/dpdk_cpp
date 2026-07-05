@@ -6,6 +6,7 @@
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_hash_crc.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 
@@ -223,6 +224,15 @@ std::expected<void, DpdkError> Environment::InitEal() noexcept {
   if (const auto eal_result{CheckNegativeResult(rte_eal_init(argc, argv.data()), "rte_eal_init")}; !eal_result) {
     return std::unexpected(eal_result.error());
   }
+
+  // Pin the CRC32 algorithm used by `rte_hash_crc` (FlowTable's hash func).
+  // DPDK's runtime auto-detection picks the best implementation per call;
+  // hard-pinning at init removes the per-call dispatch branch and makes the
+  // choice deterministic across hosts. The SSE4.2 path is universally
+  // available on our bench host; `rte_hash_crc_set_alg` returns void, so
+  // there is no error to propagate. If SSE4.2 is unavailable, the function
+  // is a no-op and the auto-detect fallback remains in effect.
+  rte_hash_crc_set_alg(CRC32_SSE42_x64);
 
   port_count_ = rte_eth_dev_count_avail();
   if (port_count_ == 0) {
