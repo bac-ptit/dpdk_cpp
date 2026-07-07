@@ -169,7 +169,7 @@ eal:
   legacy_memory: true
   log_level: '7'
   memory_channels: 2
-  memory_size: '5911'
+  memory_size: '6000'
   process_type: primary
   virtual_devices:
   - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q1.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q2.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q3.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q4.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q5.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q6.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q7.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q8.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q9.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q10.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q11.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q12.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q13.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q14.pcap,infinite_rx=1
@@ -257,7 +257,7 @@ l3_forward:
     queue_id: 10
 mempool:
   cache_size: 256
-  memory_buffer_count: 1012032
+  memory_buffer_count: 1100000
   memory_buffer_size: 2176
   name: mbuf_pool
 port:
@@ -344,5 +344,5 @@ spi:
       protocol: udp
     name: fg_l34_udp_sdf1006
     precedence: 106
-  packet_distribution: auto
+  packet_distribution: queue
   worker_count: 15

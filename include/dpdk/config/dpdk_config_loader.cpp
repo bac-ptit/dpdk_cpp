@@ -93,8 +93,10 @@ constexpr std::size_t kIpv6AddressBytes{16};
 
 /// Whether an optional IP field is absent, a valid IPv4 address, or a valid CIDR.
 [[nodiscard]] bool HasValidIp(const std::optional<std::string>& address) noexcept {
-  if (!address) return true;
-  if (address->find('/') != std::string::npos) {
+  if (!address) {
+    return true;
+  }
+  if (address->contains('/')) {
     return spi::ParseCidr(*address).has_value();
   }
   return spi::ParseIpv4Address(*address).has_value();

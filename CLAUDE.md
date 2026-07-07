@@ -32,6 +32,29 @@ Read ALL rule files before generating or reviewing code:
 - `.claude/skills/custom-formatter/SKILL.md` — std::formatter<T> conventions
 - `.claude/skills/performance-attributes/SKILL.md` — C++23/C++26 + GCC performance attributes
 
+## Research & Documentation
+
+When searching the internet for information that could help the DPDK project:
+
+1. **Verify the source**: Use `WebSearch` (Web) and `WebFetch` to confirm the
+   finding is authoritative (DPDK docs, GitHub issues, vendor blogs).
+2. **Confirm applicability**: Check that the finding applies to THIS
+   project's DPDK version (check `/usr/include/rte_*.h` for API symbols,
+   not just the latest DPDK).
+3. **Save useful findings**: If the research yields a non-trivial insight
+   (a new optimization, an API constraint, a perf tip, etc.), save it as
+   a markdown file under `docs_search/` so future sessions can reference
+   it without re-doing the research.
+
+   Naming convention: `docs_search/<NN_short_topic>.md` where `NN` is a
+   zero-padded index (e.g., `09_dpi_tls_extraction_cost.md`).
+
+   Each file should include:
+   - Source URL(s) and date verified
+   - The finding (1-3 paragraphs)
+   - Whether/how it applies to this codebase (specific files/lines)
+   - Measured impact or expected impact if applicable
+
 ## Key Conventions
 
 ### Initialization
