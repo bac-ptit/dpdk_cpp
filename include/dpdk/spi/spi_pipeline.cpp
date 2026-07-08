@@ -564,15 +564,36 @@ void PrintQueueMap(std::size_t worker_count) noexcept {
 /// Extract L7 hostname from TLS SNI (port 443) or HTTP Host (port 80).
 void ExtractHostname(const rte_mbuf& packet, PacketMetadata& metadata) noexcept {
   const auto* ip_hdr{rte_pktmbuf_mtod_offset(&packet, const rte_ipv4_hdr*, sizeof(rte_ether_hdr))};
-  const auto l4_len{static_cast<std::uint32_t>(sizeof(rte_ether_hdr) + rte_ipv4_hdr_len(ip_hdr))};
+  // Skip past IP header to TCP/UDP header. Then skip TCP header (data_offset
+  // field) to reach the L7 payload. UDP has no header beyond l4_len.
+  const auto l4_off{static_cast<std::uint32_t>(sizeof(rte_ether_hdr) + rte_ipv4_hdr_len(ip_hdr))};
+  std::uint32_t payload_off{l4_off};
+  if (metadata.protocol == Protocol::kTcp) {
+    // rte_pktmbuf_read returns either `&tcp_hdr` (when it copied) or a
+    // pointer into the mbuf (when data is contiguous). We need the bytes
+    // regardless — copy from the returned pointer.
+    rte_tcp_hdr tcp_hdr{};
+    const void* tcp_data{rte_pktmbuf_read(&packet, l4_off, sizeof(tcp_hdr), &tcp_hdr)};
+    if (tcp_data == nullptr) [[unlikely]] {
+      return;
+    }
+    if (tcp_data != &tcp_hdr) {
+      std::memcpy(&tcp_hdr, tcp_data, sizeof(tcp_hdr));
+    }
+    const auto tcp_hdr_len{static_cast<std::uint32_t>(tcp_hdr.data_off >> 4U) * 4U};
+    if (tcp_hdr_len < sizeof(rte_tcp_hdr)) [[unlikely]] {
+      return;
+    }
+    payload_off = l4_off + tcp_hdr_len;
+  }
 
   if (metadata.destination_port == kTlsPort) {
-    if (auto sni{ExtractTlsSni(packet, l4_len)}) {
+    if (auto sni{ExtractTlsSni(packet, payload_off)}) {
       metadata.hostname = sni->first;
       metadata.hostname_length = sni->second;
     }
   } else if (metadata.destination_port == kHttpPort) {
-    if (auto host{ExtractHttpHost(packet, l4_len)}) {
+    if (auto host{ExtractHttpHost(packet, payload_off)}) {
       metadata.hostname = host->first;
       metadata.hostname_length = host->second;
     }

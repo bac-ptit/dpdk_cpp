@@ -81,77 +81,80 @@ namespace dpdk::spi {
 }
 
 /// Read up to max_len bytes from mbuf into local buffer.
-[[nodiscard]] std::uint32_t ReadPayload(const rte_mbuf& packet, std::uint32_t offset, void* buf,
-                                        std::uint32_t max_len) noexcept {
+/// Returns pointer to the valid bytes — when the data is contiguous
+/// in the mbuf, DPDK returns a pointer directly into the mbuf data
+/// (not `buf`); otherwise it copies into `buf`. Caller must use the
+/// returned pointer, not `buf`, to read the actual bytes.
+[[nodiscard]] const void* ReadPayload(const rte_mbuf& packet, std::uint32_t offset, void* buf,
+                                       std::uint32_t max_len) noexcept {
   const void* data{rte_pktmbuf_read(&packet, offset, max_len, buf)};
-  if (data == nullptr) [[unlikely]]
-    return 0;
-  if (data == buf) return max_len;
-  return max_len;  // rte_pktmbuf_read copies to buf
+  return data;  // nullptr means insufficient data; else ptr to bytes
 }
 
 /// Extract hostname from TLS ClientHello SNI extension.
 [[nodiscard]] std::optional<std::pair<const char*, std::uint16_t>> ExtractTlsSni(
     const rte_mbuf& packet, std::uint32_t tcp_payload_offset) noexcept {
   constexpr std::uint32_t kMaxTlsInspect{512};
-  alignas(1) unsigned char buf[kMaxTlsInspect]{};
+  alignas(1) unsigned char local_buf[kMaxTlsInspect]{};
   const auto available{rte_pktmbuf_data_len(&packet) - tcp_payload_offset};
   const auto len{std::min(available, kMaxTlsInspect)};
   if (len < 5) [[unlikely]]
     return std::nullopt;
 
-  // Prefetch the TLS payload region into L1 before the memcpy. The
-  // extraction walks bytes 0..~120 sequentially; pulling them in early
-  // hides the DRAM round-trip behind the memcpy.
+  // Prefetch the TLS payload region into L1. The extraction walks bytes
+  // 0..~120 sequentially; pulling them in early hides the DRAM round-trip.
   if (packet.nb_segs == 1) [[likely]] {
     rte_prefetch0(rte_pktmbuf_mtod_offset(&packet, void*, tcp_payload_offset));
   }
 
-  const auto copied{ReadPayload(packet, tcp_payload_offset, buf, len)};
-  if (copied < 5) [[unlikely]]
+  // rte_pktmbuf_read returns a pointer to the bytes — either in the mbuf
+  // itself (contiguous, zero-copy) or in `local_buf` (multi-segment).
+  // Always read through this pointer, never `local_buf` directly.
+  const auto* data{static_cast<const unsigned char*>(ReadPayload(packet, tcp_payload_offset, local_buf, len))};
+  if (data == nullptr) [[unlikely]]
     return std::nullopt;
 
   // TLS record header: content_type=0x16, version>=0x0301
-  if (buf[0] != 0x16) [[unlikely]]
+  if (data[0] != 0x16) [[unlikely]]
     return std::nullopt;
-  if (buf[1] < 0x03 || (buf[1] == 0x03 && buf[2] < 0x01)) [[unlikely]]
+  if (data[1] < 0x03 || (data[1] == 0x03 && data[2] < 0x01)) [[unlikely]]
     return std::nullopt;
 
   // Handshake type = 0x01 (ClientHello)
-  if (buf[5] != 0x01) [[unlikely]]
+  if (data[5] != 0x01) [[unlikely]]
     return std::nullopt;
 
   // Walk past ClientHello fixed fields: version(2) + random(32) + session_id
   std::uint32_t off{9 + 2 + 32};
   if (off >= len) return std::nullopt;
 
-  const auto session_id_len{buf[off]};
+  const auto session_id_len{data[off]};
   off += 1 + session_id_len;
   if (off + 2 > len) return std::nullopt;
 
   // Cipher suites
-  const auto cipher_len{static_cast<std::uint16_t>((buf[off] << 8) | buf[off + 1])};
+  const auto cipher_len{static_cast<std::uint16_t>((data[off] << 8) | data[off + 1])};
   off += 2 + cipher_len;
   if (off + 1 > len) return std::nullopt;
 
   // Compression methods
-  const auto comp_len{buf[off]};
+  const auto comp_len{data[off]};
   off += 1 + comp_len;
   if (off + 2 > len) return std::nullopt;
 
   // Extensions
-  const auto ext_len{static_cast<std::uint16_t>((buf[off] << 8) | buf[off + 1])};
+  const auto ext_len{static_cast<std::uint16_t>((data[off] << 8) | data[off + 1])};
   off += 2;
-  const auto ext_end{std::min(off + ext_len, static_cast<std::uint32_t>(len))};
+  const auto ext_end{std::min(off + ext_len, len)};
 
   while (off + 4 <= ext_end) {
-    const auto ext_type{static_cast<std::uint16_t>((buf[off] << 8) | buf[off + 1])};
-    const auto ext_data_len{static_cast<std::uint16_t>((buf[off + 2] << 8) | buf[off + 3])};
+    const auto ext_type{static_cast<std::uint16_t>((data[off] << 8) | data[off + 1])};
+    const auto ext_data_len{static_cast<std::uint16_t>((data[off + 2] << 8) | data[off + 3])};
     if (ext_type == 0x0000 && off + 9 <= ext_end) {
       // SNI extension: list_len(2) + type(1) + name_len(2) + name
-      const auto name_len{static_cast<std::uint16_t>((buf[off + 7] << 8) | buf[off + 8])};
+      const auto name_len{static_cast<std::uint16_t>((data[off + 7] << 8) | data[off + 8])};
       if (off + 9 + name_len <= ext_end && name_len > 0) [[likely]] {
-        return std::make_pair(reinterpret_cast<const char*>(&buf[off + 9]), name_len);
+        return std::make_pair(reinterpret_cast<const char*>(&data[off + 9]), name_len);
       }
     }
     off += 4 + ext_data_len;
@@ -164,39 +167,41 @@ namespace dpdk::spi {
 [[nodiscard]] std::optional<std::pair<const char*, std::uint16_t>> ExtractHttpHost(
     const rte_mbuf& packet, std::uint32_t tcp_payload_offset) noexcept {
   constexpr std::uint32_t kMaxHttpInspect{256};
-  alignas(1) unsigned char buf[kMaxHttpInspect]{};
+  alignas(1) unsigned char local_buf[kMaxHttpInspect]{};
   const auto available{rte_pktmbuf_data_len(&packet) - tcp_payload_offset};
   const auto len{std::min(available, kMaxHttpInspect)};
   if (len < 4) [[unlikely]]
     return std::nullopt;
 
-  // Prefetch the HTTP request region into L1 before the memcpy.
+  // Prefetch the HTTP request region into L1.
   if (packet.nb_segs == 1) [[likely]] {
     rte_prefetch0(rte_pktmbuf_mtod_offset(&packet, void*, tcp_payload_offset));
   }
 
-  const auto copied{ReadPayload(packet, tcp_payload_offset, buf, len)};
-  if (copied < 4) [[unlikely]]
+  // rte_pktmbuf_read returns a pointer to the bytes — either in the mbuf
+  // itself (contiguous, zero-copy) or in `local_buf` (multi-segment).
+  const auto* data{static_cast<const unsigned char*>(ReadPayload(packet, tcp_payload_offset, local_buf, len))};
+  if (data == nullptr) [[unlikely]]
     return std::nullopt;
 
   // Verify HTTP method prefix
-  const bool is_http{buf[0] == 'G' && buf[1] == 'E' && buf[2] == 'T' && buf[3] == ' '};
-  const bool is_post{buf[0] == 'P' && buf[1] == 'O' && buf[2] == 'S' && buf[3] == 'T'};
+  const bool is_http{data[0] == 'G' && data[1] == 'E' && data[2] == 'T' && data[3] == ' '};
+  const bool is_post{data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T'};
   if (!is_http && !is_post) [[unlikely]]
     return std::nullopt;
 
   // Scan for "\r\nHost:" pattern
   for (std::uint32_t i{4}; i + 6 < len; ++i) {
-    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == 'H' && buf[i + 3] == 'o' && buf[i + 4] == 's' &&
-        buf[i + 5] == 't' && buf[i + 6] == ':') {
+    if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == 'H' && data[i + 3] == 'o' && data[i + 4] == 's' &&
+        data[i + 5] == 't' && data[i + 6] == ':') {
       auto host_off{i + 7};
       // Skip optional whitespace after colon
-      while (host_off < len && buf[host_off] == ' ') ++host_off;
+      while (host_off < len && data[host_off] == ' ') ++host_off;
       // Find end of header value (\r\n)
       auto host_start{host_off};
-      while (host_off < len && buf[host_off] != '\r') ++host_off;
+      while (host_off < len && data[host_off] != '\r') ++host_off;
       if (host_off > host_start) [[likely]] {
-        return std::make_pair(reinterpret_cast<const char*>(&buf[host_start]),
+        return std::make_pair(reinterpret_cast<const char*>(&data[host_start]),
                               static_cast<std::uint16_t>(host_off - host_start));
       }
     }
