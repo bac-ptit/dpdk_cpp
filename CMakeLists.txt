@@ -63,6 +63,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(glaze)
 
 add_subdirectory(include)
+add_subdirectory(test/dpi)
 
 add_executable(${FASTAPI_APP_TARGET} main.cpp)
 target_link_libraries(${FASTAPI_APP_TARGET} PRIVATE
