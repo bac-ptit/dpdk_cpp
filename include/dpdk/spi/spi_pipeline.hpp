@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -13,6 +14,7 @@
 
 #include "dpdk/dpdk_environment.hpp"
 #include "dpdk/dpi/dpi_rule_engine.hpp"
+#include "dpdk/dpi/hostname_cache.hpp"
 #include "dpdk/spi/spi_flow_table.hpp"
 #include "dpdk/spi/spi_rule_engine.hpp"
 #include "dpdk/spi/spi_rule_table_manager.hpp"
@@ -33,6 +35,8 @@ struct PipelineStats {
   std::uint64_t dropped{};
   std::uint64_t dropped_by_rule{};
   std::uint64_t flow_cache_hits{};
+  std::uint64_t dpi_cache_hits{};
+  std::uint64_t dpi_cache_misses{};
 };
 
 /// Cache-line-aligned atomic counters shared between workers and stats thread.
@@ -46,6 +50,8 @@ struct alignas(64) AtomicCounters {
   std::atomic<std::uint64_t> dropped{};
   std::atomic<std::uint64_t> dropped_by_rule{};
   std::atomic<std::uint64_t> flow_cache_hits{};
+  std::atomic<std::uint64_t> dpi_cache_hits{};
+  std::atomic<std::uint64_t> dpi_cache_misses{};
 };
 
 /// Per-burst counters accumulated in a single worker iteration.
@@ -59,6 +65,8 @@ struct BurstCounters {
   std::uint64_t dropped{};
   std::uint64_t dropped_by_rule{};
   std::uint64_t flow_cache_hits{};
+  std::uint64_t dpi_cache_hits{};
+  std::uint64_t dpi_cache_misses{};
 };
 
 /// Flush pending BurstCounters into the shared AtomicCounters.
@@ -108,6 +116,13 @@ struct alignas(64) WorkerContext {
   bool mac_updating{true};
   bool l3_forwarding{false};
   bool drop_unmatched{false};
+
+  /// Per-worker hostname → DPI result cache. Avoids re-running
+  /// ExtractTlsSni/ExtractHttpHost + DpiRuleTable::Match for hostnames
+  /// already classified. Sits on its own cache line so it doesn't share
+  /// with the hot fields above.
+  static constexpr std::size_t kWorkerCacheLineBytes{64};
+  alignas(kWorkerCacheLineBytes) dpi::HostnameCache dpi_hostname_cache;
 };
 
 /**

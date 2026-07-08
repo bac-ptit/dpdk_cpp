@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -36,7 +37,30 @@ struct DpiResult {
   bool matched{false};
 };
 
+/// Compact, cache-friendly lookup entry for suffix-match rules.
+/// Sorted by priority ASC (smallest first) so the first match wins.
+struct DpiSuffixEntry {
+  std::string_view domain;  // e.g. "facebook.com" — the "*." stripped part
+  std::uint16_t filter_index;
+};
+
 /// Immutable table of compiled DPI filters, sorted by priority.
+///
+/// Lookup indexes:
+///   - `exact_list_` — small sorted vector of (hostname, filter_index).
+///     Linear scan because there are usually < 5 exact-match rules
+///     ("dns.google", "cloudflare-dns.com", "dns.quad9.net"); a hash map
+///     is overkill for so few entries.
+///   - `suffix_list_` — small sorted vector of (domain, filter_index),
+///     sorted by `domain` so we can stop at the first mismatch. For ~25
+///     suffix rules this is faster than a hash map (no hash compute,
+///     fits in 2-3 cache lines).
+///   - `catch_all_idx_` — single `*` catch-all rule, or sentinel if none.
+///
+/// Keeping both indexes as `std::vector` (data-only) avoids the
+/// unordered_map bucket array that was causing 656M cache-misses/sec in
+/// earlier hash-map experiments. With 30 rules total, the working set
+/// fits in a single L1 cache line and stays hot.
 class DpiRuleTable final {
  public:
   explicit DpiRuleTable(std::vector<CompiledDpiFilter> filters) noexcept;
@@ -50,16 +74,42 @@ class DpiRuleTable final {
   /// Match hostname against DPI filters. Returns highest-priority (lowest value) match.
   [[nodiscard]] DpiResult Match(std::string_view hostname) const noexcept;
 
+  /// Get the DpiResult for a filter by its index (from a prior `Match()`).
+  /// Used by the hostname cache to reconstruct result without re-running Match.
+  [[nodiscard, gnu::always_inline]] DpiResult ResultAt(std::uint16_t index) const noexcept {
+    const auto& f = filters_[index];
+    return DpiResult{
+        .filter_group = f.filter_group,
+        .label = f.label,
+        .priority = f.priority,
+        .matched = true,
+    };
+  }
+
   /// Whether DPI is enabled and filters are loaded.
   [[nodiscard]] bool IsEnabled() const noexcept { return !filters_.empty(); }
 
   [[nodiscard]] std::size_t FilterCount() const noexcept { return filters_.size(); }
 
  private:
+  /// Original filter list — provides filter_group / label for results.
+  /// Sorted by priority ASC so the first match in Match() is also the
+  /// highest-priority match.
   std::vector<CompiledDpiFilter> filters_;
+
+  /// Exact-match rules (small, < 10 entries typical). Linear scan.
+  std::vector<std::pair<std::string_view, std::uint16_t>> exact_list_;
+
+  /// Suffix-match rules sorted by domain ASC for early-exit on mismatch.
+  /// ~25 entries typical, fits in 1-2 cache lines.
+  std::vector<DpiSuffixEntry> suffix_list_;
+
+  /// Index into `filters_` of the `*` catch-all rule, or sentinel if none.
+  std::uint16_t catch_all_idx_{std::numeric_limits<std::uint16_t>::max()};
 };
 
 /// Compile DPI config into a rule table.
 [[nodiscard]] std::expected<DpiRuleTable, std::string> CompileDpiRuleTable(const DpiConfig& config) noexcept;
 
 }  // namespace dpdk::dpi
+

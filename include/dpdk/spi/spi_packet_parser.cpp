@@ -4,6 +4,7 @@
 #include <rte_byteorder.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_prefetch.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
 
@@ -99,6 +100,13 @@ namespace dpdk::spi {
   if (len < 5) [[unlikely]]
     return std::nullopt;
 
+  // Prefetch the TLS payload region into L1 before the memcpy. The
+  // extraction walks bytes 0..~120 sequentially; pulling them in early
+  // hides the DRAM round-trip behind the memcpy.
+  if (packet.nb_segs == 1) [[likely]] {
+    rte_prefetch0(rte_pktmbuf_mtod_offset(&packet, void*, tcp_payload_offset));
+  }
+
   const auto copied{ReadPayload(packet, tcp_payload_offset, buf, len)};
   if (copied < 5) [[unlikely]]
     return std::nullopt;
@@ -161,6 +169,11 @@ namespace dpdk::spi {
   const auto len{std::min(available, kMaxHttpInspect)};
   if (len < 4) [[unlikely]]
     return std::nullopt;
+
+  // Prefetch the HTTP request region into L1 before the memcpy.
+  if (packet.nb_segs == 1) [[likely]] {
+    rte_prefetch0(rte_pktmbuf_mtod_offset(&packet, void*, tcp_payload_offset));
+  }
 
   const auto copied{ReadPayload(packet, tcp_payload_offset, buf, len)};
   if (copied < 4) [[unlikely]]

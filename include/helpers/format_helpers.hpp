@@ -80,8 +80,8 @@ struct std::formatter<dpdk::spi::PipelineStats> : std::formatter<std::string_vie
     return std::format_to(ctx.out(),
                           "received={} transmitted={} parsed={} matched={} "
                           "unknown={} malformed={} dropped={} dropped_by_rule={} "
-                          "flow_cache_hits={}",
+                          "flow_cache_hits={} dpi_cache_hits={} dpi_cache_misses={}",
                           s.received, s.transmitted, s.parsed, s.matched, s.unknown, s.malformed, s.dropped,
-                          s.dropped_by_rule, s.flow_cache_hits);
+                          s.dropped_by_rule, s.flow_cache_hits, s.dpi_cache_hits, s.dpi_cache_misses);
   }
 };
