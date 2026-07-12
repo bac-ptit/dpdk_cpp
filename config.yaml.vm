@@ -1,0 +1,209 @@
+# ============================================================================
+# DPDK FastAPI — VM forwarding test configuration
+#
+# Topology (see docs/luong_hoat_dong.md):
+#
+#   [VM1 external 192.168.100.130] <--> [virbr1] <--> [FastSPI/DPDK] <--> [virbr2] <--> [VM2 internal 192.168.200.180]
+#
+# Test scenario:
+#   From VM1:  curl http://192.168.200.180
+#   FastSPI   receives on port 0 (virbr1) → LPM routes 192.168.200.0/24 to port 1 (virbr2) → forwards
+#
+# Pre-requisites on the host & VMs (one-time setup):
+#   1. virbr1 and virbr2 bridges must exist with the subnets above.
+#   2. VM1 route:    ip route add 192.168.200.0/24 via 192.168.100.1
+#   3. VM2 route:    ip route add 192.168.100.0/24 via 192.168.200.1
+#   4. iptables (host): block ICMP unreachable from virbr1/virbr2 to avoid kernel
+#      racing with DPDK (see "Lưu ý" in docs/luong_hoat_dong.md).
+#
+# Layout:
+#   1. eal           - Environment Abstraction Layer
+#   2. app           - Application-level settings
+#   3. l3_forward    - L3 routing + queue-to-lcore mappings (ENABLED)
+#   4. mempool       - Pre-allocated mbuf pool
+#   5. port          - Per-port settings
+#   6. spi           - SPI filter groups (L3/L4 rules)  <- rules
+#   7. dpi           - DPI hostname filters (L7 rules)  <- rules
+# ============================================================================
+
+# EAL (Environment Abstraction Layer) configuration.
+eal:
+  # cpu_core_list: lcore 0 = main lcore, lcores 1-3 = packet workers (3 workers).
+  cpu_core_list: 0-3
+  # Prefix for shared memory and hugepage files to isolate multiple DPDK instances.
+  file_prefix: spifast
+  # Use legacy memory mode (allocate all memory at startup).
+  legacy_memory: true
+  # Log level for DPDK (7 = debug, 6 = info, 5 = warning, 4 = error).
+  log_level: '7'
+  # Number of memory channels (depends on motherboard architecture; typically 2 or 4).
+  memory_channels: 2
+  # Amount of memory to allocate when legacy_memory is enabled, in megabytes.
+  memory_size: '512'
+  # Hugepages: this host supports hugepages (/sys/kernel/mm/hugepages exists), so we use them.
+  # BEFORE running the app, allocate hugepages with:
+  #   sudo sysctl -w vm.nr_hugepages=512
+  # If you are inside a VM that cannot reserve hugepages, set this to true and DPDK
+  # will fall back to anonymous memory (--no-huge) — but on this host that path is
+  # incompatible with --legacy-mem and will fail at init.
+  disable_hugepages: false
+  # Disable PCI device scanning (required when using virtual devices like net_af_packet).
+  disable_pci: true
+  # DPDK process type: "primary" (first instance).
+  process_type: primary
+  # Virtual devices — net_af_packet PMD attaches to a Linux interface in promiscuous mode.
+  # qpairs = number of (rx queue, tx queue) pairs allocated per port.
+  virtual_devices:
+  # net_af_packet0 attaches to virbr1 (the bridge that VM1 is connected to).
+  - net_af_packet0,iface=virbr1,qpairs=3,qdisc_bypass=1,fanout_mode=hash,framecnt=4096
+  # net_af_packet1 attaches to virbr2 (the bridge that VM2 is connected to).
+  - net_af_packet1,iface=virbr2,qpairs=3,qdisc_bypass=1,fanout_mode=hash,framecnt=4096
+
+# Application-level settings — burst size, MAC update, stats interval.
+app:
+  # Maximum number of packets to receive or transmit in a single burst call.
+  burst_size: 64
+  # Whether to automatically rewrite source and destination MAC addresses on forwarded frames.
+  # In L3 mode this is implicit — destination MAC is set from the ethernet_destinations table.
+  mac_updating: false
+  # Interval in seconds between periodic statistics output (0 = disable).
+  timer_period_sec: 5
+
+# L3 (Layer 3 / Network Layer) forwarding configuration.
+# ENABLED for this VM test — FastSPI will route packets between virbr1 and virbr2 by destination IP.
+l3_forward:
+  # When true, the pipeline uses the LPM table to pick the output port based on dest IP.
+  enabled: true
+  # Routing lookup method: "lpm" (Longest Prefix Match) for IPv4 routing.
+  lookup_method: lpm
+  # Static IPv4 routing table — maps destination subnets to output ports.
+  ipv4_routes:
+  # Traffic destined for VM1's subnet (192.168.100.0/24) exits on port 0 (virbr1).
+  - destination_ip_address: 192.168.100.0
+    prefix_length: 24
+    output_port: 0
+  # Traffic destined for VM2's subnet (192.168.200.0/24) exits on port 1 (virbr2).
+  - destination_ip_address: 192.168.200.0
+    prefix_length: 24
+    output_port: 1
+  # MAC address table — used by FastSPI to rewrite the destination MAC of forwarded frames.
+  ethernet_destinations:
+  # Port 0 delivers to VM1's MAC address.
+  - port_id: 0
+    mac_address: 52:54:00:5a:2c:95
+  # Port 1 delivers to VM2's MAC address.
+  - port_id: 1
+    mac_address: 52:54:00:fe:7b:5d
+  # Mapping from (port, queue) pairs to the logical core that processes them.
+  # 3 workers (lcores 1-3), each handles one rx queue on each port.
+  queue_mappings:
+  - {port_id: 0, queue_id: 0, lcore_id: 1}
+  - {port_id: 0, queue_id: 1, lcore_id: 2}
+  - {port_id: 0, queue_id: 2, lcore_id: 3}
+  - {port_id: 1, queue_id: 0, lcore_id: 1}
+  - {port_id: 1, queue_id: 1, lcore_id: 2}
+  - {port_id: 1, queue_id: 2, lcore_id: 3}
+
+# Mempool (memory buffer pool) configuration — pre-allocated pool of fixed-size packet buffers.
+mempool:
+  # Per-core cache size: each logical core caches this many mbufs to avoid lock contention.
+  cache_size: 256
+  # Size of each individual memory buffer (mbuf) in bytes — must be large enough for max packet + headers.
+  memory_buffer_size: 2176
+  # Name of the memory pool, used for identification in DPDK logs and debugging.
+  name: mbuf_pool
+  # Total number of memory buffers (mbufs) pre-allocated in the pool.
+  # 65536 is plenty for a two-VM forwarding test (each VM is at most a few hundred flows).
+  memory_buffer_count: 65536
+
+# Port configuration.
+port:
+  # Interval in milliseconds between link status polling attempts.
+  link_check_interval_ms: 100
+  # Maximum number of link status polling attempts before giving up.
+  link_check_max_count: 90
+  # Link speed in megabits per second (0 means auto-negotiate / don't care).
+  link_speed: 0
+  # Bitmask of port indices to enable in hexadecimal format.
+  # '0x3' = 0b0011 → ports 0 and 1 are enabled.
+  port_bitmask: '0x3'
+  # Enable promiscuous mode — accept all packets on the port regardless of destination MAC.
+  promiscuous: true
+  # Number of receive descriptors in the hardware ring buffer for each receive queue.
+  receive_descriptors: 1024
+  # Number of receiver queues to configure on each port (matches qpairs=3 above).
+  receive_queues: 3
+  # Number of transmit descriptors in the hardware ring buffer for each transmit queue.
+  transmit_descriptors: 1024
+  # Number of transmit queues to configure on each port (matches qpairs=3 above).
+  transmit_queues: 3
+
+# ============================================================================
+# SPI (Shallow Packet Inspection) — header-based classification rules.
+# Groups are sorted by precedence (ascending, smallest = highest priority).
+# ============================================================================
+spi:
+  # Number of worker cores dedicated to packet processing (must match queue_mappings).
+  worker_count: 3
+  # Packet distribution mode:
+  # - auto: queue mode for RSS-capable real NICs, flow_hash for vNIC/PCAP/software PMDs.
+  # - queue: one RX/TX queue per worker.
+  # - flow_hash: main lcore receives packets and hashes flows to worker rings.
+  packet_distribution: queue
+  # Per-worker rte_ring size used only by flow_hash mode.
+  dispatch_queue_size: 65536
+  # When true, any packet that does not match any rule is silently dropped.
+  drop_unmatched: false
+  filter_groups:
+    # --- HTTP_REQUEST: VM1 -> VM2 on port 80 (precedence 100, highest) ---
+    - name: fg_http_request
+      precedence: 100
+      action: forward
+      filters:
+        - source_ip_address: 192.168.100.130
+          destination_ip_address: 192.168.200.180
+          destination_port: 80
+          protocol: tcp
+          label: HTTP_REQUEST
+
+    # --- HTTP_RESPONSE: VM2 -> VM1 from port 80 (precedence 101) ---
+    - name: fg_http_response
+      precedence: 101
+      action: forward
+      filters:
+        - source_ip_address: 192.168.200.180
+          destination_ip_address: 192.168.100.130
+          source_port: 80
+          protocol: tcp
+          label: HTTP_RESPONSE
+
+    # --- catch-all HTTP (precedence 110): any tcp/80 traffic not yet matched ---
+    - name: fg_l34_http
+      precedence: 110
+      action: forward
+      filters:
+        - {destination_port: 80, protocol: tcp, label: http_all}
+
+    # --- catch-all HTTPS (precedence 111) ---
+    - name: fg_l34_https
+      precedence: 111
+      action: forward
+      filters:
+        - {destination_port: 443, protocol: tcp, label: https_all}
+
+    # --- DNS (precedence 112) ---
+    - name: fg_l34_dns
+      precedence: 112
+      action: forward
+      filters:
+        - {destination_port: 53, protocol: udp, label: dns_udp}
+        - {destination_port: 53, protocol: tcp, label: dns_tcp}
+
+# ============================================================================
+# DPI (Deep Packet Inspection) — L7 hostname classification.
+# Disabled for this L3-forwarding smoke test; keep enabled=false to avoid the
+# extra L7 parsing cost on a 3-worker setup.
+# ============================================================================
+dpi:
+  enabled: false
+  filters: []
