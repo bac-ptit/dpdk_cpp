@@ -24,6 +24,7 @@ class RuleTableManager final {
   RuleTableManager& operator=(const RuleTableManager&) = delete;
   RuleTableManager(RuleTableManager&&) = delete;
   RuleTableManager& operator=(RuleTableManager&&) = delete;
+  ~RuleTableManager() = default;
 
   /**
    * @brief Worker: lock-free read of the active rule table.

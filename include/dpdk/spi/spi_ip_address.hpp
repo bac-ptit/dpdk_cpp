@@ -19,13 +19,15 @@ namespace dpdk::spi {
 
 /// Compute a prefix mask from CIDR length (e.g. 18 → 0xFFFFC000).
 [[nodiscard]] constexpr std::uint32_t PrefixMask(std::uint16_t prefix_length) noexcept {
-  if (prefix_length == 0) {
-    return 0;
+  constexpr std::uint32_t kIpv4Bits{32U};
+  if (prefix_length == 0U) {
+    return 0U;
   }
-  if (prefix_length >= 32) {
-    return 0xFFFFFFFF;
+  if (prefix_length >= kIpv4Bits) {
+    constexpr std::uint32_t kIpv4Mask{0xFFFFFFFFU};
+    return kIpv4Mask;
   }
-  return ~((1U << (32 - prefix_length)) - 1);
+  return ~((std::uint32_t{1U} << (kIpv4Bits - prefix_length)) - 1U);
 }
 
 /**

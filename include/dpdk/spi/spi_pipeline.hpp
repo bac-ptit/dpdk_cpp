@@ -13,7 +13,9 @@
 #include <vector>
 
 #include "dpdk/dpdk_environment.hpp"
+#include "dpdk/config/dpdk_config.hpp"
 #include "dpdk/dpi/dpi_rule_engine.hpp"
+#include "dpdk/dpi/dpi_rule_table_manager.hpp"
 #include "dpdk/dpi/hostname_cache.hpp"
 #include "dpdk/spi/spi_flow_table.hpp"
 #include "dpdk/spi/spi_rule_engine.hpp"
@@ -96,7 +98,10 @@ struct EthernetDestinationEntry {
 struct alignas(64) WorkerContext {
   const dpdk::Environment* environment{};
   const RuleTableManager* rule_manager{};
-  const dpi::DpiRuleTable* dpi_rules{};
+  /// Pointer to the DPI table manager (atomic-pointer swap for hot-reload).
+  /// Workers call `dpi_rule_manager->Load()` once per packet to read the
+  /// active DpiRuleTable pointer under a memory_order_acquire load.
+  const dpi::DpiRuleTableManager* dpi_rule_manager{};
   FlowTable* flow_table{};
   const std::vector<L3RouteEntry>* l3_routes{};
   const std::vector<EthernetDestinationEntry>* ethernet_destinations{};
@@ -126,6 +131,14 @@ struct alignas(64) WorkerContext {
 };
 
 /**
+ * @brief Aggregated runtime configuration for the SPI pipeline.
+ *
+ * Bundles the fields from AppConfig, SpiConfig, L3ForwardConfig, and
+ * PcapInjectorConfig that the pipeline needs to start up. Decouples the
+ * Pipeline constructor signature from the YAML config schema so adding
+ * new config fields doesn't change the constructor.
+ */
+/**
  * @brief DPDK-based SPI packet-processing pipeline with L2 forwarding.
  *
  * Receives packets via rte_eth_rx_burst, classifies each packet using the
@@ -137,17 +150,13 @@ class Pipeline final {
   /**
    * @brief Construct without starting workers.
    * @param environment  Initialized DPDK environment (ports, mempool).
-   * @param rules        Compiled rule table owned by caller.
-   * @param burst_size   Packets per rte_eth_rx_burst call.
-   * @param worker_count Number of worker lcores to launch.
-   * @param mac_updating Whether to rewrite Ethernet source/destination MACs.
-   * @param l3_forward   L3 forwarding configuration loaded from YAML.
-   * @param drop_unmatched Whether to drop packets that match no SPI rule.
+   * @param rules        Compiled SPI rule table owned by caller.
+   * @param dpi_rules    Compiled DPI rule table (nullptr if DPI disabled).
+   * @param config       Top-level config (Pipeline reads the fields it needs
+   *                    from app, l3_forward, spi, and pcap_injector).
    */
   Pipeline(const dpdk::Environment& environment, RuleTable initial_rules, std::unique_ptr<dpi::DpiRuleTable> dpi_rules,
-           std::uint16_t burst_size, std::uint16_t worker_count, bool mac_updating, const L3ForwardConfig& l3_forward,
-           bool drop_unmatched, std::string packet_distribution, std::uint32_t dispatch_queue_size,
-           std::uint32_t flow_ttl_sec = 300);
+           const DpdkConfig& config);
 
   /// Stop all workers and release per-worker resources.
   ~Pipeline();
@@ -172,6 +181,14 @@ class Pipeline final {
 
   /// Return const reference to per-rule match counters.
   [[nodiscard]] const std::vector<std::uint64_t>& GetRuleMatchCounts() const noexcept { return rule_match_counts_; }
+
+  /// Access to the SPI rule table manager (used by MaybeReload to swap).
+  [[nodiscard]] RuleTableManager& GetRuleTableManager() noexcept { return rule_manager_; }
+  [[nodiscard]] const RuleTableManager& GetRuleTableManager() const noexcept { return rule_manager_; }
+
+  /// Access to the DPI rule table manager (used by MaybeReload to swap).
+  [[nodiscard]] dpi::DpiRuleTableManager& GetDpiRuleTableManager() noexcept { return dpi_rule_manager_; }
+  [[nodiscard]] const dpi::DpiRuleTableManager& GetDpiRuleTableManager() const noexcept { return dpi_rule_manager_; }
 
  private:
   using WorkerEntryPoint = int (*)(void*);
@@ -210,6 +227,15 @@ class Pipeline final {
   [[nodiscard]] std::expected<PipelineStats, std::string> RunFlowHashDispatch(
       const volatile std::sig_atomic_t& force_quit, std::uint32_t timer_period_sec) noexcept;
   /**
+   * @brief Read packets from a pcap file and push them into the dispatcher
+   *        rings instead of calling rte_eth_rx_burst. Used to integrate
+   *        DPI verification into the production binary without depending
+   *        on the net_pcap PMD (which truncates payloads in this lab).
+   * @return Final pipeline statistics.
+   */
+  [[nodiscard]] std::expected<PipelineStats, std::string> RunPcapInjectDispatch(
+      const volatile std::sig_atomic_t& force_quit, std::uint32_t timer_period_sec) noexcept;
+  /**
    * @brief Allocate per-worker rte_rings for flow-hash dispatch mode.
    */
   [[nodiscard]] std::expected<void, std::string> CreateDispatchRings() noexcept;
@@ -236,7 +262,8 @@ class Pipeline final {
 
   const dpdk::Environment& environment_;
   RuleTableManager rule_manager_;
-  std::unique_ptr<dpi::DpiRuleTable> dpi_rules_;
+  std::unique_ptr<dpi::DpiRuleTable> dpi_rules_;  ///< Pre-reload table (kept alive until manager Init).
+  dpi::DpiRuleTableManager dpi_rule_manager_;    ///< Atomic-pointer DPI table for hot-reload.
   FlowTable flow_table_;
   AtomicCounters counters_;
   std::string config_path_;
@@ -247,6 +274,7 @@ class Pipeline final {
   std::vector<L3RouteEntry> l3_routes_;
   std::vector<EthernetDestinationEntry> ethernet_destinations_;
   std::string packet_distribution_;
+  PcapInjectorConfig pcap_injector_;
   std::uint32_t dispatch_queue_size_{};
   std::uint16_t burst_size_{};
   bool mac_updating_{true};

@@ -2,6 +2,7 @@
 
 #include <rte_acl.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -17,13 +18,16 @@ namespace dpdk::spi {
 /// Number of fields for ACL matching.
 constexpr uint32_t kAclNumFields{5};
 
+/// Default filter group precedence (lower = higher priority).
+constexpr std::uint32_t kDefaultPrecedence{100};
+
 /// ACL field indices in the 5-tuple.
-enum AclFieldIndex : uint8_t {
-  kAclFieldSrcIp = 0,
-  kAclFieldDstIp,
-  kAclFieldSrcPort,
-  kAclFieldDstPort,
-  kAclFieldProtocol,
+enum class AclFieldIndex : uint8_t {
+  kSrcIp = 0,
+  kDstIp,
+  kSrcPort,
+  kDstPort,
+  kProtocol,
 };
 
 /// 5-tuple input for rte_acl_classify (all fields in network byte order).
@@ -88,7 +92,7 @@ struct CompiledFilter {
 /// Compiled filter group — hot-path representation of a SpiFilterGroupConfig.
 struct CompiledFilterGroup {
   std::string name;
-  std::uint32_t precedence{100};
+  std::uint32_t precedence{kDefaultPrecedence};
   Action action{Action::kForward};
   std::vector<CompiledFilter> filters;
   rte_acl_ctx* acl_ctx{nullptr};
@@ -102,18 +106,18 @@ struct CompiledFilterGroup {
 };
 
 /// Shared ACL field definitions — MASK type with bitmask values.
-inline constexpr rte_acl_field_def kAclFieldDefs[kAclNumFields]{
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = kAclFieldSrcIp, .input_index = 0,
+inline constexpr std::array<rte_acl_field_def, kAclNumFields> kAclFieldDefs{{
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kSrcIp), .input_index = 0,
      .offset = offsetof(AclInputData, src_ip_be)},
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = kAclFieldDstIp, .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kDstIp), .input_index = 0,
      .offset = offsetof(AclInputData, dst_ip_be)},
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint16_t), .field_index = kAclFieldSrcPort, .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint16_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kSrcPort), .input_index = 0,
      .offset = offsetof(AclInputData, src_port_be)},
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint16_t), .field_index = kAclFieldDstPort, .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint16_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kDstPort), .input_index = 0,
      .offset = offsetof(AclInputData, dst_port_be)},
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint8_t), .field_index = kAclFieldProtocol, .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint8_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kProtocol), .input_index = 0,
      .offset = offsetof(AclInputData, protocol)},
-};
+}};
 
 /// Classification result returned by RuleTable::Match.
 struct ClassificationResult {

@@ -492,6 +492,21 @@ void PrintQueueMap(std::size_t worker_count) noexcept {
   }
 }
 
+/// Print dispatch ring assignment per worker for flow-hash mode.
+void PrintDispatchMap(const dpdk::Environment& environment, std::size_t worker_count,
+                      std::uint32_t dispatch_queue_size) noexcept {
+  const auto& active_ports{environment.GetActivePorts()};
+  std::println("Entering SPI packet-processing loop");
+  std::println("Software flow-hash dispatcher mode on main lcore");
+  PrintForwardMap(active_ports);
+  std::println("Dispatch map: main lcore receives packets and flow-hashes into {} worker rings",
+               worker_count);
+  for (std::size_t worker_id{0}; worker_id < worker_count; ++worker_id) {
+    std::println("Dispatch map: worker {} -> ring size {} / transmit queue {}",
+                 worker_id, dispatch_queue_size, worker_id);
+  }
+}
+
 /// Select queue-per-worker or software flow-hash packet distribution.
 [[nodiscard]] PacketDistribution ResolvePacketDistribution(const dpdk::Environment& environment,
                                                            std::string_view configured_mode,
@@ -588,12 +603,12 @@ void ExtractHostname(const rte_mbuf& packet, PacketMetadata& metadata) noexcept 
   }
 
   if (metadata.destination_port == kTlsPort) {
-    if (auto sni{ExtractTlsSni(packet, payload_off)}) {
+    if (const auto sni{ExtractTlsSni(packet, payload_off)}) {
       metadata.hostname = sni->first;
       metadata.hostname_length = sni->second;
     }
   } else if (metadata.destination_port == kHttpPort) {
-    if (auto host{ExtractHttpHost(packet, payload_off)}) {
+    if (const auto host{ExtractHttpHost(packet, payload_off)}) {
       metadata.hostname = host->first;
       metadata.hostname_length = host->second;
     }
@@ -620,8 +635,8 @@ struct DpiMatch {
   const auto cached_idx{context.dpi_hostname_cache.Lookup(hostname)};
   if (cached_idx != dpi::HostnameCache::kNoMatchIdx) [[likely]] {
     ++counters.dpi_cache_hits;
-    if (cached_idx < context.dpi_rules->FilterCount()) [[likely]] {
-      const auto result = context.dpi_rules->ResultAt(cached_idx);
+    if (cached_idx < context.dpi_rule_manager->Load()->FilterCount()) [[likely]] {
+      const auto result = context.dpi_rule_manager->Load()->ResultAt(cached_idx);
       return DpiMatch{.filter_group = result.filter_group, .label = result.label,
                        .priority = result.priority};
     }
@@ -632,14 +647,14 @@ struct DpiMatch {
   ++counters.dpi_cache_misses;
 
   // Cache miss — full Match() + insert into cache.
-  const auto result{context.dpi_rules->Match(hostname)};
+  const auto result{context.dpi_rule_manager->Load()->Match(hostname)};
   if (result.matched) [[unlikely]] {
     // Look up the filter index for cache. For ≤30 entries this is O(N)
     // but each step is a string_view compare, fits in one cache line.
     std::uint16_t idx{0U};
-    for (std::size_t i = 0; i < context.dpi_rules->FilterCount(); ++i) {
+    for (std::size_t i = 0; i < context.dpi_rule_manager->Load()->FilterCount(); ++i) {
       idx = static_cast<std::uint16_t>(i);
-      const auto probe = context.dpi_rules->ResultAt(idx);
+      const auto probe = context.dpi_rule_manager->Load()->ResultAt(idx);
       if (probe.filter_group == result.filter_group && probe.label == result.label &&
           probe.priority == result.priority) {
         break;
@@ -686,11 +701,11 @@ struct DpiMatch {
     const auto spi_match = rules->Match(metadata);
 
     // L7 DPI: extract hostname and match DPI rules.
-    if (context.dpi_rules != nullptr && context.dpi_rules->IsEnabled() &&
+    if (context.dpi_rule_manager->Load() != nullptr && context.dpi_rule_manager->Load()->IsEnabled() &&
         metadata.protocol == Protocol::kTcp &&
         (metadata.destination_port == kTlsPort || metadata.destination_port == kHttpPort)) {
       ExtractHostname(packet, metadata);
-      if (auto dpi{MatchDpi(context, counters, metadata)}) {
+      if (MatchDpi(context, counters, metadata)) {
         const auto action{spi_match.matched ? spi_match.action : Action::kForward};
         return MakeMatched(metadata, action, key, context, counters);
       }
@@ -870,32 +885,57 @@ struct DpiMatch {
  * @param transmit_counts   Per-port TX counts.
  * @param counters          Per-burst counters.
  */
-[[gnu::hot, gnu::flatten]] void ProcessPortBurst(
-    WorkerContext& context, const std::vector<std::uint16_t>& active_ports, std::uint16_t port_id,
-    std::array<rte_mbuf*, kMaxBurstCapacity>& packets,
-    std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
-    std::vector<std::uint16_t>& transmit_counts, BurstCounters& counters) noexcept {
-  const auto received{rte_eth_rx_burst(port_id, context.worker_id, packets.data(), context.burst_size)};
-  [[assume(received <= kMaxBurstCapacity)]];
-  [[assume(received <= context.burst_size)]];
-  counters.received += received;
-  if (received == 0) [[unlikely]] {
+
+/// Run L7 DPI classification on a single flow-cache-miss packet.
+///
+/// Gated on (DPI enabled) ∧ (TCP) ∧ (dst port 443 | 80). On DPI match,
+/// inserts the new flow entry, increments matched counter, sets
+/// `action` and `matched` in place. Caller is responsible for the
+/// drop/forward decision that follows.
+///
+/// Extracted from ProcessPortBurst to keep that function under
+/// NIST's CC < 10 guideline for hot paths.
+[[gnu::hot, gnu::always_inline]] inline void TryDpiClassify(
+    WorkerContext& context, BurstCounters& counters, const rte_mbuf& packet, PacketMetadata& metadata,
+    const ClassificationResult& spi_match, const FlowKey& key, Action& action, bool& matched) noexcept {
+  const auto* const dpi_rules{context.dpi_rule_manager->Load()};
+  if (dpi_rules == nullptr || !dpi_rules->IsEnabled()) [[likely]] {
+    return;
+  }
+  if (metadata.protocol != Protocol::kTcp) [[likely]] {
+    return;
+  }
+  if (metadata.destination_port != kTlsPort && metadata.destination_port != kHttpPort) [[likely]] {
     return;
   }
 
-  // Stage A — scratch arrays for parsed packets.
-  // Total stack footprint: ~13.5 KiB (8 KiB metadata + 4 KiB keys +
-  // 1 KiB positions + 0.5 KiB packet_to_parsed). Fits well within the
-  // default 8 MiB thread stack.
-  std::array<PacketMetadata, kMaxBurstCapacity> metadata{};
-  std::array<FlowKey, kMaxBurstCapacity> keys{};
-  std::array<std::int32_t, kMaxBurstCapacity> positions{};
-  std::array<std::uint16_t, kMaxBurstCapacity> packet_to_parsed{};
+  // ExtractHostname mutates metadata.hostname to point into the mbuf
+  // (zero-copy via rte_pktmbuf_read). Safe because the mbuf outlives
+  // the metadata reference (we still hold the packet in the burst).
+  ExtractHostname(packet, metadata);
+  if (auto dpi{MatchDpi(context, counters, metadata)}) {
+    const auto final_action{spi_match.matched ? spi_match.action : Action::kForward};
+    context.flow_table->Insert(key, FlowEntry{.action = final_action, .match_count = 1});
+    ++counters.matched;
+    action = final_action;
+    matched = true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ProcessPortBurst helpers — each ≤30 lines, cognitive complexity < 10
+// ---------------------------------------------------------------------------
+
+/// Parse all received packets, building metadata/keys arrays.
+/// Returns the number of successfully parsed packets.
+[[nodiscard]] std::uint32_t ParseReceivedPackets(
+    std::span<rte_mbuf*> received_packets, BurstCounters& counters,
+    std::span<PacketMetadata> metadata, std::span<FlowKey> keys,
+    std::span<std::uint16_t> packet_to_parsed) noexcept {
   constexpr std::uint16_t kUnmapped{std::numeric_limits<std::uint16_t>::max()};
+  constexpr auto kPrefetchDistance{4UZ};
   std::uint32_t n_parsed{0};
 
-  constexpr auto kPrefetchDistance{4UZ};
-  const std::span received_packets{packets.data(), received};
   for (auto i{0UZ}; i < received_packets.size(); ++i) {
     if (i + kPrefetchDistance < received_packets.size()) [[likely]] {
       rte_prefetch0(rte_pktmbuf_mtod(received_packets[i + kPrefetchDistance], void*));
@@ -918,109 +958,143 @@ struct DpiMatch {
       packet_to_parsed[i] = kUnmapped;
     }
   }
+  return n_parsed;
+}
 
-  // Stage B — bulk hash lookup. Single SIMD-vectorised CRC32 over each
-  // chunk of <= RTE_HASH_LOOKUP_BULK_MAX (64) parsed keys + pipelined
-  // bucket loads. With burst=256 we do at most 4 bulk calls per burst.
-  constexpr std::uint32_t kBulkChunkMax{64};  // RTE_HASH_LOOKUP_BULK_MAX
-  if (n_parsed > 0) [[likely]] {
-    for (std::uint32_t chunk_start{0}; chunk_start < n_parsed; chunk_start += kBulkChunkMax) {
-      const auto chunk_size{std::min<std::uint32_t>(kBulkChunkMax, n_parsed - chunk_start)};
-      context.flow_table->LookupBulk(keys.data() + chunk_start, chunk_size,
-                                      positions.data() + chunk_start);
+/// Bulk flow hash lookup in chunks of ≤64 keys.
+void BulkFlowLookup(FlowTable& flow_table,
+                    std::span<const FlowKey> keys, std::uint32_t n_parsed,
+                    std::span<std::int32_t> positions) noexcept {
+  constexpr std::uint32_t kBulkChunkMax{64};
+  for (std::uint32_t chunk_start{0}; chunk_start < n_parsed;
+       chunk_start += kBulkChunkMax) {
+    const auto chunk_size{std::min(kBulkChunkMax, n_parsed - chunk_start)};
+    flow_table.LookupBulk(keys.subspan(chunk_start, chunk_size).data(),
+                          chunk_size,
+                          positions.subspan(chunk_start, chunk_size).data());
+  }
+}
+
+/// Resolve flow action: cache hit → fast path, miss → SPI + DPI.
+[[gnu::hot, gnu::always_inline]] inline void ResolvePacketAction(
+    WorkerContext& context, BurstCounters& counters,
+    const rte_mbuf& packet, PacketMetadata& metadata,
+    const FlowKey& key, std::int32_t position,
+    Action& action, bool& matched) noexcept {
+  if (position >= 0) {
+    auto* const entry{context.flow_table->GetEntry(position)};
+    if (entry->match_count > 0) [[likely]] {
+      ++counters.flow_cache_hits;
+      action = entry->action;
+      matched = true;
+      return;
     }
   }
 
-  // Stage C — finalize classification per packet, apply drop/forward.
+  const auto* rules{context.rule_manager->Load()};
+  const auto spi_match{rules->Match(metadata)};
+  TryDpiClassify(context, counters, packet, metadata, spi_match, key,
+                 action, matched);
+
+  if (!matched) {
+    if (spi_match.matched) {
+      context.flow_table->Insert(key, FlowEntry{.action = spi_match.action, .match_count = 1});
+      ++counters.matched;
+      action = spi_match.action;
+      matched = true;
+    } else {
+      ++counters.unknown;
+    }
+  }
+}
+
+/// Apply drop/forward decision and enqueue or free the packet.
+[[gnu::hot, gnu::always_inline]] inline void ApplyForwardDecision(
+    WorkerContext& context, const std::vector<std::uint16_t>& active_ports,
+    BurstCounters& counters, rte_mbuf* packet, std::uint16_t port_id,
+    const PacketClassification& classification,
+    std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
+    std::vector<std::uint16_t>& transmit_counts) noexcept {
+  if (classification.matched && classification.action == Action::kDrop) [[unlikely]] {
+    ++counters.dropped_by_rule;
+    DropPacket(counters, packet);
+    return;
+  }
+  if (context.drop_unmatched && !classification.matched) [[unlikely]] {
+    DropPacket(counters, packet);
+    return;
+  }
+  const auto transmit_port{ResolveTransmitPort(context, classification, active_ports, port_id)};
+  if (!transmit_port || *transmit_port >= transmit_buffers.size()) [[unlikely]] {
+    DropPacket(counters, packet);
+    return;
+  }
+  if (!PrepareAndRewriteHeaders(context, *transmit_port, *packet)) [[unlikely]] {
+    DropPacket(counters, packet);
+    return;
+  }
+  EnqueuePacket(packet, *transmit_port, transmit_buffers, transmit_counts);
+}
+
+/// Finalize classification and forward all packets in the burst.
+void FinalizePackets(WorkerContext& context,
+                     const std::vector<std::uint16_t>& active_ports,
+                     std::uint16_t port_id,
+                     std::span<rte_mbuf*> received_packets,
+                     std::span<PacketMetadata> metadata,
+                     std::span<FlowKey> keys,
+                     std::span<const std::int32_t> positions,
+                     std::span<const std::uint16_t> packet_to_parsed,
+                     std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
+                     std::vector<std::uint16_t>& transmit_counts,
+                     BurstCounters& counters) noexcept {
+  constexpr std::uint16_t kUnmapped{std::numeric_limits<std::uint16_t>::max()};
   for (auto i{0UZ}; i < received_packets.size(); ++i) {
     auto* const packet{received_packets[i]};
-    const auto pi{packet_to_parsed[i]};
-
-    if (pi == kUnmapped) [[unlikely]] {
+    const auto parsed_idx{packet_to_parsed[i]};
+    if (parsed_idx == kUnmapped) [[unlikely]] {
       DropPacket(counters, packet);
       continue;
     }
-
-    // Hit fast path.
     Action action{Action::kForward};
     bool matched{false};
-    if (positions[pi] >= 0) {
-      auto* const entry{context.flow_table->GetEntry(positions[pi])};
-      if (entry->match_count > 0) [[likely]] {
-        ++counters.flow_cache_hits;
-        action = entry->action;
-        matched = true;
-      }
-    }
-
-    // Miss path — full SPI rules + DPI hostname extraction. Slow path,
-    // reachable only on first-packet-per-flow (~0.1%) or after PurgeExpired.
-    if (!matched) {
-      const auto* rules{context.rule_manager->Load()};
-      const auto spi_match{rules->Match(metadata[pi])};
-
-      bool dpi_handled{false};
-      if (context.dpi_rules != nullptr && context.dpi_rules->IsEnabled() &&
-          metadata[pi].protocol == Protocol::kTcp &&
-          (metadata[pi].destination_port == kTlsPort ||
-           metadata[pi].destination_port == kHttpPort)) {
-        // ExtractHostname mutates metadata.hostname to point into the mbuf,
-        // which is fine — the packet is still alive at this point. We mutate
-        // metadata[pi] in place; other packets in the same burst cannot be
-        // affected because they index different slots.
-        ExtractHostname(*packet, metadata[pi]);
-        if (auto dpi{MatchDpi(context, counters, metadata[pi])}) {
-          const auto final_action{spi_match.matched ? spi_match.action : Action::kForward};
-          context.flow_table->Insert(keys[pi], FlowEntry{.action = final_action, .match_count = 1});
-          ++counters.matched;
-          action = final_action;
-          matched = true;
-          dpi_handled = true;
-        }
-      }
-      (void)dpi_handled;
-
-      if (!matched) {
-        if (spi_match.matched) {
-          context.flow_table->Insert(keys[pi], FlowEntry{.action = spi_match.action, .match_count = 1});
-          ++counters.matched;
-          action = spi_match.action;
-          matched = true;
-        } else {
-          ++counters.unknown;
-        }
-      }
-    }
-
-    // Drop decisions (mirrors ForwardPacket's drops).
-    if (matched && action == Action::kDrop) [[unlikely]] {
-      ++counters.dropped_by_rule;
-      DropPacket(counters, packet);
-      continue;
-    }
-    if (context.drop_unmatched && !matched) [[unlikely]] {
-      DropPacket(counters, packet);
-      continue;
-    }
-
-    // Forward decision.
+    ResolvePacketAction(context, counters, *packet, metadata[parsed_idx],
+                        keys[parsed_idx], positions[parsed_idx],
+                        action, matched);
     const PacketClassification classification{
-        .metadata = metadata[pi],
-        .action = action,
-        .parsed = true,
-        .matched = matched,
-    };
-    const auto transmit_port{ResolveTransmitPort(context, classification, active_ports, port_id)};
-    if (!transmit_port || *transmit_port >= transmit_buffers.size()) [[unlikely]] {
-      DropPacket(counters, packet);
-      continue;
-    }
-    if (!PrepareAndRewriteHeaders(context, *transmit_port, *packet)) [[unlikely]] {
-      DropPacket(counters, packet);
-      continue;
-    }
-    EnqueuePacket(packet, *transmit_port, transmit_buffers, transmit_counts);
+        .metadata = metadata[parsed_idx], .action = action,
+        .parsed = true, .matched = matched};
+    ApplyForwardDecision(context, active_ports, counters, packet,
+                         port_id, classification,
+                         transmit_buffers, transmit_counts);
   }
+}
+
+[[gnu::hot, gnu::flatten]] void ProcessPortBurst(
+    WorkerContext& context, const std::vector<std::uint16_t>& active_ports, std::uint16_t port_id,
+    std::array<rte_mbuf*, kMaxBurstCapacity>& packets,
+    std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
+    std::vector<std::uint16_t>& transmit_counts, BurstCounters& counters) noexcept {
+  const auto received{rte_eth_rx_burst(port_id, context.worker_id, packets.data(), context.burst_size)};
+  [[assume(received <= kMaxBurstCapacity)]];
+  [[assume(received <= context.burst_size)]];
+  counters.received += received;
+  if (received == 0) [[unlikely]] {
+    return;
+  }
+
+  std::array<PacketMetadata, kMaxBurstCapacity> metadata{};
+  std::array<FlowKey, kMaxBurstCapacity> keys{};
+  std::array<std::int32_t, kMaxBurstCapacity> positions{};
+  std::array<std::uint16_t, kMaxBurstCapacity> packet_to_parsed{};
+
+  const std::span received_packets{packets.data(), received};
+  const auto n_parsed{ParseReceivedPackets(received_packets, counters,
+      metadata, keys, packet_to_parsed)};
+  BulkFlowLookup(*context.flow_table, keys, n_parsed, positions);
+  FinalizePackets(context, active_ports, port_id, received_packets,
+                  metadata, keys, positions, packet_to_parsed,
+                  transmit_buffers, transmit_counts, counters);
 }
 
 // NOTE: ProcessPortBurstBulk was explored as a future optimization
@@ -1200,23 +1274,27 @@ void FlushAtomicCounters(AtomicCounters& counters, const BurstCounters& pending)
 }
 
 Pipeline::Pipeline(const dpdk::Environment& environment, RuleTable initial_rules,
-                   std::unique_ptr<dpi::DpiRuleTable> dpi_rules, std::uint16_t burst_size, std::uint16_t worker_count,
-                   bool mac_updating, const L3ForwardConfig& l3_forward, bool drop_unmatched,
-                   std::string packet_distribution, std::uint32_t dispatch_queue_size, std::uint32_t flow_ttl_sec)
+                   std::unique_ptr<dpi::DpiRuleTable> dpi_rules, const DpdkConfig& config)
     : environment_{environment},
       dpi_rules_{std::move(dpi_rules)},
       rule_match_counts_(initial_rules.GroupCount()),
-      worker_contexts_(worker_count),
-      l3_routes_{BuildL3Routes(l3_forward)},
-      ethernet_destinations_{BuildEthernetDestinations(l3_forward)},
-      packet_distribution_{std::move(packet_distribution)},
-      dispatch_queue_size_{dispatch_queue_size},
-      burst_size_{std::clamp(burst_size, kMinBurstCapacity, kMaxBurstCapacity)},
-      mac_updating_{mac_updating},
-      l3_forwarding_{l3_forward.enabled},
-      drop_unmatched_{drop_unmatched},
-      flow_ttl_sec_{flow_ttl_sec} {
+      worker_contexts_(static_cast<std::uint16_t>(config.spi.worker_count)),
+      l3_routes_{BuildL3Routes(config.l3_forward)},
+      ethernet_destinations_{BuildEthernetDestinations(config.l3_forward)},
+      packet_distribution_{config.spi.packet_distribution},
+      pcap_injector_{config.pcap_injector},
+      dispatch_queue_size_{config.spi.dispatch_queue_size},
+      burst_size_{std::clamp(config.app.burst_size, kMinBurstCapacity, kMaxBurstCapacity)},
+      mac_updating_{config.app.mac_updating},
+      l3_forwarding_{config.l3_forward.enabled},
+      drop_unmatched_{config.spi.drop_unmatched},
+      flow_ttl_sec_{config.spi.flow_ttl_sec} {
   rule_manager_.Init(std::make_unique<RuleTable>(std::move(initial_rules)));
+  // Hand the dpi_rules unique_ptr to the manager. The manager takes
+  // ownership via release() and stores the raw pointer under its atomic.
+  if (dpi_rules_) {
+    dpi_rule_manager_.Init(std::move(dpi_rules_));
+  }
 }
 
 Pipeline::~Pipeline() {
@@ -1281,7 +1359,7 @@ void Pipeline::PrepareWorkerContext(WorkerContext& context, const volatile std::
                                     std::uint16_t worker_id) noexcept {
   context.environment = &environment_;
   context.rule_manager = &rule_manager_;
-  context.dpi_rules = dpi_rules_.get();
+  context.dpi_rule_manager = &dpi_rule_manager_;
   context.flow_table = &flow_table_;
   context.l3_routes = &l3_routes_;
   context.ethernet_destinations = &ethernet_destinations_;
@@ -1416,17 +1494,7 @@ std::expected<PipelineStats, std::string> Pipeline::RunFlowHashDispatch(const vo
     return std::unexpected(started.error());
   }
 
-  const auto& active_ports{environment_.GetActivePorts()};
-  std::println("Entering SPI packet-processing loop");
-  std::println("Software flow-hash dispatcher mode on main lcore");
-  PrintForwardMap(active_ports);
-  // Log dispatch ring assignment per worker.
-  std::println("Dispatch map: main lcore receives packets and flow-hashes into {} worker rings",
-               worker_contexts_.size());
-  for (std::size_t worker_id{0}; worker_id < worker_contexts_.size(); ++worker_id) {
-    std::println("Dispatch map: worker {} -> ring size {} / transmit queue {}", worker_id, dispatch_queue_size_,
-                 worker_id);
-  }
+  PrintDispatchMap(environment_, worker_contexts_.size(), dispatch_queue_size_);
 
   std::array<rte_mbuf*, kMaxBurstCapacity> packets{};
   const auto start_tsc{rte_rdtsc()};
