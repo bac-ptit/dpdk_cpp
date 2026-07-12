@@ -84,13 +84,16 @@ class PcapReader final {
   [[nodiscard]] bool IsEof() const noexcept { return eof_; }
 
  private:
-  PcapReader(void* pcap_handle, rte_mempool* mempool, std::uint64_t total_packets, std::uint64_t total_bytes) noexcept;
+  PcapReader(void* pcap_handle, rte_mempool* mempool, std::uint64_t total_packets, std::uint64_t total_bytes,
+             std::string filename) noexcept;
 
   void* pcap_handle_{nullptr};
   rte_mempool* mempool_{nullptr};
   std::uint64_t total_packets_{};
   std::uint64_t total_bytes_{};
   bool eof_{false};
+  /// Stored at Open() so Reset() can rewind by closing+reopening.
+  std::string filename_;
 };
 
 /**
