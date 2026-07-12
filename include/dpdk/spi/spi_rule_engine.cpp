@@ -57,21 +57,35 @@ CompiledFilterGroup::~CompiledFilterGroup() {
 namespace {
 
 [[nodiscard]] constexpr std::optional<Protocol> ParseProtocol(std::string_view protocol) noexcept {
-  if (protocol == "tcp") return Protocol::kTcp;
-  if (protocol == "udp") return Protocol::kUdp;
+  if (protocol == "tcp") {
+    return Protocol::kTcp;
+  }
+  if (protocol == "udp") {
+    return Protocol::kUdp;
+  }
   return std::nullopt;
 }
 
 [[nodiscard]] constexpr Action ParseAction(const std::string& action) noexcept {
-  if (action == "drop") return Action::kDrop;
+  if (action == "drop") {
+    return Action::kDrop;
+  }
   return Action::kForward;
 }
 
+/// IP protocol number for TCP (RFC 793).
+constexpr uint8_t kIpProtoTcp{6};
+/// IP protocol number for UDP (RFC 768).
+constexpr uint8_t kIpProtoUdp{17};
+
 [[nodiscard]] constexpr uint8_t ProtocolToIpProto(Protocol protocol) noexcept {
-  return protocol == Protocol::kTcp ? 6 : 17;
+  return protocol == Protocol::kTcp ? kIpProtoTcp : kIpProtoUdp;
 }
 
-[[nodiscard]] bool IsCidr(const std::string& address) noexcept { return address.find('/') != std::string::npos; }
+/// Base for decimal number parsing.
+constexpr int kDecimalBase{10};
+
+[[nodiscard]] bool IsCidr(std::string_view address) noexcept { return address.contains('/'); }
 
 /// Build one rte_acl_rule from a parsed CompiledFilter.
 /// MASK type with bitmask values. Port/protocol also set but verified in C++.
@@ -83,32 +97,32 @@ void BuildAclRule(struct rte_acl_rule* rule, const CompiledFilter& filter, uint3
   rule->data.category_mask = 1;
 
   // src_ip
-  rule->field[kAclFieldSrcIp].value.u32 = rte_cpu_to_be_32(filter.source_ip_address);
-  rule->field[kAclFieldSrcIp].mask_range.u32 = filter.match_source_ip ? UINT32_MAX : 0;
+  rule->field[static_cast<uint8_t>(AclFieldIndex::kSrcIp)].value.u32 = rte_cpu_to_be_32(filter.source_ip_address);
+  rule->field[static_cast<uint8_t>(AclFieldIndex::kSrcIp)].mask_range.u32 = filter.match_source_ip ? UINT32_MAX : 0;
 
   // dst_ip
   if (filter.match_destination_cidr) {
-    rule->field[kAclFieldDstIp].value.u32 = rte_cpu_to_be_32(filter.destination_network);
-    rule->field[kAclFieldDstIp].mask_range.u32 = rte_cpu_to_be_32(filter.destination_prefix_mask);
+    rule->field[static_cast<uint8_t>(AclFieldIndex::kDstIp)].value.u32 = rte_cpu_to_be_32(filter.destination_network);
+    rule->field[static_cast<uint8_t>(AclFieldIndex::kDstIp)].mask_range.u32 = rte_cpu_to_be_32(filter.destination_prefix_mask);
   } else if (filter.match_destination_ip) {
-    rule->field[kAclFieldDstIp].value.u32 = rte_cpu_to_be_32(filter.destination_ip_address);
-    rule->field[kAclFieldDstIp].mask_range.u32 = UINT32_MAX;
+    rule->field[static_cast<uint8_t>(AclFieldIndex::kDstIp)].value.u32 = rte_cpu_to_be_32(filter.destination_ip_address);
+    rule->field[static_cast<uint8_t>(AclFieldIndex::kDstIp)].mask_range.u32 = UINT32_MAX;
   } else {
-    rule->field[kAclFieldDstIp].value.u32 = 0;
-    rule->field[kAclFieldDstIp].mask_range.u32 = 0;
+    rule->field[static_cast<uint8_t>(AclFieldIndex::kDstIp)].value.u32 = 0;
+    rule->field[static_cast<uint8_t>(AclFieldIndex::kDstIp)].mask_range.u32 = 0;
   }
 
   // src_port
-  rule->field[kAclFieldSrcPort].value.u16 = rte_cpu_to_be_16(filter.source_port);
-  rule->field[kAclFieldSrcPort].mask_range.u16 = filter.match_source_port ? UINT16_MAX : 0;
+  rule->field[static_cast<uint8_t>(AclFieldIndex::kSrcPort)].value.u16 = rte_cpu_to_be_16(filter.source_port);
+  rule->field[static_cast<uint8_t>(AclFieldIndex::kSrcPort)].mask_range.u16 = filter.match_source_port ? UINT16_MAX : 0;
 
   // dst_port
-  rule->field[kAclFieldDstPort].value.u16 = rte_cpu_to_be_16(filter.destination_port);
-  rule->field[kAclFieldDstPort].mask_range.u16 = filter.match_destination_port ? UINT16_MAX : 0;
+  rule->field[static_cast<uint8_t>(AclFieldIndex::kDstPort)].value.u16 = rte_cpu_to_be_16(filter.destination_port);
+  rule->field[static_cast<uint8_t>(AclFieldIndex::kDstPort)].mask_range.u16 = filter.match_destination_port ? UINT16_MAX : 0;
 
   // protocol
-  rule->field[kAclFieldProtocol].value.u8 = ProtocolToIpProto(filter.protocol);
-  rule->field[kAclFieldProtocol].mask_range.u8 = UINT8_MAX;
+  rule->field[static_cast<uint8_t>(AclFieldIndex::kProtocol)].value.u8 = ProtocolToIpProto(filter.protocol);
+  rule->field[static_cast<uint8_t>(AclFieldIndex::kProtocol)].mask_range.u8 = UINT8_MAX;
 }
 
 [[nodiscard]] std::expected<CompiledFilter, std::string> CompileFilter(const SpiFilterConfig& filter_config,
@@ -148,7 +162,7 @@ void BuildAclRule(struct rte_acl_rule* rule, const CompiledFilter& filter, uint3
       // Extract prefix length from CIDR string (e.g. "31.13.64.0/18" → 18).
       const auto slash{filter_config.destination_ip_address->find('/')};
       const auto prefix_str{filter_config.destination_ip_address->substr(slash + 1)};
-      dest_prefix_len = static_cast<std::uint32_t>(std::strtoul(prefix_str.c_str(), nullptr, 10));
+      dest_prefix_len = static_cast<std::uint32_t>(std::strtoul(prefix_str.c_str(), nullptr, kDecimalBase));
       is_cidr = true;
     } else {
       const auto parsed{ParseIpv4Address(*filter_config.destination_ip_address)};
@@ -202,7 +216,7 @@ RuleTable::RuleTable(std::vector<CompiledFilterGroup> groups) noexcept : groups_
 }
 
 ClassificationResult RuleTable::Match(const PacketMetadata& packet) const noexcept {
-  AclInputData acl_input;
+  AclInputData acl_input{};
   acl_input.src_ip_be = rte_cpu_to_be_32(packet.source_ip_address);
   acl_input.dst_ip_be = rte_cpu_to_be_32(packet.destination_ip_address);
 
@@ -250,7 +264,7 @@ std::expected<RuleTable, std::string> CompileRuleTable(const SpiConfig& config) 
   std::vector<CompiledFilterGroup> groups;
   groups.reserve(config.filter_groups.size());
 
-  for (const auto& [gi, group_config] : config.filter_groups | std::views::enumerate) {
+  for (const auto& [group_index, group_config] : config.filter_groups | std::views::enumerate) {
     if (group_config.filters.empty()) {
       continue;
     }
@@ -267,19 +281,19 @@ std::expected<RuleTable, std::string> CompileRuleTable(const SpiConfig& config) 
     const auto rule_size{static_cast<std::size_t>(RTE_ACL_RULE_SZ(kAclNumFields))};
     auto rule_buf{std::make_unique<uint8_t[]>(rule_size * group_config.filters.size())};
 
-    for (const auto& [fi, filter_config] : group_config.filters | std::views::enumerate) {
-      auto filter{CompileFilter(filter_config, gi, fi)};
+    for (const auto& [filter_index, filter_config] : group_config.filters | std::views::enumerate) {
+      auto filter{CompileFilter(filter_config, group_index, filter_index)};
       if (!filter) {
         return std::unexpected(filter.error());
       }
 
-      auto* rule{reinterpret_cast<struct rte_acl_rule*>(rule_buf.get() + fi * rule_size)};
-      BuildAclRule(rule, *filter, static_cast<uint32_t>(fi));
+      auto* rule{reinterpret_cast<struct rte_acl_rule*>(rule_buf.get() + (filter_index * rule_size))};
+      BuildAclRule(rule, *filter, static_cast<uint32_t>(filter_index));
       filters.push_back(std::move(*filter));
     }
 
     // Create ACL context.
-    const auto acl_name{std::format("{}_g{}", group_config.name, gi)};
+    const auto acl_name{std::format("{}_g{}", group_config.name, group_index)};
     const struct rte_acl_param acl_param{
         .name = acl_name.c_str(),
         .socket_id = static_cast<int>(rte_socket_id()),
@@ -306,7 +320,7 @@ std::expected<RuleTable, std::string> CompileRuleTable(const SpiConfig& config) 
     struct rte_acl_config acl_cfg{};
     acl_cfg.num_categories = 1;
     acl_cfg.num_fields = kAclNumFields;
-    std::memcpy(acl_cfg.defs, kAclFieldDefs, sizeof(rte_acl_field_def) * kAclNumFields);
+    std::memcpy(acl_cfg.defs, kAclFieldDefs.data(), sizeof(rte_acl_field_def) * kAclNumFields);
 
     const int build_ret{rte_acl_build(acl_ctx, &acl_cfg)};
     if (build_ret != 0) {
@@ -322,7 +336,7 @@ std::expected<RuleTable, std::string> CompileRuleTable(const SpiConfig& config) 
 
   // Sort groups by precedence (ascending — smallest = highest priority).
   std::ranges::sort(
-      groups, [](const CompiledFilterGroup& a, const CompiledFilterGroup& b) { return a.precedence < b.precedence; });
+      groups, [](const CompiledFilterGroup& lhs, const CompiledFilterGroup& rhs) { return lhs.precedence < rhs.precedence; });
 
   return RuleTable{std::move(groups)};
 }

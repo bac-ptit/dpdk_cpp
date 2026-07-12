@@ -20,6 +20,17 @@ Checks: "*,
         -cppcoreguidelines-avoid-do-while,
         -bugprone-easily-swappable-parameters,
         -misc-const-correctness,
+        -cppcoreguidelines-pro-type-union-access,
+        -hicpp-no-access-of-members-of-unions,
+        -cppcoreguidelines-pro-type-reinterpret-cast,
+        -hicpp-no-reinterpret-cast,
+        -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+        -hicpp-no-array-decay,
+        -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+        -hicpp-no-pointer-arithmetic,
+        -cppcoreguidelines-avoid-c-arrays,
+        -hicpp-avoid-c-arrays,
+        -modernize-avoid-c-arrays,
 "
 WarningsAsErrors: '*'
 HeaderFilterRegex: ''
