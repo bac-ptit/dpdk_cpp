@@ -371,9 +371,12 @@ constexpr std::size_t kIpv6AddressBytes{16};
 [[nodiscard]] std::expected<void, std::string> ValidateWorkerQueueConfig(const DpdkConfig& config) noexcept {
   const auto& port_config{config.port};
   const auto& spi_config{config.spi};
+  const bool injector_mode{config.pcap_injector.enabled};
 
-  CONFIG_VALIDATE(port_config.receive_queues == 0, "port.receive_queues must be greater than 0");
-  CONFIG_VALIDATE(port_config.transmit_queues == 0, "port.transmit_queues must be greater than 0");
+  CONFIG_VALIDATE(!injector_mode && port_config.receive_queues == 0,
+                  "port.receive_queues must be greater than 0");
+  CONFIG_VALIDATE(!injector_mode && port_config.transmit_queues == 0,
+                  "port.transmit_queues must be greater than 0");
   CONFIG_VALIDATE(spi_config.worker_count == 0, "spi.worker_count must be greater than 0");
   CONFIG_VALIDATE(!IsSupportedPacketDistribution(spi_config.packet_distribution),
                   "spi.packet_distribution must be 'auto', 'queue', or 'flow_hash'");
@@ -382,13 +385,26 @@ constexpr std::size_t kIpv6AddressBytes{16};
   CONFIG_VALIDATE(spi_config.worker_count > spi_config.dispatch_queue_size,
                   "spi.worker_count={} exceeds spi.dispatch_queue_size={}", spi_config.worker_count,
                   spi_config.dispatch_queue_size);
-  CONFIG_VALIDATE(spi_config.packet_distribution == "queue" && spi_config.worker_count > port_config.receive_queues,
+  CONFIG_VALIDATE(!injector_mode && spi_config.packet_distribution == "queue"
+                      && spi_config.worker_count > port_config.receive_queues,
                   "spi.worker_count={} exceeds port.receive_queues={}", spi_config.worker_count,
                   port_config.receive_queues);
-  CONFIG_VALIDATE(spi_config.worker_count > port_config.transmit_queues,
+  CONFIG_VALIDATE(!injector_mode && spi_config.worker_count > port_config.transmit_queues,
                   "spi.worker_count={} exceeds port.transmit_queues={}", spi_config.worker_count,
                   port_config.transmit_queues);
 
+  return {};
+}
+
+/// Validate the pcap injector block. Caller is responsible for ensuring
+/// `dpi.enabled` matches the user's intent; we only guard injector config
+/// semantic constraints.
+[[nodiscard]] std::expected<void, std::string> ValidatePcapInjectorConfig(
+    const PcapInjectorConfig& cfg) noexcept {
+  CONFIG_VALIDATE(cfg.enabled && cfg.pcap_file.empty(),
+                  "pcap_injector.pcap_file must be non-empty when enabled");
+  CONFIG_VALIDATE(cfg.inject_burst_size == 0 || cfg.inject_burst_size > 256,
+                  "pcap_injector.inject_burst_size must be between 1 and 256 (got {})", cfg.inject_burst_size);
   return {};
 }
 
@@ -406,6 +422,7 @@ std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexce
   const auto& spi_config{config.spi};
   CONFIG_PROPAGATE(ValidateL3ForwardConfig(config.l3_forward));
   CONFIG_PROPAGATE(ValidateWorkerQueueConfig(config));
+  CONFIG_PROPAGATE(ValidatePcapInjectorConfig(config.pcap_injector));
 
   CONFIG_VALIDATE(spi_config.filter_groups.empty(), "spi.filter_groups must contain at least one group");
 

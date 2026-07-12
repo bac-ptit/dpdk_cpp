@@ -86,6 +86,11 @@ class Environment final {
   /// correct without needing a software flow-hash dispatcher.
   [[nodiscard]] bool HasPcapPort() const noexcept;
 
+  /// Whether init() skipped port setup. True when the pcap injector is enabled
+  /// and there are no NIC ports to drive — pipeline injects packets directly
+  /// into the dispatcher rings, no `rte_eth_tx_burst` is ever called.
+  [[nodiscard]] bool PortsAreSkipped() const noexcept { return skip_ports_; }
+
   /// Driver name reported by the PMD for a port.
   [[nodiscard]] std::string_view GetPortDriverName(std::uint16_t port_id) const noexcept;
 
@@ -222,6 +227,10 @@ class Environment final {
 
   DpdkConfig config_;
   bool initialized_{false};
+  /// True when init() short-circuited SetupPorts/CheckLinkStatus because the
+  /// pcap injector does not need any NIC port. Set in init() based on
+  /// `config_.pcap_injector.enabled`.
+  bool skip_ports_{false};
   rte_mempool* memory_buffer_pool_{nullptr};
   std::uint16_t port_count_{};
   std::vector<std::uint16_t> active_ports_;

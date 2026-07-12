@@ -253,6 +253,27 @@ struct DpiConfig {
   std::vector<DpiFilterConfig> filters;
 };
 
+/// Pcap injector — bypass net_pcap PMD's payload truncation by reading a
+/// pcap file from disk and feeding full L2-L7 mbufs into the dispatcher
+/// rings. Used for end-to-end DPI verification without a real NIC.
+struct PcapInjectorConfig {
+  /// Enable the injector (defaults to `false` — no behaviour change when off).
+  bool enabled{false};
+  /// Path to the pcap file to read. Required when `enabled = true`.
+  std::string pcap_file;
+  /// How many times to replay the file. `0` means infinite loop.
+  std::uint32_t loop_count{1};
+  /// Rate limit; `0` = unlimited.
+  std::uint64_t packets_per_second{0};
+  /// Hard cap on packets emitted across all loops. `0` = no cap.
+  std::uint64_t max_packets{0};
+  /// Synthetic receive port id stored on `mbuf->port` so L2-pair lookup
+  /// resolves to a valid (synthetic) port. Defaults to `0`.
+  std::uint16_t receive_port_id{0};
+  /// Maximum mbufs read per read-burst (capped at the pipeline max).
+  std::uint32_t inject_burst_size{64};
+};
+
 /// Top-level application configuration — all config sections.
 struct DpdkConfig {
   EalConfig eal;
@@ -262,6 +283,11 @@ struct DpdkConfig {
   L3ForwardConfig l3_forward;
   SpiConfig spi;
   DpiConfig dpi;
+  /// Optional: only present when the user adds a `pcap_injector:` block.
+  /// Glaze reflects std::optional<>'s monostate absence as "field omitted
+  /// from YAML." Default-constructed when missing — equivalent to
+  /// enabled=false with empty pcap_file.
+  PcapInjectorConfig pcap_injector{};
 };
 
 }  // namespace dpdk

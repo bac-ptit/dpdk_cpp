@@ -194,11 +194,21 @@ std::expected<void, DpdkError> Environment::init() noexcept {
     return {};
   }
 
+  // Pcap-injector mode runs without any NIC port; the pipeline injects
+  // packets from a disk file directly into the dispatcher rings. Skip
+  // the InitEal port-count precondition and the SetupPorts/CheckLink
+  // phases so the binary stays usable on hosts with zero NIC devices.
+  skip_ports_ = config_.pcap_injector.enabled;
+
   if (const auto init_result{InitEal()}; !init_result) {
     return std::unexpected(init_result.error());
   }
   if (const auto mempool_result{CreateMempool()}; !mempool_result) {
     return std::unexpected(mempool_result.error());
+  }
+  if (skip_ports_) {
+    initialized_ = true;
+    return {};
   }
   if (const auto ports_result{SetupPorts()}; !ports_result) {
     return std::unexpected(ports_result.error());
@@ -235,8 +245,16 @@ std::expected<void, DpdkError> Environment::InitEal() noexcept {
   rte_hash_crc_set_alg(CRC32_SSE42_x64);
 
   port_count_ = rte_eth_dev_count_avail();
-  if (port_count_ == 0) {
+  if (port_count_ == 0 && !skip_ports_) {
     return std::unexpected(DpdkError{.message = "No Ethernet ports available after EAL init", .dpdk_errno = 0});
+  }
+  if (skip_ports_) {
+    // Pcap-injector mode has no real NIC. Synthesize a single sentinel
+    // port id so worker `transmit_buffers[GetPortCount()]` indexing
+    // (and the flush buffer-size loop) stays in range. Staging
+    // buffers are still drained by the guard in FlushTransmitBuffers.
+    port_count_ = 1;
+    active_ports_.push_back(0);
   }
   port_mac_addrs_.resize(port_count_);
   port_runtime_infos_.resize(port_count_);

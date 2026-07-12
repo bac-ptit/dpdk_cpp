@@ -49,7 +49,7 @@ struct std::formatter<dpdk::spi::Protocol> : std::formatter<std::string_view> {
 
 template <>
 struct std::formatter<dpdk::spi::PacketMetadata> : std::formatter<std::string_view> {
-  auto format(const dpdk::spi::PacketMetadata& m, std::format_context& ctx) const noexcept {
+  static auto format(const dpdk::spi::PacketMetadata& m, std::format_context& ctx) noexcept {
     auto out = std::format_to(ctx.out(), "{} src=", m.protocol);
     out = dpdk::FormatIpv4(m.source_ip_address, ctx);
     out = std::format_to(out, ":{}", m.source_port);
