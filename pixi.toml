@@ -33,5 +33,21 @@ run-pcap = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-d
 test-spi = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH python3 test/test_spi_rules.py"
 verify-rules-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH python3 test/verify_rules.py --build-dir cmake-build-release"
 docs = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH doxygen Doxyfile"
-benchmark = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH ./script/benchmark.sh 100000 6 100"
+benchmark = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH ./script/benchmark.sh 1000000 15 100"
 test = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH python3 test/test_spi_rules.py"
+# Hot-reload FastAPI config from disk without restarting workers.
+# 1. Copies source config.yaml into cmake-build-release/ (FastAPI reads
+#    from there via its compile-time CONFIG_PATH).
+# 2. Sends SIGUSR1; the signal handler triggers MaybeReload() on the main
+#    lcore which re-reads and atomically swaps rule tables.
+reload = "./script/reload.sh"
+# SPI-only throughput bench — forces dpi.enabled=false to exclude the
+# DPI path entirely. Compare against `bench` (which keeps the user's
+# DPI rules loaded) to measure DPI overhead separately.
+bench-spi = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-spi 1000000"
+# SPI+DPI throughput bench — uses pcap_injector mode (bypasses the
+# net_pcap PMD's L7-stripping bug) so DPI cache hits actually populate.
+# Generates shards with TLS ClientHello SNI records matching the
+# production DPI filter groups. Final stats will show non-zero
+# dpi_cache_hits, proving the DPI path runs end-to-end.
+bench-dpi = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-dpi 1000000"

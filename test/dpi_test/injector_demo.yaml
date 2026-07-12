@@ -1,0 +1,135 @@
+app:
+  burst_size: 64
+  mac_updating: false
+  timer_period_sec: 5
+dpi:
+  enabled: true
+  filters:
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.facebook.com'
+    label: facebook
+    priority: 10
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.fbcdn.net'
+    label: facebook_cdn
+    priority: 10
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.messenger.com'
+    label: messenger
+    priority: 10
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.instagram.com'
+    label: instagram
+    priority: 10
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.whatsapp.net'
+    label: whatsapp
+    priority: 10
+  - filter_group: fg_l7_google
+    hostname_pattern: '*.google.com'
+    label: google
+    priority: 30
+  - filter_group: fg_l7_google
+    hostname_pattern: '*.googleapis.com'
+    label: googleapis
+    priority: 30
+  - filter_group: fg_l7s_google
+    hostname_pattern: '*.gstatic.com'
+    label: gstatic
+    priority: 30
+  - filter_group: fg_l7_google
+    hostname_pattern: '*.googleusercontent.com'
+    label: googleusercontent
+    priority: 30
+  - filter_group: fg_l7_youtube
+    hostname_pattern: '*.youtube.com'
+    label: youtube
+    priority: 20
+  - filter_group: fg_l7_youtube
+    hostname_pattern: '*.ytimg.com'
+    label: ytimg
+    priority: 20
+  - filter_group: fg_l7_music
+    hostname_pattern: '*.spotify.com'
+    label: spotify
+    priority: 120
+  - filter_group: fg_l7_music
+    hostname_pattern: '*.soundcloud.com'
+    label: soundcloud
+    priority: 120
+  - filter_group: fg_l7_doh
+    hostname_pattern: dns.google
+    label: doh_google
+    priority: 140
+  - filter_group: fg_l7_doh
+    hostname_pattern: cloudflare-dns.com
+    label: doh_cloudflare
+    priority: 140
+  - filter_group: fg_l7_https_default
+    hostname_pattern: '*'
+    label: https_default
+    priority: 999
+eal:
+  cpu_core_list: 0-15
+  disable_hugepages: false
+  disable_pci: true
+  file_prefix: spifast
+  legacy_memory: true
+  log_level: '7'
+  memory_channels: 2
+  memory_size: '1500'
+  process_type: primary
+  virtual_devices: []
+l3_forward:
+  enabled: false
+  ethernet_destinations: []
+  ipv4_routes: []
+  lookup_method: lpm
+  queue_mappings: []
+mempool:
+  cache_size: 256
+  memory_buffer_count: 200000
+  memory_buffer_size: 2176
+  name: mbuf_pool
+pcap_injector:
+  enabled: true
+  pcap_file: /home/bac/programming/viettel/dpdk_cpp/test/dpi_test/dpi_repeated_2k.pcap
+  loop_count: 5
+  packets_per_second: 0
+  max_packets: 0
+  receive_port_id: 0
+  inject_burst_size: 64
+port:
+  link_check_interval_ms: 100
+  link_check_max_count: 90
+  link_speed: 0
+  port_bitmask: '0x0'
+  promiscuous: true
+  receive_descriptors: 1024
+  receive_queues: 0
+  transmit_descriptors: 1024
+  transmit_queues: 0
+spi:
+  dispatch_queue_size: 32768
+  drop_unmatched: true
+  filter_groups:
+  - action: forward
+    filters:
+    - destination_ip_address: 157.240.0.0/16
+      label: facebook_4
+      protocol: tcp
+    - destination_ip_address: 142.250.0.0/15
+      destination_port: 443
+      label: youtube_1
+      protocol: tcp
+    - destination_ip_address: 172.217.0.0/16
+      destination_port: 443
+      label: youtube_2
+      protocol: tcp
+    - destination_ip_address: 10.0.0.1
+      label: http_all
+      protocol: tcp
+    name: fg_l34_inject
+    precedence: 100
+  packet_distribution: flow_hash
+  worker_count: 4

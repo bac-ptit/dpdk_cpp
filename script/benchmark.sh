@@ -4,19 +4,17 @@
 # Usage:
 #   ./script/benchmark.sh [count] [workers] [match_percent]
 #
-# Defaults: count=100000, workers=6, match_percent=100
+# Defaults: count=1000000 (1M packets), workers=15 (lcore 0 is main, lcores
+# 1-15 are workers on a 16-core host), match_percent=100
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/cmake-build-debug}"
-if [ ! -d "$BUILD_DIR" ] && [ -d "$PROJECT_DIR/cmake-build-release" ]; then
-  BUILD_DIR="$PROJECT_DIR/cmake-build-release"
-fi
+BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/cmake-build-release}"
 BINARY="${BUILD_DIR}/FastAPI"
 
-COUNT="${1:-100000}"
-WORKERS="${2:-6}"
+COUNT="${1:-1000000}"
+WORKERS="${2:-15}"
 MATCH_PERCENT="${3:-100}"
 
 echo "============================================="

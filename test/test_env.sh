@@ -9,9 +9,9 @@ MACVLAN="macvlan0"
 HOST_IFACE="enp3s0"
 APP_IP="192.168.1.12"
 TEST_IP="192.168.1.13"
-BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/build_debug}"
-if [ ! -d "$BUILD_DIR" ] && [ -d "$PROJECT_DIR/cmake-build-debug" ]; then
-  BUILD_DIR="$PROJECT_DIR/cmake-build-debug"
+BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/cmake-build-release}"
+if [ ! -d "$BUILD_DIR" ] && [ -d "$PROJECT_DIR/build_release" ]; then
+  BUILD_DIR="$PROJECT_DIR/build_release"
 fi
 APP_BINARY="${APP_BINARY:-$BUILD_DIR/FastAPI}"
 DEFAULT_WORKERS="${DEFAULT_WORKERS:-6}"
@@ -20,7 +20,7 @@ DEFAULT_MATCH_PERCENT="${DEFAULT_MATCH_PERCENT:-100}"
 CONFIG_BACKUP=""
 
 usage() {
-  echo "Usage: $0 {setup|run|send|pcap|bench|bench-pcap|bench-afpacket|teardown}"
+  echo "Usage: $0 {setup|run|send|pcap|bench|bench-spi|bench-dpi|bench-pcap|bench-afpacket|teardown}"
   exit 1
 }
 
@@ -212,6 +212,157 @@ cmd_bench() {
   cmd_bench_pcap "$@"
 }
 
+# SPI-only throughput bench: forces `dpi.enabled: false` in the loaded
+# config so the DPI parser / cache path is excluded entirely. Use this
+# to measure pure SPI throughput without DPI overhead. Note that the
+# existing `bench` (and thus `pixi run bench`) preserves the user's
+# DPI rules via Cách 3 — DPI sees every packet but `hostname == nullptr`
+# for the net_pcap PMD trunk because it strips L7, so the cost is just
+# the empty MatchDpi early-return.
+cmd_bench_spi() {
+  cmd_bench_pcap "$@"
+  if [ -f "$BUILD_DIR/config.yaml" ]; then
+    python3 -c "
+import sys, yaml
+with open('$BUILD_DIR/config.yaml') as f:
+    cfg = yaml.safe_load(f)
+cfg['dpi']['enabled'] = False
+cfg['dpi']['filters'] = []
+with open('$BUILD_DIR/config.yaml', 'w') as f:
+    yaml.dump(cfg, f, default_flow_style=False)
+print('bench-spi: forced dpi.enabled=false')
+"
+  fi
+}
+
+# Full SPI+DPI throughput bench using pcap_injector mode (bypasses the
+# net_pcap PMD's L7-stripping bug). Generates shards with TLS ClientHello
+# SNI records matching the production DPI filter groups, then runs
+# FastAPI in pcap_injector mode. Produces non-zero dpi_cache_hits in
+# the final stats — proving the DPI path actually runs end-to-end.
+cmd_bench_dpi() {
+  local count="${1:-1000000}"
+  local workers="${2:-15}"
+  local shard_dir="$SCRIPT_DIR/dpi_bench_shards"
+
+  echo "[*] Generating DPI-enabled PCAP benchmark shards: count=$count workers=$workers..."
+  rm -rf "$shard_dir"
+  python3 "$SCRIPT_DIR/gen_dpi_bench_pcap.py" "$shard_dir" --count "$count" --shards "$workers"
+
+  echo "[*] Creating config with pcap_injector + DPI rules..."
+  local config_file="$PROJECT_DIR/config.yaml"
+  begin_config_edit
+
+  python3 - "$config_file" "$shard_dir" "$workers" <<'PY'
+import os, sys
+import yaml
+config_file, shard_dir, workers = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(config_file) as f:
+    cfg = yaml.safe_load(f)
+
+# Fix 3 (2026-07-09): use net_pcap PMD with all 15 shards, per-queue fanout
+# instead of pcap_injector. Single main lcore producer was 50× slower
+# (2.88 Mpps vs 149 Mpps target). net_pcap PMD reads full pcap frames
+# including L7 (snaplen=65535 in dpi_bench_shards, packets ≤142 B vs
+# 2176 B mbuf room → full TLS payload preserved in mbuf).
+rx_streams = [f'rx_pcap={os.path.join(shard_dir, f"dpi_bench_q{i}.pcap")}' for i in range(workers)]
+cfg['eal']['virtual_devices'] = ['net_pcap0,' + ','.join(rx_streams) + ',infinite_rx=1']
+cfg['pcap_injector'] = {'enabled': False}
+cfg['port']['port_bitmask'] = '0x1'
+cfg['port']['receive_queues'] = workers
+cfg['port']['transmit_queues'] = workers
+
+# SPI rules matching the bench traffic (same as bench-pcap).
+cfg['spi']['filter_groups'] = [
+    {'name': 'bench_fb', 'precedence': 100, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'destination_ip_address': '31.13.64.0/18', 'label': 'fb_1'},
+        {'protocol': 'tcp', 'destination_ip_address': '66.220.144.0/20', 'label': 'fb_2'},
+        {'protocol': 'tcp', 'destination_ip_address': '69.63.176.0/20', 'label': 'fb_3'},
+        {'protocol': 'tcp', 'destination_ip_address': '157.240.0.0/16', 'label': 'fb_4'},
+        {'protocol': 'tcp', 'destination_ip_address': '69.220.144.5', 'label': 'fb_5'},
+    ]},
+    {'name': 'bench_yt', 'precedence': 101, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'destination_ip_address': '142.250.0.0/15', 'destination_port': 443, 'label': 'yt_1'},
+        {'protocol': 'tcp', 'destination_ip_address': '172.217.0.0/16', 'destination_port': 443, 'label': 'yt_2'},
+        {'protocol': 'tcp', 'destination_ip_address': '216.58.192.0/19', 'destination_port': 443, 'label': 'yt_3'},
+        {'protocol': 'tcp', 'destination_ip_address': '74.125.0.1', 'destination_port': 443, 'label': 'yt_4'},
+    ]},
+    {'name': 'bench_http', 'precedence': 102, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'destination_port': 80, 'label': 'http'},
+    ]},
+    {'name': 'bench_https', 'precedence': 103, 'action': 'forward', 'filters': [
+        {'protocol': 'tcp', 'destination_port': 443, 'label': 'https'},
+    ]},
+]
+
+# DPI rules matching the SNIs embedded by gen_dpi_bench_pcap.py.
+cfg['dpi']['enabled'] = True
+cfg['dpi']['filters'] = [
+    {'filter_group': 'fg_l7_facebook', 'hostname_pattern': '*.facebook.com', 'label': 'facebook', 'priority': 10},
+    {'filter_group': 'fg_l7_google',   'hostname_pattern': '*.google.com',   'label': 'google',   'priority': 30},
+    {'filter_group': 'fg_l7_youtube',  'hostname_pattern': '*.youtube.com',  'label': 'youtube',  'priority': 20},
+    {'filter_group': 'fg_l7_default',  'hostname_pattern': '*',              'label': 'default',  'priority': 999},
+]
+
+# Per-queue fanout (15 workers × 1 queue each) — main lcore idle,
+# throughput scales with workers. packet_distribution='queue' resolves
+# to kQueuePerWorker in ResolvePacketDistribution.
+cfg['spi']['packet_distribution'] = 'queue'
+cfg['spi']['worker_count'] = workers
+cfg['spi']['dispatch_queue_size'] = 32768
+
+# Boost hot-path throughput: 2x burst amortizes per-iteration overhead,
+# 2x mempool cache reduces per-lcore mutex contention on global pool.
+# Both are SAFE (don't break correctness), pure speed knobs.
+# NOTE: DPDK's RTE_MEMPOOL_CACHE_MAX_SIZE=512, so cache_size capped at 512
+# (1024 returns EINVAL from rte_pktmbuf_pool_create).
+cfg['app']['burst_size'] = 128
+cfg['mempool']['cache_size'] = 512
+
+# Auto-detect available hugepages and scale mbufs + memory_size to fit.
+# Falls back to 1500 MB on hosts where detection fails (no hugepages
+# configured yet, no sudo, etc.). To get full 1.05M mbufs at 5500 MB
+# memory_size (matches bench), the user should pre-allocate at least
+# 5500 MB of hugepages: `sudo sysctl -w vm.nr_hugepages=2750`.
+import os
+host_mem_cap_mb = 1500
+try:
+    with open('/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages') as f:
+        pages = int(f.read().strip())
+        detected_mb = pages * 2
+        # Reserve 10% for kernel overhead, use up to 90% for EAL.
+        host_mem_cap_mb = max(800, int(detected_mb * 0.9))
+except (OSError, ValueError):
+    pass
+
+mbuf_size = cfg['mempool']['memory_buffer_size']
+cfg['mempool']['memory_buffer_count'] = min(
+    max(200000, workers * 70000),  # ideal: 1.05M @ 15 workers
+    (host_mem_cap_mb * 1024 * 1024) // (mbuf_size * 2),  # 50% for mbufs, 50% for EAL overhead
+)
+needed_mb = int(cfg['mempool']['memory_buffer_count'] * mbuf_size
+               / (1024 * 1024) * 1.4) + workers * 64 + 256
+cfg['eal']['memory_size'] = str(min(max(needed_mb, 800), host_mem_cap_mb))
+
+with open(config_file, 'w') as f:
+    yaml.dump(cfg, f, default_flow_style=False)
+print(f'DPI benchmark: workers={workers}, pcap={shard_dir} (infinite loop)')
+PY
+
+  local memory_mb
+  memory_mb="$(cat "$config_file.mem" 2>/dev/null || echo 1500)"
+  rm -f "$config_file.mem"
+  ensure_hugepages "$memory_mb"
+
+  cp "$config_file" "$BUILD_DIR/config.yaml"
+
+  echo "[*] Running app... (Ctrl+C to stop — final stats will show dpi_cache_hits)"
+  run_app
+
+  restore_config
+  echo "[OK] DPI benchmark done."
+}
+
 cmd_bench_pcap() {
   local count="${1:-$DEFAULT_BENCH_COUNT}"
   local workers="${2:-}"
@@ -295,12 +446,42 @@ with open(config_file) as f:
 rx_streams = [f'rx_pcap={os.path.join(shard_dir, f"bench_q{i}.pcap")}' for i in range(workers)]
 cfg['eal']['virtual_devices'] = ['net_pcap0,' + ','.join(rx_streams) + ',infinite_rx=1']
 
+# Disable any pcap_injector block in the user's config — ResolvePacketDistribution
+# would otherwise take kPcapInject mode and skip the net_pcap shards above.
+cfg['pcap_injector'] = {'enabled': False}
+
+# net_pcap PMD needs matching queue counts (one RX queue per shard). The
+# user's config may have these zeroed (e.g. when set up for pcap_injector
+# mode); override to workers count so the workers can drain shards in
+# parallel without a software flow-hash dispatcher in between.
+cfg['port']['receive_queues'] = workers
+cfg['port']['transmit_queues'] = workers
+cfg['port']['port_bitmask'] = '0x1'
+
+# net_pcap PMD requires at least ~66667 mbufs per RX queue (default
+# rx_packets_per_burst) — scale memory_buffer_count with worker count
+# so the PMD's eth_rx_queue_setup() doesn't fail with EINVAL.
+cfg['mempool']['memory_buffer_count'] = max(
+    int(cfg.get('mempool', {}).get('memory_buffer_count', 32768)),
+    workers * 70000,
+)
+
 # Override 2: filter groups matching the synthetic pcap traffic. The bench shards
 # are generated with specific destination IP / port values that match only these
 # rules. User's own filter_groups would not match the bench traffic, so we
 # replace them with the bench's rules. After the run, restore_config puts
 # the user's original groups back.
 cfg['spi']['filter_groups'] = filter_groups
+
+# Scale EAL memory_size with mempool: net_pcap PMD's per-queue ring +
+# ACL classification tables need ~3GB at 15 workers / 1M mbufs.
+# The user's DPI-injector config sets memory_size=1500 which is too small
+# for the 15-queue net_pcap path; bump to 5000 so EAL heap fits mbufs +
+# EAL overhead (capped at 5500 since lab free hugepages is ~3GB).
+needed_mb = int(cfg.get('mempool', {}).get('memory_buffer_count', 32768)
+               * cfg.get('mempool', {}).get('memory_buffer_size', 2176)
+               / (1024 * 1024) * 1.5) + workers * 256 + 1024
+cfg['eal']['memory_size'] = str(min(max(int(cfg.get('eal', {}).get('memory_size', '5000')), needed_mb), 5500))
 
 with open(config_file, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
@@ -402,6 +583,8 @@ case "${1:-}" in
   send)     shift; cmd_send "$@" ;;
   pcap)     shift; cmd_pcap "$@" ;;
   bench)    shift; cmd_bench "$@" ;;
+  bench-spi) shift; cmd_bench_spi "$@" ;;
+  bench-dpi) shift; cmd_bench_dpi "$@" ;;
   bench-pcap) shift; cmd_bench_pcap "$@" ;;
   bench-afpacket) shift; cmd_bench_afpacket "$@" ;;
   teardown) cmd_teardown ;;

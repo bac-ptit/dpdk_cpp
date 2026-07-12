@@ -1,0 +1,348 @@
+app:
+  burst_size: 64
+  mac_updating: false
+  timer_period_sec: 5
+dpi:
+  enabled: true
+  filters:
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.facebook.com'
+    label: facebook
+    priority: 10
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.fbcdn.net'
+    label: facebook_cdn
+    priority: 10
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.messenger.com'
+    label: messenger
+    priority: 10
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.instagram.com'
+    label: instagram
+    priority: 10
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.whatsapp.net'
+    label: whatsapp
+    priority: 10
+  - filter_group: fg_l7_google
+    hostname_pattern: '*.google.com'
+    label: google
+    priority: 30
+  - filter_group: fg_l7_google
+    hostname_pattern: '*.googleapis.com'
+    label: googleapis
+    priority: 30
+  - filter_group: fg_l7s_google
+    hostname_pattern: '*.gstatic.com'
+    label: gstatic
+    priority: 30
+  - filter_group: fg_l7_google
+    hostname_pattern: '*.googleusercontent.com'
+    label: googleusercontent
+    priority: 30
+  - filter_group: fg_l7_google
+    hostname_pattern: '*.google.vn'
+    label: google_vn
+    priority: 30
+  - filter_group: fg_l7_youtube
+    hostname_pattern: '*.youtube.com'
+    label: youtube
+    priority: 20
+  - filter_group: fg_l7_youtube
+    hostname_pattern: '*.youtu.be'
+    label: youtu_be
+    priority: 20
+  - filter_group: fg_l7_youtube
+    hostname_pattern: '*.googlevideo.com'
+    label: googlevideo
+    priority: 20
+  - filter_group: fg_l7_youtube
+    hostname_pattern: '*.ytimg.com'
+    label: ytimg
+    priority: 20
+  - filter_group: fg_l7_tiktok
+    hostname_pattern: '*.tiktok.com'
+    label: tiktok
+    priority: 40
+  - filter_group: fg_l7_tiktok
+    hostname_pattern: '*.tiktokcdn.com'
+    label: tiktokcdn
+    priority: 40
+  - filter_group: fg_l7_tiktok
+    hostname_pattern: '*.byteoversea.com'
+    label: byteoversea
+    priority: 40
+  - filter_group: fg_l7_tiktok
+    hostname_pattern: '*.bytecdn.com'
+    label: bytecdn
+    priority: 40
+  - filter_group: fg_l7_zalo
+    hostname_pattern: '*.zalo.me'
+    label: zalo
+    priority: 50
+  - filter_group: fg_l7_zalo
+    hostname_pattern: '*.zalopay.vn'
+    label: zalopay
+    priority: 50
+  - filter_group: fg_l7_zalo
+    hostname_pattern: '*.zing.vn'
+    label: zing
+    priority: 50
+  - filter_group: fg_l7_netflix
+    hostname_pattern: '*.netflix.com'
+    label: netflix
+    priority: 60
+  - filter_group: fg_l7_netflix
+    hostname_pattern: '*.nflxvideo.net'
+    label: netflix_video
+    priority: 60
+  - filter_group: fg_l7_telegram
+    hostname_pattern: '*.telegram.org'
+    label: telegram
+    priority: 70
+  - filter_group: fg_l7_telegram
+    hostname_pattern: '*.t.me'
+    label: t_me
+    priority: 70
+  - filter_group: fg_l7_teams
+    hostname_pattern: '*.teams.microsoft.com'
+    label: teams
+    priority: 80
+  - filter_group: fg_l7_office365
+    hostname_pattern: '*.office365.com'
+    label: office365
+    priority: 90
+  - filter_group: fg_l7_office365
+    hostname_pattern: '*.outlook.com'
+    label: outlook
+    priority: 90
+  - filter_group: fg_l7_zoom
+    hostname_pattern: '*.zoom.us'
+    label: zoom
+    priority: 100
+  - filter_group: fg_l7_ai
+    hostname_pattern: '*.openai.com'
+    label: chatgpt
+    priority: 110
+  - filter_group: fg_l7_ai
+    hostname_pattern: '*.anthropic.com'
+    label: claude
+    priority: 110
+  - filter_group: fg_l7_ai
+    hostname_pattern: '*.gemini.google.com'
+    label: gemini
+    priority: 110
+  - filter_group: fg_l7_music
+    hostname_pattern: '*.spotify.com'
+    label: spotify
+    priority: 120
+  - filter_group: fg_l7_music
+    hostname_pattern: '*.soundcloud.com'
+    label: soundcloud
+    priority: 120
+  - filter_group: fg_l7_gov
+    hostname_pattern: '*.gov.vn'
+    label: gov_vn
+    priority: 130
+  - filter_group: fg_l7_doh
+    hostname_pattern: dns.google
+    label: doh_google
+    priority: 140
+  - filter_group: fg_l7_doh
+    hostname_pattern: cloudflare-dns.com
+    label: doh_cloudflare
+    priority: 140
+  - filter_group: fg_l7_doh
+    hostname_pattern: dns.quad9.net
+    label: doh_quad9
+    priority: 140
+  - filter_group: fg_l7_https_default
+    hostname_pattern: '*'
+    label: https_default
+    priority: 999
+eal:
+  cpu_core_list: 0-15
+  disable_hugepages: false
+  disable_pci: true
+  file_prefix: spifast
+  legacy_memory: true
+  log_level: '7'
+  memory_channels: 2
+  memory_size: '6000'
+  process_type: primary
+  virtual_devices:
+  - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q1.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q2.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q3.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q4.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q5.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q6.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q7.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q8.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q9.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q10.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q11.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q12.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q13.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/dpi_test/shards_repeated/bench_q14.pcap,infinite_rx=1
+l3_forward:
+  enabled: false
+  ethernet_destinations:
+  - mac_address: 52:54:00:5a:2c:95
+    port_id: 0
+  - mac_address: 52:54:00:fe:7b:5d
+    port_id: 1
+  ipv4_routes:
+  - destination_ip_address: 192.168.100.0
+    output_port: 0
+    prefix_length: 24
+  - destination_ip_address: 192.168.200.0
+    output_port: 1
+    prefix_length: 24
+  lookup_method: lpm
+  queue_mappings:
+  - lcore_id: 1
+    port_id: 0
+    queue_id: 0
+  - lcore_id: 2
+    port_id: 0
+    queue_id: 1
+  - lcore_id: 3
+    port_id: 0
+    queue_id: 2
+  - lcore_id: 4
+    port_id: 0
+    queue_id: 3
+  - lcore_id: 5
+    port_id: 0
+    queue_id: 4
+  - lcore_id: 6
+    port_id: 0
+    queue_id: 5
+  - lcore_id: 7
+    port_id: 0
+    queue_id: 6
+  - lcore_id: 8
+    port_id: 0
+    queue_id: 7
+  - lcore_id: 9
+    port_id: 0
+    queue_id: 8
+  - lcore_id: 10
+    port_id: 0
+    queue_id: 9
+  - lcore_id: 11
+    port_id: 0
+    queue_id: 10
+  - lcore_id: 1
+    port_id: 1
+    queue_id: 0
+  - lcore_id: 2
+    port_id: 1
+    queue_id: 1
+  - lcore_id: 3
+    port_id: 1
+    queue_id: 2
+  - lcore_id: 4
+    port_id: 1
+    queue_id: 3
+  - lcore_id: 5
+    port_id: 1
+    queue_id: 4
+  - lcore_id: 6
+    port_id: 1
+    queue_id: 5
+  - lcore_id: 7
+    port_id: 1
+    queue_id: 6
+  - lcore_id: 8
+    port_id: 1
+    queue_id: 7
+  - lcore_id: 9
+    port_id: 1
+    queue_id: 8
+  - lcore_id: 10
+    port_id: 1
+    queue_id: 9
+  - lcore_id: 11
+    port_id: 1
+    queue_id: 10
+mempool:
+  cache_size: 256
+  memory_buffer_count: 1100000
+  memory_buffer_size: 2176
+  name: mbuf_pool
+port:
+  link_check_interval_ms: 100
+  link_check_max_count: 90
+  link_speed: 0
+  port_bitmask: '0x1'
+  promiscuous: true
+  receive_descriptors: 1024
+  receive_queues: 15
+  transmit_descriptors: 1024
+  transmit_queues: 15
+spi:
+  dispatch_queue_size: 32768
+  drop_unmatched: true
+  filter_groups:
+  - action: forward
+    filters:
+    - destination_ip_address: 31.13.64.0/18
+      label: facebook_1
+      protocol: tcp
+    - destination_ip_address: 66.220.144.0/20
+      label: facebook_2
+      protocol: tcp
+    - destination_ip_address: 69.63.176.0/20
+      label: facebook_3
+      protocol: tcp
+    - destination_ip_address: 157.240.0.0/16
+      label: facebook_4
+      protocol: tcp
+    - destination_ip_address: 69.220.144.5
+      label: facebook_5
+      protocol: tcp
+    name: fg_l34_facebook
+    precedence: 100
+  - action: forward
+    filters:
+    - destination_ip_address: 142.250.0.0/15
+      destination_port: 443
+      label: youtube_1
+      protocol: tcp
+    - destination_ip_address: 172.217.0.0/16
+      destination_port: 443
+      label: youtube_2
+      protocol: tcp
+    - destination_ip_address: 216.58.192.0/19
+      destination_port: 443
+      label: youtube_3
+      protocol: tcp
+    - destination_ip_address: 74.125.0.1
+      destination_port: 443
+      label: youtube_4
+      protocol: tcp
+    name: fg_l34_youtube
+    precedence: 101
+  - action: forward
+    filters:
+    - destination_port: 80
+      label: http_all
+      protocol: tcp
+    name: fg_l34_http
+    precedence: 102
+  - action: forward
+    filters:
+    - destination_port: 443
+      label: https_all
+      protocol: tcp
+    name: fg_l34_https
+    precedence: 103
+  - action: forward
+    filters:
+    - destination_port: 53
+      label: dns_udp
+      protocol: udp
+    - destination_port: 53
+      label: dns_tcp
+      protocol: tcp
+    name: fg_l34_dns
+    precedence: 104
+  - action: drop
+    filters:
+    - destination_port: 9999
+      label: udp_drop
+      protocol: udp
+    name: fg_l34_udp_sdf1006
+    precedence: 106
+  packet_distribution: queue
+  worker_count: 15
