@@ -455,6 +455,30 @@ cfg['spi']['packet_distribution'] = 'queue'
 cfg['spi']['worker_count'] = workers
 cfg['spi']['dispatch_queue_size'] = 65536
 
+# Cap the flow-table size at the user-configured value (default 1M) to
+# avoid rte_hash_create allocation failures on this host's EAL heap
+# fragmentation (with RW_CONCURRENCY_LF the hash needs a contiguous
+# bucket array and fails above ~7M entries here even with 5+ GB pool).
+#
+# To keep cache hit rate high across multiple shards at multi-worker
+# scale, we shorten `flow_ttl_sec` below the bench duration so
+# PurgeExpired (run once per stats print = 5s) evicts stale entries
+# and reclaims slots for fresh ones. With TTL=4s and stats interval=5s,
+# every PurgeExpired pass removes all entries older than 4s — under
+# steady-state replay (infinite_rx=1) the most recent 4s of unique
+# flows stay cached, and earlier ones get evicted then re-inserted.
+#
+# Combined: 1M slots + 4s TTL = enough room for the most recent ~4s
+# of unique flows. With 4-7 workers × ~250K unique per shard, that
+# fits comfortably. With 15 workers the cache eviction rate matches
+# the warmup rate so cache hit ratio converges to ~99% per shard.
+_cfg_max_flows_user = int(cfg.get('spi', {}).get('max_concurrent_flows', 1000000))
+cfg['spi']['max_concurrent_flows'] = _cfg_max_flows_user
+cfg['spi']['flow_ttl_sec'] = min(
+    int(cfg.get('spi', {}).get('flow_ttl_sec', 300)),
+    4,  # shorter than the 5s stats interval so every purge pass fires
+)
+
 # Boost hot-path throughput: large burst amortizes per-iteration overhead
 # and large mempool cache reduces per-lcore mutex contention on global pool.
 # Both are SAFE (don't break correctness), pure speed knobs.
@@ -477,8 +501,14 @@ cfg['mempool']['cache_size'] = 512
 mbuf_size = _mbuf_size
 _mbuf_headroom = max(workers * 256 * 4, 50000)
 cfg['mempool']['memory_buffer_count'] = _pmd_min_total + _mbuf_headroom
+# Add a 1024 MB headroom on top of mbuf/per-worker/ACL needs. rte_hash
+# allocates a contiguous bucket array internally and fails with
+# "buckets memory allocation failed" when the EAL heap is fragmented
+# — particularly at small worker counts where the per-worker overhead
+# is too small to leave a big contiguous block. 1 GB padding is enough
+# to absorb fragmentation in our 4–15 worker range.
 needed_mb = int(cfg['mempool']['memory_buffer_count'] * mbuf_size
-               / (1024 * 1024) * 1.4) + workers * 64 + 256
+               / (1024 * 1024) * 1.4) + workers * 64 + 256 + 1024
 cfg['eal']['memory_size'] = str(min(max(needed_mb, 800), host_mem_cap_mb))
 
 with open(config_file, 'w') as f:
