@@ -86,10 +86,30 @@ class DpiRuleTable final {
     };
   }
 
+  /// Look up the filter index for a given DPI filter group name (e.g.
+  /// `"fg_l7_facebook"`). Returns the index of the FIRST filter with that
+  /// `filter_group` value, or `std::nullopt` if none match. Used by the
+  /// SPI→DPI static link resolver at compile / reload time, NOT on the
+  /// hot path. Linear scan over `filters_` is acceptable because
+  ///   (a) typical filter count is ≤30, fits in one cache line, and
+  ///   (b) this runs once per config load / SIGUSR1, not per packet.
+  [[nodiscard]] std::optional<std::uint32_t> FindByFilterGroup(
+      std::string_view name) const noexcept;
+
   /// Whether DPI is enabled and filters are loaded.
   [[nodiscard]] bool IsEnabled() const noexcept { return !filters_.empty(); }
 
   [[nodiscard]] std::size_t FilterCount() const noexcept { return filters_.size(); }
+
+  /// Monotonic generation counter — incremented on each reload via
+  /// `DpiRuleTableManager::Swap`. Workers compare the cached generation
+  /// against `Generation()` on every Lookup; mismatch is treated as a
+  /// miss and triggers a re-scan. See docs_search/13 §M1.
+  [[nodiscard]] std::uint32_t Generation() const noexcept { return generation_; }
+
+  /// Set the generation. Used by `DpiRuleTableManager::Swap` when the
+  /// new table replaces the old.
+  void SetGeneration(std::uint32_t gen) noexcept { generation_ = gen; }
 
  private:
   /// Original filter list — provides filter_group / label for results.
@@ -106,6 +126,8 @@ class DpiRuleTable final {
 
   /// Index into `filters_` of the `*` catch-all rule, or sentinel if none.
   std::uint16_t catch_all_idx_{std::numeric_limits<std::uint16_t>::max()};
+  /// Generation counter — see `Generation()`.
+  std::uint32_t generation_{0U};
 };
 
 /// Compile DPI config into a rule table.

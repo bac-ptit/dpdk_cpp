@@ -135,6 +135,19 @@ DpiResult DpiRuleTable::Match(std::string_view hostname) const noexcept {
   return {};
 }
 
+std::optional<std::uint32_t> DpiRuleTable::FindByFilterGroup(
+    std::string_view name) const noexcept {
+  if (name.empty()) {
+    return std::nullopt;
+  }
+  for (std::uint32_t i{0}; i < filters_.size(); ++i) {
+    if (filters_[i].filter_group == name) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
 // std::format is safe with -fno-exceptions; DpiConfig comes from dpi_rule_engine.hpp
 // NOLINTNEXTLINE(bugprone-exception-escape, misc-include-cleaner)
 std::expected<DpiRuleTable, std::string> CompileDpiRuleTable(const DpiConfig& config) noexcept {

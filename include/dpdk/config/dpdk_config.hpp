@@ -213,6 +213,27 @@ struct SpiFilterGroupConfig {
   std::string action{"forward"};
   /// Filters in this group — any filter match means the group matches.
   std::vector<SpiFilterConfig> filters;
+  /// When true, packets matching this group are STILL sent through DPI
+  /// (hostname extraction + DpiRuleTable::Match). When false (default),
+  /// DPI is skipped for packets that match this group. Use this to cap
+  /// DPI work to a small opt-in set of groups (e.g. port-based groups
+  /// that need to know the L7 hostname to forward correctly).
+  bool l7_required{false};
+  /// Optional static link to a DPI filter group (matched by
+  /// `dpi.filters[*].filter_group`). When non-empty AND `l7_required`
+  /// is true, a packet that matches this SPI group is treated as
+  /// DPI-classified to the named DPI group without running
+  /// ExtractHostname / MatchDpi. The SPI action is cached in the flow
+  /// table; subsequent packets on the same 5-tuple skip DPI work
+  /// entirely. Empty string = no link (legacy behaviour, full hostname
+  /// DPI path runs as before).
+  ///
+  /// Use case: an SPI group whose IP ranges unambiguously identify an
+  /// application (e.g. Facebook IP blocks always serve `*.facebook.com`)
+  /// should declare the link so the per-packet TLS-SNI parse is skipped.
+  /// Port-only catch-alls (port 80, port 443) should NOT declare a link
+  /// — they can serve any application.
+  std::string dpi_filter_group;
 };
 
 /// SPI configuration — hierarchical filter groups and worker settings.
@@ -227,6 +248,13 @@ struct SpiConfig {
   bool drop_unmatched{false};
   /// Flow cache TTL in seconds (0 = disable flow caching).
   std::uint32_t flow_ttl_sec{300};
+  /// Hard ceiling on concurrent flow cache entries (pre-allocated at startup).
+  /// When exceeded, the action configured in `flow_overflow_action` is taken.
+  std::uint32_t max_concurrent_flows{1'000'000};
+  /// Action when the flow cache is full and a new connection arrives.
+  /// "drop" — drop the packet (predictable, observable via `flow_table_full`).
+  /// "reclassify" — forward without caching; the next packet re-runs SPI/DPI.
+  std::string flow_overflow_action{"drop"};
   /// Hierarchical filter groups — sorted by precedence (ascending).
   std::vector<SpiFilterGroupConfig> filter_groups;
 };

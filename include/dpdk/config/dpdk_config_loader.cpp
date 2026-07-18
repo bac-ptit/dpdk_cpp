@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 #include "dpdk/spi/spi_ip_address.hpp"
 
@@ -58,6 +59,11 @@ constexpr std::size_t kIpv6AddressBytes{16};
 /// Whether the SPI packet distribution mode is supported.
 [[nodiscard]] constexpr bool IsSupportedPacketDistribution(std::string_view mode) noexcept {
   return mode == "auto" || mode == "queue" || mode == "flow_hash";
+}
+
+/// Whether the configured flow-cache overflow action is supported.
+[[nodiscard]] constexpr bool IsSupportedFlowOverflowAction(std::string_view action) noexcept {
+  return action == "drop" || action == "reclassify";
 }
 
 /// Whether the eventdev scheduling mode is accepted by DPDK l3fwd.
@@ -425,9 +431,34 @@ std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexce
   CONFIG_PROPAGATE(ValidatePcapInjectorConfig(config.pcap_injector));
 
   CONFIG_VALIDATE(spi_config.filter_groups.empty(), "spi.filter_groups must contain at least one group");
+  CONFIG_VALIDATE(spi_config.max_concurrent_flows == 0,
+                  "spi.max_concurrent_flows must be greater than 0 (got {})", spi_config.max_concurrent_flows);
+  CONFIG_VALIDATE(!IsSupportedFlowOverflowAction(spi_config.flow_overflow_action),
+                  "spi.flow_overflow_action must be 'drop' or 'reclassify' (got '{}')",
+                  spi_config.flow_overflow_action);
 
   for (std::size_t i{0}; i < spi_config.filter_groups.size(); ++i) {
     CONFIG_PROPAGATE(ValidateFilterGroupConfig(spi_config.filter_groups[i], i));
+  }
+
+  // Cross-reference SPI→DPI link targets. Build the set of DPI filter
+  // group names once, then reject any SPI group whose `dpi_filter_group`
+  // does not resolve. Empty `dpi_filter_group` (the default) is always
+  // valid — it means "no static link, run full hostname DPI".
+  std::unordered_set<std::string_view> dpi_group_names;
+  dpi_group_names.reserve(config.dpi.filters.size());
+  for (const auto& f : config.dpi.filters) {
+    dpi_group_names.insert(f.filter_group);
+  }
+  for (std::size_t i{0}; i < spi_config.filter_groups.size(); ++i) {
+    const auto& g = spi_config.filter_groups[i];
+    if (g.dpi_filter_group.empty()) {
+      continue;
+    }
+    CONFIG_VALIDATE(!dpi_group_names.contains(g.dpi_filter_group),
+                    "spi.filter_groups[{}] ('{}') dpi_filter_group='{}' has no matching "
+                    "entry in dpi.filters (must equal one of dpi.filters[*].filter_group)",
+                    i, g.name, g.dpi_filter_group);
   }
 
   return {};
