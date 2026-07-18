@@ -1,0 +1,25 @@
+spi -> link tới dpi
+chương trình hiện tại: đang là O(logn), xử lý sao cho sử dụng spi phù hợp, chỉnh sửa các rule cần thiết đẻ hạn chế nhất có thể, cái này chủ yếu chắc trong file config.
+
+Hạn chế DPI:
+check METHOD
+gộp request và response gộp thành 1 flow
+filters:
+        - source_ip_address: 192.168.100.130
+          destination_ip_address: 192.168.200.180
+          destination_port: 80
+          protocol: tcp
+          label: HTTP_REQUEST
+
+    # --- HTTP_RESPONSE: VM2 -> VM1 from port 80 (precedence 101) ---
+    - name: fg_http_response
+      precedence: 101
+      action: forward
+      filters:
+        - source_ip_address: 192.168.200.180
+          destination_ip_address: 192.168.100.130
+          source_port: 80
+          protocol: tcp
+          label: HTTP_RESPONSE
+quản lý timeout
+!overload table(xử lý thêm khi reload, xử lý cấp phát tĩnh, hạn chế cấp phát động có thể nói là không)
