@@ -3,23 +3,29 @@
 namespace {
 
 /// Global force-quit flag set by the signal handler.
-volatile std::sig_atomic_t force_quit{0};
+/// `std::atomic<int>` is async-signal-safe for `store()` on x86-64
+/// (`is_lock_free()` is true), and lets workers poll it with
+/// `.load(std::memory_order_relaxed)` cross-lcore safely.
+std::atomic<int> force_quit{0};
 
-/// Global reload-request flag set by SIGUSR1.
-volatile std::sig_atomic_t reload_requested{0};
+/// Global reload-request flag set by SIGUSR1. Same rationale.
+std::atomic<int> reload_requested{0};
 
 /**
  * @brief Signal handler for SIGINT, SIGTERM, and SIGUSR1.
  *
  * SIGINT/SIGTERM → set force_quit for graceful shutdown.
  * SIGUSR1 → set reload_requested for config hot-reload.
+ *
+ * Only writes `std::atomic<int>` flags (lock-free for int on every
+ * supported architecture), so the handler body is async-signal-safe.
  * @param signal  The received signal number.
  */
 void HandleSignal(int signal) noexcept {
   if (signal == SIGINT || signal == SIGTERM) {
-    force_quit = 1;
+    force_quit.store(1, std::memory_order_relaxed);
   } else if (signal == SIGUSR1) {
-    reload_requested = 1;
+    reload_requested.store(1, std::memory_order_relaxed);
   }
 }
 
@@ -27,9 +33,9 @@ void HandleSignal(int signal) noexcept {
 
 namespace dpdk {
 
-volatile std::sig_atomic_t& ForceQuitFlag() noexcept { return force_quit; }
+std::atomic<int>& ForceQuitFlag() noexcept { return force_quit; }
 
-volatile std::sig_atomic_t& ReloadFlag() noexcept { return reload_requested; }
+std::atomic<int>& ReloadFlag() noexcept { return reload_requested; }
 
 /**
  * @brief Install signal handlers for SIGINT, SIGTERM, and SIGUSR1.

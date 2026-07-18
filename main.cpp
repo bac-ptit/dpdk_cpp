@@ -66,11 +66,6 @@ void PrintStat(dpdk::spi::Pipeline& pipeline, std::uint32_t timer_period_sec) {
  * @return 0 on success, 1 on error.
  */
 int main() {
-  if (!dpdk::InstallSignalHandlers()) {
-    std::println(stderr, "Failed to install signal handlers");
-    return 1;
-  }
-
   auto config{dpdk::LoadConfig(CONFIG_PATH)};
   if (!config) {
     std::println(stderr, "Config error: {}", config.error());
@@ -89,6 +84,15 @@ int main() {
   auto env{dpdk::Environment{*config}};
   if (auto result{env.init()}; !result) {
     std::println(stderr, "DPDK init failed: {}", result.error());
+    return 1;
+  }
+
+  // M3: install signal handlers AFTER Environment::init(). rte_eal_init
+  // installs its own SIGUSR1/SIGINT/SIGTERM handlers internally; calling
+  // InstallSignalHandlers() before init() would be silently overwritten
+  // and SIGUSR1 would never reach our reload handler.
+  if (!dpdk::InstallSignalHandlers()) {
+    std::println(stderr, "Failed to install signal handlers");
     return 1;
   }
 

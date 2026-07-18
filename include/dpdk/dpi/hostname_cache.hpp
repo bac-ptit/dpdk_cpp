@@ -30,8 +30,12 @@ class HostnameCache {
   HostnameCache() noexcept = default;
 
   /// Look up cached result. Returns filter_index or `kNoMatchIdx` on miss.
+  /// `current_generation` is the active `DpiRuleTable::Generation()` —
+  /// if it differs from the generation stored at insertion time, the
+  /// entry is treated as a miss (DPI table has reloaded). See
+  /// docs_search/13 §M1.
   [[nodiscard, gnu::hot, gnu::always_inline]] std::uint16_t Lookup(
-      std::string_view hostname) const noexcept {
+      std::string_view hostname, std::uint32_t current_generation) const noexcept {
     if (hostname.empty()) [[unlikely]] {
       return kNoMatchIdx;
     }
@@ -39,6 +43,7 @@ class HostnameCache {
     const auto slot = hash & kMask;
     const auto& first_entry = SlotAt(slot);
     if (first_entry.hash != 0U && first_entry.hash == hash &&
+        first_entry.generation == current_generation &&
         KeyMatches(first_entry, hostname)) [[likely]] {
       return first_entry.filter_index;
     }
@@ -46,6 +51,7 @@ class HostnameCache {
     for (std::uint32_t probe = 1U; probe < kMaxProbes; ++probe) {
       const auto& probe_entry = SlotAt((slot + probe) & kMask);
       if (probe_entry.hash != 0U && probe_entry.hash == hash &&
+          probe_entry.generation == current_generation &&
           KeyMatches(probe_entry, hostname)) [[likely]] {
         return probe_entry.filter_index;
       }
@@ -53,8 +59,10 @@ class HostnameCache {
     return kNoMatchIdx;
   }
 
-  /// Insert (or update) a hostname result.
-  [[gnu::hot]] void Insert(std::string_view hostname, std::uint16_t filter_index) noexcept {
+  /// Insert (or update) a hostname result, stamped with the current
+  /// DPI rule-table generation.
+  [[gnu::hot]] void Insert(std::string_view hostname, std::uint16_t filter_index,
+                           std::uint32_t current_generation) noexcept {
     if (hostname.empty()) [[unlikely]] {
       return;
     }
@@ -63,32 +71,35 @@ class HostnameCache {
 
     auto& first_entry = SlotAt(slot);
     if (first_entry.hash == 0U) {
-      StoreEntry(first_entry, hash, hostname, filter_index);
+      StoreEntry(first_entry, hash, hostname, filter_index, current_generation);
       return;
     }
     if (first_entry.hash == hash && KeyMatches(first_entry, hostname)) {
       first_entry.filter_index = filter_index;
+      first_entry.generation = current_generation;
       return;
     }
     for (std::uint32_t probe = 1U; probe < kMaxProbes; ++probe) {
       auto& probe_entry = SlotAt((slot + probe) & kMask);
       if (probe_entry.hash == 0U) {
-        StoreEntry(probe_entry, hash, hostname, filter_index);
+        StoreEntry(probe_entry, hash, hostname, filter_index, current_generation);
         return;
       }
       if (probe_entry.hash == hash && KeyMatches(probe_entry, hostname)) {
         probe_entry.filter_index = filter_index;
+        probe_entry.generation = current_generation;
         return;
       }
     }
     // Cache full for this hash — silently drop (rare).
   }
 
-  /// Clear all entries.
+  /// Clear all entries. Called from `MaybeReload` if you prefer a
+  /// brute-force clear to the generation-counter approach.
   void Clear() noexcept { slots_.fill(EmptyEntry{}); }
 
  private:
-  // 4096 slots × ~16 bytes = ~64 KiB. Fits in L2 (typically 256 KiB–1 MiB).
+  // 4096 slots × ~20 bytes = ~80 KiB. Fits in L2 (typically 256 KiB–1 MiB).
   static constexpr std::uint32_t kSlots{4096U};
   static constexpr std::uint32_t kMask{kSlots - 1U};
   static constexpr std::uint32_t kMaxProbes{4U};
@@ -100,6 +111,10 @@ class HostnameCache {
     std::uint32_t key32{0U};       // first 4 bytes of hostname
     std::uint64_t key64{0U};       // bytes [4..11] of hostname
     std::uint16_t filter_index{kNoMatchIdx};
+    /// DPI rule-table generation at insertion time. On mismatch the
+    /// entry is treated as a miss (filter_index may point into the
+    /// previous table). See docs_search/13 §M1.
+    std::uint32_t generation{0U};
   };
 
   using EmptyEntry = Entry;
@@ -166,10 +181,12 @@ class HostnameCache {
   }
 
   static void StoreEntry(Entry& entry, const std::uint32_t hash, const std::string_view hostname,
-                         const std::uint16_t filter_index) noexcept {
+                         const std::uint16_t filter_index,
+                         const std::uint32_t generation) noexcept {
     entry.hash = hash;
     CopyKey(entry, hostname);
     entry.filter_index = filter_index;
+    entry.generation = generation;
   }
 
   std::array<Entry, kSlots> slots_{};

@@ -35,10 +35,18 @@ class DpiRuleTableManager final {
   }
 
   /// Atomically swap in a new DPI rule table. Main lcore only.
+  /// Increments the new table's generation so per-worker HostnameCache
+  /// entries that reference filter indices in the old table are
+  /// invalidated on their next Lookup. See docs_search/13 §M1.
   void Swap(std::unique_ptr<DpiRuleTable> new_table) noexcept {
-    auto* old = active_.exchange(new_table.release(), std::memory_order_acq_rel);
+    if (new_table != nullptr) {
+      const auto* old = active_.load(std::memory_order_relaxed);
+      const auto next_gen = (old == nullptr) ? 1U : old->Generation() + 1U;
+      new_table->SetGeneration(next_gen);
+    }
+    auto* old_ptr = active_.exchange(new_table.release(), std::memory_order_acq_rel);
     prev_retired_ = std::move(retired_);
-    retired_.reset(old);
+    retired_.reset(old_ptr);
   }
 
   /// Initialize with the first DPI rule table (called from Pipeline ctor).
