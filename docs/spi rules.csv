@@ -1,0 +1,26 @@
+﻿no.,l34-filter,l34-filter-group,"network-prefix
+(destination IP)","network-address
+(destination IP)","network-port
+(destination Port)",protocol,src-ip,src-prefix,src-port
+1,f_l34_facebook_1,fg_l34_facebook,31.13.64.0/18,NA,any,any,NA,NA,any
+2,f_l34_facebook_2,fg_l34_facebook,66.220.144.0/20,NA,any,any,NA,NA,any
+3,f_l34_facebook_3,fg_l34_facebook,69.63.176.0/20,NA,any,any,NA,NA,any
+4,f_l34_facebook_4,fg_l34_facebook,157.240.0.0/16,NA,any,any,NA,NA,any
+5,f_l34_facebook_4,fg_l34_facebook,NA,69.220.144.5,any,any,NA,NA,any
+6,f_l34_youtube_1,fg_l34_youtube,142.250.0.0/15,NA,443,tcp,NA,NA,any
+7,f_l34_youtube_2,fg_l34_youtube,172.217.0.0/16,NA,443,tcp,NA,NA,any
+8,f_l34_youtube_3,fg_l34_youtube,216.58.192.0/19,NA,443,tcp,NA,NA,any
+9,f_l34_youtube_4,fg_l34_youtube,N/A,74.125.0.1,443,tcp,NA,NA,any
+10,f_l34_http_all,fg_l34_http_sdf1003,NA,NA,80,tcp,NA,NA,any
+11,f_l34_https_all,fg_l34_https_sdf1004,NA,NA,443,tcp,NA,NA,any
+12,f_l34_dns_udp,fg_l34_dns_sdf1005,NA,NA,53,udp,NA,NA,any
+13,f_l34_dns_tcp,fg_l34_dns_sdf1005,NA,NA,53,tcp,NA,NA,any
+,,,,,,,,,
+No,Precedence,l34-filter-group,Action,,,,,,
+1,100,fg_l34_facebook,forward,,,,,,
+2,101,fg_l34_youtube,forward,,,,,,
+3,102,fg_l34_http_sdf1003,forward,,,,,,
+4,103,fg_l34_https_sdf1004,forward,,,,,,
+5,104,fg_l34_dns_sdf1005,forward,,,,,,
+6,105,fg_l34_dns_sdf1005,forward,,,,,,
+7,106,fg_l34_udp_sdf1006,Drop,,,,,,
