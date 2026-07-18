@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +30,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -346,6 +348,11 @@ void UpdateL2ForwardMacs(const rte_mbuf& packet, const rte_ether_addr& src_addr,
       .dropped = LoadCounter(counters.dropped),
       .dropped_by_rule = LoadCounter(counters.dropped_by_rule),
       .flow_cache_hits = LoadCounter(counters.flow_cache_hits),
+      .dpi_cache_hits = LoadCounter(counters.dpi_cache_hits),
+      .dpi_cache_misses = LoadCounter(counters.dpi_cache_misses),
+      .dpi_skipped_by_spi = LoadCounter(counters.dpi_skipped_by_spi),
+      .dpi_skipped_by_link = LoadCounter(counters.dpi_skipped_by_link),
+      .flow_table_full = LoadCounter(counters.flow_table_full),
   };
 }
 
@@ -366,6 +373,9 @@ void AddBurstCounters(AtomicCounters& counters, const BurstCounters& burst) noex
   counters.flow_cache_hits.fetch_add(burst.flow_cache_hits, std::memory_order_relaxed);
   counters.dpi_cache_hits.fetch_add(burst.dpi_cache_hits, std::memory_order_relaxed);
   counters.dpi_cache_misses.fetch_add(burst.dpi_cache_misses, std::memory_order_relaxed);
+  counters.dpi_skipped_by_spi.fetch_add(burst.dpi_skipped_by_spi, std::memory_order_relaxed);
+  counters.dpi_skipped_by_link.fetch_add(burst.dpi_skipped_by_link, std::memory_order_relaxed);
+  counters.flow_table_full.fetch_add(burst.flow_table_full, std::memory_order_relaxed);
 }
 
 /// Fold worker-side counters in dispatcher mode without double-counting RX.
@@ -380,6 +390,9 @@ void AddDispatchedWorkerCounters(AtomicCounters& counters, const BurstCounters& 
   counters.flow_cache_hits.fetch_add(burst.flow_cache_hits, std::memory_order_relaxed);
   counters.dpi_cache_hits.fetch_add(burst.dpi_cache_hits, std::memory_order_relaxed);
   counters.dpi_cache_misses.fetch_add(burst.dpi_cache_misses, std::memory_order_relaxed);
+  counters.dpi_skipped_by_spi.fetch_add(burst.dpi_skipped_by_spi, std::memory_order_relaxed);
+  counters.dpi_skipped_by_link.fetch_add(burst.dpi_skipped_by_link, std::memory_order_relaxed);
+  counters.flow_table_full.fetch_add(burst.flow_table_full, std::memory_order_relaxed);
 }
 
 /// Add per-burst counters to a worker-local stats snapshot.
@@ -395,6 +408,9 @@ void AddBurstStats(PipelineStats& stats, const BurstCounters& burst) noexcept {
   stats.flow_cache_hits += burst.flow_cache_hits;
   stats.dpi_cache_hits += burst.dpi_cache_hits;
   stats.dpi_cache_misses += burst.dpi_cache_misses;
+  stats.dpi_skipped_by_spi += burst.dpi_skipped_by_spi;
+  stats.dpi_skipped_by_link += burst.dpi_skipped_by_link;
+  stats.flow_table_full += burst.flow_table_full;
 }
 
 /// Fold per-burst counters into a worker-local pending accumulator. Used
@@ -412,6 +428,9 @@ void AddBurstCounters(BurstCounters& accumulator, const BurstCounters& burst) no
   accumulator.flow_cache_hits += burst.flow_cache_hits;
   accumulator.dpi_cache_hits += burst.dpi_cache_hits;
   accumulator.dpi_cache_misses += burst.dpi_cache_misses;
+  accumulator.dpi_skipped_by_spi += burst.dpi_skipped_by_spi;
+  accumulator.dpi_skipped_by_link += burst.dpi_skipped_by_link;
+  accumulator.flow_table_full += burst.flow_table_full;
 }
 
 /// Print the current counter state to stdout.
@@ -439,36 +458,106 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
     const auto stats{CollectStats(counters)};
     const auto elapsed_sec{static_cast<double>(current_tsc - start_tsc) / static_cast<double>(rte_get_tsc_hz())};
     const auto mpps{static_cast<double>(stats.received) / elapsed_sec / 1e6};
-    std::println("SPI stats: received={} matched={} elapsed={:.1f}s Mpps={:.2f}", stats.received, stats.matched,
-                 elapsed_sec, mpps);
+    std::println(
+        "SPI stats: received={} matched={} flow_table_full={} dpi_skipped_by_spi={} "
+        "dpi_skipped_by_link={} elapsed={:.1f}s Mpps={:.2f}",
+        stats.received, stats.matched, stats.flow_table_full, stats.dpi_skipped_by_spi,
+        stats.dpi_skipped_by_link, elapsed_sec, mpps);
     timer_tsc = 0;
   }
 }
 
-/// Check the reload flag and hot-swap rules if requested.
-[[gnu::cold]] void MaybeReload(RuleTableManager& rule_manager, volatile std::sig_atomic_t* reload_flag,
-                               const std::string& config_path) noexcept {
-  if (reload_flag == nullptr || *reload_flag == 0) {
+/// Check the reload flag and rebuild the active RuleTable in place if requested.
+///
+/// The in-place rebuild (PR5) eliminates the per-reload heap allocations that
+/// the prior `rule_manager.Swap(make_unique<RuleTable>(...))` did. Sequence:
+///
+///   1. Set `*reload_barrier` so workers busy-wait at the end of their
+///      current burst instead of starting a new one.
+///   2. Wait briefly for workers to drain into the barrier (cheap
+///      spin-or-sleep; workers re-check the flag at the end of every
+///      burst so the worst-case delay is one burst).
+///   3. Compile the new rules.
+///   4. Call `RebuildInPlace` on the active RuleTable — this calls
+///      `rte_acl_reset_rules` + `add_rules` + `build` on the existing
+///      `rte_acl_ctx`, which reuses its pre-allocated internal storage.
+///   5. Clear `*reload_barrier`; workers resume on their next iteration.
+///
+/// If step 4 fails (e.g. -ENOSPC because the new rule count exceeds
+/// `max_rule_num`), the old rules stay in place and we log + clear the
+/// reload flag without disturbing workers.
+[[gnu::cold]] void MaybeReload(RuleTableManager& rule_manager, std::atomic<int>* reload_flag,
+                               const std::string& config_path, std::atomic<bool>& reload_barrier,
+                               const dpdk::dpi::DpiRuleTable& dpi_table) noexcept {
+  if (reload_flag == nullptr || reload_flag->load(std::memory_order_relaxed) == 0) {
     return;
   }
+
+  // Pause workers before reading or mutating the active RuleTable. Workers
+  // re-check the barrier at the end of every burst, so by the time we finish
+  // compiling the new rules below, all workers should be paused.
+  reload_barrier.store(true, std::memory_order_release);
 
   auto config{dpdk::LoadConfig(config_path)};
   if (!config) {
     std::println(stderr, "Reload failed: {}", config.error());
-    *reload_flag = 0;
+    reload_flag->store(0, std::memory_order_relaxed);
+    reload_barrier.store(false, std::memory_order_release);
     return;
   }
+
+  // Brief sleep so workers have time to finish their current burst and
+  // observe the barrier. Without this, a worker mid-burst could still call
+  // RuleTable::Match after we've started mutating the ctx. 1 ms is plenty
+  // for a 64-packet burst at 100 Mpps (~640 ns).
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
   auto new_rules{CompileRuleTable(config->spi)};
   if (!new_rules) {
     std::println(stderr, "Reload failed: {}", new_rules.error());
-    *reload_flag = 0;
+    reload_flag->store(0, std::memory_order_relaxed);
+    reload_barrier.store(false, std::memory_order_release);
     return;
   }
 
-  std::println("Rules reloaded: {} groups, {} filters", new_rules->GroupCount(), new_rules->FilterCount());
-  rule_manager.Swap(std::make_unique<RuleTable>(std::move(*new_rules)));
-  *reload_flag = 0;
+  // Take the active RuleTable and rebuild it in place. This call is the
+  // whole point of PR5: no new rte_acl_ctx, no new std::vector for groups
+  // (the old one is replaced by move-assignment from new_rules->groups_).
+  const auto* active = rule_manager.Load();
+  if (active == nullptr) {
+    std::println(stderr, "Reload failed: no active RuleTable");
+    reload_flag->store(0, std::memory_order_relaxed);
+    reload_barrier.store(false, std::memory_order_release);
+    return;
+  }
+
+  // Move the freshly-compiled groups + precedence_order out of new_rules
+  // so RebuildInPlace can take them by value. The new_rules RuleTable's
+  // destructor will free its (now-orphaned) acl_ctx_ — that's fine, we
+  // never adopt its ctx, we only want its rule data.
+  std::vector<CompiledFilterGroup> new_groups = std::move(*new_rules).MoveGroupsOut();
+  std::vector<std::uint32_t> new_prec = std::move(*new_rules).MovePrecedenceOrderOut();
+
+  if (const auto rebuild{const_cast<RuleTable*>(active)->RebuildInPlace(std::move(new_groups), std::move(new_prec))};
+      !rebuild) {
+    std::println(stderr, "Reload failed: {}", rebuild.error());
+    reload_flag->store(0, std::memory_order_relaxed);
+    reload_barrier.store(false, std::memory_order_release);
+    return;
+  }
+
+  // Re-resolve SPI→DPI static links on the just-rebuilt active table. The
+  // freshly compiled groups start with `bound_dpi_filter_index = kNoDpiLink`;
+  // without this pass the link would silently disappear after every reload.
+  if (const auto resolve{const_cast<RuleTable*>(active)->ResolveDpiLinks(dpi_table)}; !resolve) {
+    std::println(stderr, "Reload warning: SPI→DPI links lost after reload: {}", resolve.error());
+  }
+
+  std::println("Rules reloaded: {} groups, {} filters (in-place)", active->GroupCount(), active->FilterCount());
+  reload_flag->store(0, std::memory_order_relaxed);
+
+  // Release workers.
+  reload_barrier.store(false, std::memory_order_release);
 }
 
 /// Print final packet counters for each worker queue.
@@ -523,18 +612,21 @@ void PrintDispatchMap(const dpdk::Environment& environment, std::size_t worker_c
     std::println("Packet distribution: queue (auto, single worker)");
     return PacketDistribution::kQueuePerWorker;
   }
-  // net_pcap binds each rx_pcap shard to its own RX queue, so workers can
-  // drain shards in parallel directly. Don't route through the dispatcher.
+  // No RSS offloads → all packets land on queue 0. Software dispatcher is the
+  // only way to fan them out across workers. Checked FIRST so the per-port
+  // branches below can safely assume queue-per-worker actually works.
+  if (!environment.ActivePortsSupportRss()) {
+    std::println("Packet distribution: flow_hash (auto, active ports report no RSS offloads)");
+    return PacketDistribution::kFlowHash;
+  }
+  // net_pcap with multiple rx_pcap= shards binds each shard to its own RX queue
+  // (only true when RSS is on; without it everything funnels to queue 0).
   if (environment.HasPcapPort()) {
     std::println("Packet distribution: queue (auto, net_pcap shards feed separate queues)");
     return PacketDistribution::kQueuePerWorker;
   }
   if (environment.HasSoftwareBackedPort()) {
     std::println("Packet distribution: flow_hash (auto, software/vNIC PMD detected)");
-    return PacketDistribution::kFlowHash;
-  }
-  if (!environment.ActivePortsSupportRss()) {
-    std::println("Packet distribution: flow_hash (auto, active ports report no RSS offloads)");
     return PacketDistribution::kFlowHash;
   }
   if (environment.GetReceiveQueueCount() < worker_count) {
@@ -568,11 +660,25 @@ void PrintDispatchMap(const dpdk::Environment& environment, std::size_t worker_c
 [[nodiscard, gnu::always_inline]] inline PacketClassification MakeMatched(
     const PacketMetadata& metadata, Action action, const FlowKey& key, const WorkerContext& context,
     BurstCounters& counters) noexcept {
+  // `match_count = 1` marks the slot as populated (the lookup check is
+  // `packed == 0`). New `action_and_count` value is published via the
+  // release-store inside `Insert`.
+  if (const auto ins{context.flow_table->Insert(key, /*match_count=*/1, action)};
+      ins != FlowInsertResult::kOk) [[unlikely]] {
+    // Flow table is full (-ENOSPC). Apply configured overflow policy.
+    ++counters.flow_table_full;
+    if (context.flow_overflow_drop) {
+      // Tell the caller to drop this packet; DropPacket frees the mbuf and
+      // increments `dropped_by_rule` + `dropped`.
+      return {.metadata = metadata, .action = Action::kDrop, .parsed = true, .matched = true};
+    }
+    // reclassify: forward without caching. Decrement `matched` so the caller
+    // doesn't double-count (the rule engine doesn't get credit for a flow it
+    // couldn't cache).
+    ++counters.unknown;
+    return {.metadata = metadata, .action = Action::kForward, .parsed = true, .matched = false};
+  }
   ++counters.matched;
-  // Only `action` is hot-path read on subsequent hits. `match_count = 1` marks
-  // the slot as populated (the lookup-zero check is `entry->match_count == 0`).
-  FlowEntry entry{.action = action, .match_count = 1};
-  context.flow_table->Insert(key, entry);
   return {.metadata = metadata, .action = action, .parsed = true, .matched = true};
 }
 
@@ -630,13 +736,27 @@ struct DpiMatch {
   }
   const std::string_view hostname{metadata.hostname, metadata.hostname_length};
 
+  // H1: hoist a single acquire-load of the DPI rule table so all reads
+  // below come from the same table pointer. Without this, a Swap()
+  // between two consecutive Load() calls could observe different
+  // tables — the cached_idx from the OLD table might be >= FilterCount()
+  // on the NEW table, causing ResultAt() OOB read.
+  const auto* const dpi_rules{context.dpi_rule_manager->Load()};
+  if (dpi_rules == nullptr) [[unlikely]] {
+    return std::nullopt;
+  }
+  const auto filter_count{dpi_rules->FilterCount()};
+  const auto current_generation{dpi_rules->Generation()};
+
   // Cache fast path — ~20 ns vs ~300 ns for full Match(). Per-worker
   // cache, no contention. False positives at 1K entries ≈ 0.001%.
-  const auto cached_idx{context.dpi_hostname_cache.Lookup(hostname)};
+  // M1: pass current_generation so cache entries from a previous DPI
+  // reload are invalidated on their next Lookup.
+  const auto cached_idx{context.dpi_hostname_cache.Lookup(hostname, current_generation)};
   if (cached_idx != dpi::HostnameCache::kNoMatchIdx) [[likely]] {
     ++counters.dpi_cache_hits;
-    if (cached_idx < context.dpi_rule_manager->Load()->FilterCount()) [[likely]] {
-      const auto result = context.dpi_rule_manager->Load()->ResultAt(cached_idx);
+    if (cached_idx < filter_count) [[likely]] {
+      const auto result = dpi_rules->ResultAt(cached_idx);
       return DpiMatch{.filter_group = result.filter_group, .label = result.label,
                        .priority = result.priority};
     }
@@ -647,27 +767,37 @@ struct DpiMatch {
   ++counters.dpi_cache_misses;
 
   // Cache miss — full Match() + insert into cache.
-  const auto result{context.dpi_rule_manager->Load()->Match(hostname)};
+  const auto result{dpi_rules->Match(hostname)};
   if (result.matched) [[unlikely]] {
     // Look up the filter index for cache. For ≤30 entries this is O(N)
     // but each step is a string_view compare, fits in one cache line.
     std::uint16_t idx{0U};
-    for (std::size_t i = 0; i < context.dpi_rule_manager->Load()->FilterCount(); ++i) {
+    for (std::size_t i = 0; i < filter_count; ++i) {
       idx = static_cast<std::uint16_t>(i);
-      const auto probe = context.dpi_rule_manager->Load()->ResultAt(idx);
+      const auto probe = dpi_rules->ResultAt(idx);
       if (probe.filter_group == result.filter_group && probe.label == result.label &&
           probe.priority == result.priority) {
         break;
       }
     }
-    context.dpi_hostname_cache.Insert(hostname, idx);
+    context.dpi_hostname_cache.Insert(hostname, idx, current_generation);
     return DpiMatch{.filter_group = result.filter_group, .label = result.label,
                      .priority = result.priority};
   }
   // Cache the negative result too so we don't redo the search.
-  context.dpi_hostname_cache.Insert(hostname, dpi::HostnameCache::kNoMatchIdx);
+  context.dpi_hostname_cache.Insert(hostname, dpi::HostnameCache::kNoMatchIdx, current_generation);
   return std::nullopt;
 }
+
+// Forward declaration — full definition lives below (after ProcessPortBurst helpers).
+// Both `ClassifyPacket` (flow_hash dispatch path) and `ForwardPacket` only need the
+// same SPI-gated DPI behaviour that the queue+bulk path already gets via
+// `ResolvePacketAction` → `TryDpiClassify`. Routing both paths through this single
+// function ensures the SPI gate short-circuits DPI work in *every* packet flow,
+// matching the mentor's "spi -> link tới dpi" requirement.
+[[gnu::hot, gnu::always_inline]] inline void TryDpiClassify(
+    WorkerContext& context, BurstCounters& counters, const rte_mbuf& packet, PacketMetadata& metadata,
+    const ClassificationResult& spi_match, const FlowKey& key, Action& action, bool& matched) noexcept;
 
 /**
  * @brief Parse and classify a single packet, updating counters.
@@ -682,36 +812,99 @@ struct DpiMatch {
     ++counters.parsed;
     auto metadata{*parsed};
 
-    const FlowKey key{
-        .src_ip = metadata.source_ip_address,
-        .dst_ip = metadata.destination_ip_address,
-        .src_port = metadata.source_port,
-        .dst_port = metadata.destination_port,
-        .protocol = metadata.protocol,
-    };
+    const FlowKey key{MakeCanonical(metadata.source_ip_address,
+                                  metadata.destination_ip_address,
+                                  metadata.source_port,
+                                  metadata.destination_port,
+                                  metadata.protocol)};
 
-    // Cache hit — fast path.
-    if (auto* cached = context.flow_table->Lookup(key)) [[likely]] {
+    // Cache hit — fast path. Returns std::optional<FlowEntryView>; on the
+    // hot path the view is captured into a register and the action bit is
+    // consumed directly without re-reading the atomic.
+    if (auto cached{context.flow_table->Lookup(key, context.current_burst_tsc)}) [[likely]] {
       ++counters.flow_cache_hits;
       return {.metadata = metadata, .action = cached->action, .parsed = true, .matched = true};
     }
 
     // Cache miss — run SPI rules.
     const auto* rules = context.rule_manager->Load();
-    const auto spi_match = rules->Match(metadata);
 
-    // L7 DPI: extract hostname and match DPI rules.
-    if (context.dpi_rule_manager->Load() != nullptr && context.dpi_rule_manager->Load()->IsEnabled() &&
-        metadata.protocol == Protocol::kTcp &&
-        (metadata.destination_port == kTlsPort || metadata.destination_port == kHttpPort)) {
-      ExtractHostname(packet, metadata);
-      if (MatchDpi(context, counters, metadata)) {
-        const auto action{spi_match.matched ? spi_match.action : Action::kForward};
-        return MakeMatched(metadata, action, key, context, counters);
-      }
+    // Tuple-Space Search pre-check (O(1) hash probe vs ACL multi-bit trie
+    // walk). Fires only for SPI filters whose FULL 5-tuple is specified
+    // (no CIDR, no "any source", no "any port"). For CIDR / port-only
+    // filters, `ProbeTss` returns `kNoTssHit` and we fall through to the
+    // regular ACL path unchanged. When TSS hits, we synthesize the same
+    // `ClassificationResult` the ACL would have produced — including
+    // `bound_dpi_filter_index` — so the static-link fast path below still
+    // fires for linked groups. See docs_search/17 §2.
+    ClassificationResult spi_match{};
+    if (const auto tss_hit{rules->ProbeTss(key)}; tss_hit != RuleTable::kNoTssHit) [[likely]] {
+      spi_match = rules->ResultForCategory(tss_hit);
+    } else {
+      spi_match = rules->Match(metadata);
     }
 
-    // SPI match.
+    // SPI→DPI static link fast path (MUST run BEFORE TryDpiClassify).
+    // When the SPI group declared a `dpi_filter_group` in config, the SPI
+    // match already determines the DPI group — skip ExtractHostname +
+    // MatchDpi entirely, cache the SPI action, and return. Without this
+    // branch sitting here, the matched path below would return BEFORE
+    // TryDpiClassify is invoked, leaving the link unreachable on the
+    // flow-hash dispatch path.
+    if (spi_match.matched && spi_match.bound_dpi_filter_index != kNoDpiLink) [[likely]] {
+      if (context.flow_table->Insert(key, /*match_count=*/1, spi_match.action) != FlowInsertResult::kOk) [[unlikely]] {
+        ++counters.flow_table_full;
+        if (context.flow_overflow_drop) {
+          return {.metadata = metadata, .action = Action::kDrop, .parsed = true, .matched = true};
+        }
+        // overflow policy == reclassify: don't cache, fall through.
+        return {.metadata = metadata, .action = spi_match.action, .parsed = true, .matched = true};
+      }
+      ++counters.dpi_skipped_by_link;
+      ++counters.matched;
+      return {.metadata = metadata, .action = spi_match.action, .parsed = true, .matched = true};
+    }
+
+    // SPI-only fast path: when DPI is fully disabled (`dpi.rules` empty →
+    // `IsEnabled()` false), bypass `TryDpiClassify` entirely. Otherwise the
+    // SPI path would pay ~8 cycles/cache-miss for the Load() + IsEnabled()
+    // check + return — material on a 30 Mpps workload (a few % throughput).
+    // The DPI engine's own `IsEnabled()` short-circuit at the top of
+    // `TryDpiClassify` still handles partial cases (table loaded but
+    // runtime disabled), so this is strictly an optimisation for the
+    // "DPI off entirely" mode that the bench harness uses for `bench-spi`.
+    //
+    // Production: DPI is enabled by default → branch is `[[unlikely]]` so
+    // the compiler lays out the fall-through (DPI on) path inline. The
+    // `bench-spi` benchmark takes the early-out on every cache miss and
+    // pays the mispredict cost (~15 cycles), but bench-spi is a benchmark
+    // — production never hits this path with DPI enabled.
+    const auto* const dpi_rules{context.dpi_rule_manager->Load()};
+    if (dpi_rules == nullptr || !dpi_rules->IsEnabled()) [[unlikely]] {
+      if (spi_match.matched) {
+        return MakeMatched(metadata, spi_match.action, key, context, counters);
+      }
+      ++counters.unknown;
+      return {.metadata = metadata, .action = Action::kForward, .parsed = true, .matched = false};
+    }
+
+    // Single SPI-gated DPI entry point (same logic as the queue-mode
+    // `ResolvePacketAction`/`FinalizePackets` path). Encapsulates:
+    //   1. Skip if DPI is disabled.
+    //   2. Skip when SPI already decided a final action that does not need L7.
+    //   3. Skip non-TCP / non-{80,443} traffic.
+    //   4. Skip response-direction packets (canonical FlowKey means the request-side
+    //      cache hit covers this packet; no need to redo ExtractHostname).
+    //   5. Otherwise run ExtractHostname + MatchDpi; on match, Insert into flow cache
+    //      and propagate the action via the out-params.
+    Action action{Action::kForward};
+    bool matched{false};
+    TryDpiClassify(context, counters, packet, metadata, spi_match, key, action, matched);
+    if (matched) {
+      return {.metadata = metadata, .action = action, .parsed = true, .matched = true};
+    }
+
+    // Plain SPI match (no DPI on this packet — or DPI found nothing).
     if (spi_match.matched) {
       return MakeMatched(metadata, spi_match.action, key, context, counters);
     }
@@ -902,10 +1095,59 @@ struct DpiMatch {
   if (dpi_rules == nullptr || !dpi_rules->IsEnabled()) [[likely]] {
     return;
   }
+  // SPI-gated DPI: short-circuit when SPI already gave us a final answer
+  // that does NOT require L7 inspection. With W4a's canonical tuple, the
+  // response packet's FlowKey already points to the request-side cached
+  // entry, so DPI work is unnecessary on the response path too.
+  if (spi_match.matched && spi_match.action == Action::kDrop) [[unlikely]] {
+    ++counters.dpi_skipped_by_spi;
+    return;
+  }
+  if (spi_match.matched && spi_match.action == Action::kForward && !spi_match.l7_required) [[likely]] {
+    ++counters.dpi_skipped_by_spi;
+    return;
+  }
+  // SPI→DPI static link fast path: the SPI group declared a `dpi_filter_group`
+  // in config, so the SPI match already determines the DPI group. Skip
+  // ExtractHostname + MatchDpi entirely; cache the SPI action in the flow
+  // table so subsequent packets on this 5-tuple skip DPI work too. This
+  // is the dominant DPI throughput win when IP-range groups unambiguously
+  // identify the application (e.g. Facebook IPs always serve `*.facebook.com`).
+  if (spi_match.matched && spi_match.bound_dpi_filter_index != kNoDpiLink) [[likely]] {
+    if (context.flow_table->Insert(key, /*match_count=*/1, spi_match.action) != FlowInsertResult::kOk) [[unlikely]] {
+      ++counters.flow_table_full;
+      if (context.flow_overflow_drop) {
+        action = Action::kDrop;
+        matched = true;
+      }
+      // matched stays false → caller treats as unknown → forwards.
+    } else {
+      ++counters.dpi_skipped_by_link;
+      ++counters.matched;
+      action = spi_match.action;
+      matched = true;
+    }
+    return;
+  }
   if (metadata.protocol != Protocol::kTcp) [[likely]] {
+    ++counters.dpi_skipped_by_spi;
     return;
   }
   if (metadata.destination_port != kTlsPort && metadata.destination_port != kHttpPort) [[likely]] {
+    ++counters.dpi_skipped_by_spi;
+    return;
+  }
+
+  // Skip the response direction: src_port is a well-known web port (80/443)
+  // and dst_port is ephemeral (>= 1024). The canonical FlowKey of this
+  // packet was already inserted by the request side; the cached entry
+  // applies via the lookup hit in ResolvePacketAction, so we don't need
+  // to run hostname extraction or DPI matching here.
+  constexpr std::uint16_t kWellKnownPortMax{1024};
+  const bool is_response{(metadata.source_port == kHttpPort || metadata.source_port == kTlsPort) &&
+                         metadata.destination_port >= kWellKnownPortMax};
+  if (is_response) [[likely]] {
+    ++counters.dpi_skipped_by_spi;
     return;
   }
 
@@ -915,10 +1157,19 @@ struct DpiMatch {
   ExtractHostname(packet, metadata);
   if (auto dpi{MatchDpi(context, counters, metadata)}) {
     const auto final_action{spi_match.matched ? spi_match.action : Action::kForward};
-    context.flow_table->Insert(key, FlowEntry{.action = final_action, .match_count = 1});
-    ++counters.matched;
-    action = final_action;
-    matched = true;
+    if (context.flow_table->Insert(key, /*match_count=*/1, final_action) != FlowInsertResult::kOk) [[unlikely]] {
+      // Flow table is full (-ENOSPC). Apply configured overflow policy.
+      ++counters.flow_table_full;
+      if (context.flow_overflow_drop) {
+        action = Action::kDrop;
+        matched = true;
+      }
+      // reclassify: matched stays false; caller treats as unknown and forwards.
+    } else {
+      ++counters.matched;
+      action = final_action;
+      matched = true;
+    }
   }
 }
 
@@ -944,13 +1195,11 @@ struct DpiMatch {
     if (auto parsed{ParsePacket(*packet)}) {
       ++counters.parsed;
       metadata[n_parsed] = *parsed;
-      keys[n_parsed] = FlowKey{
-          .src_ip = parsed->source_ip_address,
-          .dst_ip = parsed->destination_ip_address,
-          .src_port = parsed->source_port,
-          .dst_port = parsed->destination_port,
-          .protocol = parsed->protocol,
-      };
+      keys[n_parsed] = MakeCanonical(parsed->source_ip_address,
+                                     parsed->destination_ip_address,
+                                     parsed->source_port,
+                                     parsed->destination_port,
+                                     parsed->protocol);
       packet_to_parsed[i] = static_cast<std::uint16_t>(n_parsed);
       ++n_parsed;
     } else {
@@ -964,14 +1213,16 @@ struct DpiMatch {
 /// Bulk flow hash lookup in chunks of ≤64 keys.
 void BulkFlowLookup(FlowTable& flow_table,
                     std::span<const FlowKey> keys, std::uint32_t n_parsed,
-                    std::span<std::int32_t> positions) noexcept {
+                    std::uint64_t now_tsc,
+                    std::span<BulkResult> results) noexcept {
   constexpr std::uint32_t kBulkChunkMax{64};
   for (std::uint32_t chunk_start{0}; chunk_start < n_parsed;
        chunk_start += kBulkChunkMax) {
     const auto chunk_size{std::min(kBulkChunkMax, n_parsed - chunk_start)};
     flow_table.LookupBulk(keys.subspan(chunk_start, chunk_size).data(),
                           chunk_size,
-                          positions.subspan(chunk_start, chunk_size).data());
+                          now_tsc,
+                          results.subspan(chunk_start, chunk_size));
   }
 }
 
@@ -979,29 +1230,43 @@ void BulkFlowLookup(FlowTable& flow_table,
 [[gnu::hot, gnu::always_inline]] inline void ResolvePacketAction(
     WorkerContext& context, BurstCounters& counters,
     const rte_mbuf& packet, PacketMetadata& metadata,
-    const FlowKey& key, std::int32_t position,
+    const FlowKey& key, const BulkResult& bulk_result,
     Action& action, bool& matched) noexcept {
-  if (position >= 0) {
-    auto* const entry{context.flow_table->GetEntry(position)};
-    if (entry->match_count > 0) [[likely]] {
-      ++counters.flow_cache_hits;
-      action = entry->action;
-      matched = true;
-      return;
-    }
+  if (bulk_result.valid) [[likely]] {
+    // Snapshot taken inside LookupBulk — no second acquire-load, no
+    // position-lifetime window. See docs_search/13 §H4.
+    ++counters.flow_cache_hits;
+    action = bulk_result.view.action;
+    matched = true;
+    return;
   }
 
   const auto* rules{context.rule_manager->Load()};
-  const auto spi_match{rules->Match(metadata)};
+  ClassificationResult spi_match{};
+  if (const auto tss_hit{rules->ProbeTss(key)}; tss_hit != RuleTable::kNoTssHit) [[likely]] {
+    spi_match = rules->ResultForCategory(tss_hit);
+  } else {
+    spi_match = rules->Match(metadata);
+  }
   TryDpiClassify(context, counters, packet, metadata, spi_match, key,
                  action, matched);
 
   if (!matched) {
     if (spi_match.matched) {
-      context.flow_table->Insert(key, FlowEntry{.action = spi_match.action, .match_count = 1});
-      ++counters.matched;
-      action = spi_match.action;
-      matched = true;
+      if (context.flow_table->Insert(key, /*match_count=*/1, spi_match.action) != FlowInsertResult::kOk) [[unlikely]] {
+        // Flow table is full (-ENOSPC). Apply configured overflow policy.
+        ++counters.flow_table_full;
+        if (context.flow_overflow_drop) {
+          action = Action::kDrop;
+          matched = true;
+        } else {
+          ++counters.unknown;
+        }
+      } else {
+        ++counters.matched;
+        action = spi_match.action;
+        matched = true;
+      }
     } else {
       ++counters.unknown;
     }
@@ -1043,7 +1308,7 @@ void FinalizePackets(WorkerContext& context,
                      std::span<rte_mbuf*> received_packets,
                      std::span<PacketMetadata> metadata,
                      std::span<FlowKey> keys,
-                     std::span<const std::int32_t> positions,
+                     std::span<const BulkResult> bulk_results,
                      std::span<const std::uint16_t> packet_to_parsed,
                      std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
                      std::vector<std::uint16_t>& transmit_counts,
@@ -1059,7 +1324,7 @@ void FinalizePackets(WorkerContext& context,
     Action action{Action::kForward};
     bool matched{false};
     ResolvePacketAction(context, counters, *packet, metadata[parsed_idx],
-                        keys[parsed_idx], positions[parsed_idx],
+                        keys[parsed_idx], bulk_results[parsed_idx],
                         action, matched);
     const PacketClassification classification{
         .metadata = metadata[parsed_idx], .action = action,
@@ -1075,6 +1340,11 @@ void FinalizePackets(WorkerContext& context,
     std::array<rte_mbuf*, kMaxBurstCapacity>& packets,
     std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
     std::vector<std::uint16_t>& transmit_counts, BurstCounters& counters) noexcept {
+  // Sample rte_rdtsc() once per burst for any future GetEntry-side
+  // last_seen_tsc touch. The bulk path's LookupBulk/GetEntry currently
+  // doesn't read it, but having it ready costs ~1 cycle and lets us
+  // add the touch without per-packet rdtsc later.
+  context.current_burst_tsc = rte_rdtsc();
   const auto received{rte_eth_rx_burst(port_id, context.worker_id, packets.data(), context.burst_size)};
   [[assume(received <= kMaxBurstCapacity)]];
   [[assume(received <= context.burst_size)]];
@@ -1085,15 +1355,16 @@ void FinalizePackets(WorkerContext& context,
 
   std::array<PacketMetadata, kMaxBurstCapacity> metadata{};
   std::array<FlowKey, kMaxBurstCapacity> keys{};
-  std::array<std::int32_t, kMaxBurstCapacity> positions{};
+  std::array<BulkResult, kMaxBurstCapacity> bulk_results{};
   std::array<std::uint16_t, kMaxBurstCapacity> packet_to_parsed{};
 
   const std::span received_packets{packets.data(), received};
   const auto n_parsed{ParseReceivedPackets(received_packets, counters,
       metadata, keys, packet_to_parsed)};
-  BulkFlowLookup(*context.flow_table, keys, n_parsed, positions);
+  BulkFlowLookup(*context.flow_table, keys, n_parsed,
+                 context.current_burst_tsc, bulk_results);
   FinalizePackets(context, active_ports, port_id, received_packets,
-                  metadata, keys, positions, packet_to_parsed,
+                  metadata, keys, bulk_results, packet_to_parsed,
                   transmit_buffers, transmit_counts, counters);
 }
 
@@ -1187,6 +1458,12 @@ void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbu
   BurstCounters burst_counters;
   std::ranges::fill(transmit_counts, 0);
 
+  // Sample rte_rdtsc() once per burst — ForwardPacket → ClassifyPacket
+  // → Lookup uses context.current_burst_tsc for the last_seen_tsc touch.
+  // Single rdtsc amortized across all packets in the burst instead of
+  // one per cache hit (~24 cycles each on Skylake-class).
+  context.current_burst_tsc = rte_rdtsc();
+
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
   const auto received{rte_ring_sc_dequeue_burst(context.dispatch_ring, reinterpret_cast<void**>(packets.data()),
                                                  context.burst_size, nullptr)};
@@ -1229,8 +1506,16 @@ void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbu
   std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>> transmit_buffers(context->environment->GetPortCount());
   std::vector<std::uint16_t> transmit_counts(context->environment->GetPortCount());
 
-  while (*context->force_quit == 0) {
+  while (context->force_quit->load(std::memory_order_relaxed) == 0) {
     ProcessWorkerIteration(*context, packets, transmit_buffers, transmit_counts);
+    // Pause during in-place rule rebuilds. The main lcore sets
+    // `reload_barrier` before doing the rebuild and clears it after;
+    // we observe the flag at the end of each burst and spin
+    // until the main lcore clears it.
+    while (context->reload_barrier != nullptr && context->reload_barrier->load(std::memory_order_acquire) &&
+           context->force_quit->load(std::memory_order_relaxed) == 0) {
+      rte_pause();
+    }
   }
   // Drain any unflushed counters so final stats are accurate.
   FlushAtomicCounters(*context->counters, context->pending_burst);
@@ -1245,8 +1530,12 @@ void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbu
   std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>> transmit_buffers(context->environment->GetPortCount());
   std::vector<std::uint16_t> transmit_counts(context->environment->GetPortCount());
 
-  while (*context->force_quit == 0) {
+  while (context->force_quit->load(std::memory_order_relaxed) == 0) {
     ProcessDispatchedWorkerIteration(*context, packets, transmit_buffers, transmit_counts);
+    while (context->reload_barrier != nullptr && context->reload_barrier->load(std::memory_order_acquire) &&
+           context->force_quit->load(std::memory_order_relaxed) == 0) {
+      rte_pause();
+    }
   }
   // Drain any unflushed counters so final stats are accurate.
   AddDispatchedWorkerCounters(*context->counters, context->pending_burst);
@@ -1271,6 +1560,9 @@ void FlushAtomicCounters(AtomicCounters& counters, const BurstCounters& pending)
   counters.flow_cache_hits.fetch_add(pending.flow_cache_hits, std::memory_order_relaxed);
   counters.dpi_cache_hits.fetch_add(pending.dpi_cache_hits, std::memory_order_relaxed);
   counters.dpi_cache_misses.fetch_add(pending.dpi_cache_misses, std::memory_order_relaxed);
+  counters.dpi_skipped_by_spi.fetch_add(pending.dpi_skipped_by_spi, std::memory_order_relaxed);
+  counters.dpi_skipped_by_link.fetch_add(pending.dpi_skipped_by_link, std::memory_order_relaxed);
+  counters.flow_table_full.fetch_add(pending.flow_table_full, std::memory_order_relaxed);
 }
 
 Pipeline::Pipeline(const dpdk::Environment& environment, RuleTable initial_rules,
@@ -1288,13 +1580,32 @@ Pipeline::Pipeline(const dpdk::Environment& environment, RuleTable initial_rules
       mac_updating_{config.app.mac_updating},
       l3_forwarding_{config.l3_forward.enabled},
       drop_unmatched_{config.spi.drop_unmatched},
-      flow_ttl_sec_{config.spi.flow_ttl_sec} {
-  rule_manager_.Init(std::make_unique<RuleTable>(std::move(initial_rules)));
-  // Hand the dpi_rules unique_ptr to the manager. The manager takes
-  // ownership via release() and stores the raw pointer under its atomic.
+      flow_ttl_sec_{config.spi.flow_ttl_sec},
+      max_concurrent_flows_{config.spi.max_concurrent_flows},
+      flow_overflow_drop_{config.spi.flow_overflow_action == "drop"} {
+  // Allocate the flow cache with the configured hard ceiling. This is the
+  // only place where flow_table_ is constructed — all hot-path lookups and
+  // inserts go through the raw pointer stashed in WorkerContext.
+  flow_table_ = std::make_unique<FlowTable>(max_concurrent_flows_);
+
+  // Hand the dpi_rules unique_ptr to the manager FIRST so we can read the
+  // DPI table pointer via `Load()` to resolve SPI→DPI static links below.
   if (dpi_rules_) {
     dpi_rule_manager_.Init(std::move(dpi_rules_));
   }
+  // Resolve SPI→DPI static links against the active DPI table. Must run
+  // before `rule_manager_.Init` because Init moves the table out of our
+  // reach. `ResolveDpiLinks` mutates `initial_rules.groups_` in place to
+  // populate `bound_dpi_filter_index` from each group's transient
+  // `bound_dpi_name`. After resolution, the transient strings are freed.
+  if (const auto* const dpi_table{dpi_rule_manager_.Load()}; dpi_table != nullptr) {
+    if (const auto resolve_result{initial_rules.ResolveDpiLinks(*dpi_table)}; !resolve_result) {
+      std::println(stderr, "Pipeline init failed: {}", resolve_result.error());
+      std::abort();
+    }
+  }
+
+  rule_manager_.Init(std::make_unique<RuleTable>(std::move(initial_rules)));
 }
 
 Pipeline::~Pipeline() {
@@ -1318,7 +1629,7 @@ std::expected<void, std::string> Pipeline::StartWorkers(WorkerEntryPoint entry_p
         std::format("Need {} worker lcores, found {}", worker_contexts_.size(), worker_lcores.size()));
   }
 
-  worker_force_quit_ = 0;
+  worker_force_quit_.store(0, std::memory_order_relaxed);
   for (std::size_t worker_id{0}; worker_id < worker_contexts_.size(); ++worker_id) {
     if (const auto launched{LaunchWorker(worker_id, worker_lcores[worker_id], entry_point)}; !launched) {
       return std::unexpected(launched.error());
@@ -1339,7 +1650,7 @@ std::expected<void, std::string> Pipeline::LaunchWorker(std::size_t worker_id, u
     return {};
   }
 
-  worker_force_quit_ = 1;
+  worker_force_quit_.store(1, std::memory_order_relaxed);
   rte_eal_mp_wait_lcore();
   return std::unexpected(
       std::format("rte_eal_remote_launch worker {} on lcore {} failed (ret={})", worker_id, lcore_id, ret));
@@ -1350,17 +1661,17 @@ void Pipeline::StopWorkers() noexcept {
     return;
   }
 
-  worker_force_quit_ = 1;
+  worker_force_quit_.store(1, std::memory_order_relaxed);
   rte_eal_mp_wait_lcore();
   workers_started_ = false;
 }
 
-void Pipeline::PrepareWorkerContext(WorkerContext& context, const volatile std::sig_atomic_t& force_quit,
+void Pipeline::PrepareWorkerContext(WorkerContext& context, const std::atomic<int>& force_quit,
                                     std::uint16_t worker_id) noexcept {
   context.environment = &environment_;
   context.rule_manager = &rule_manager_;
   context.dpi_rule_manager = &dpi_rule_manager_;
-  context.flow_table = &flow_table_;
+  context.flow_table = flow_table_.get();
   context.l3_routes = &l3_routes_;
   context.ethernet_destinations = &ethernet_destinations_;
   context.counters = &counters_;
@@ -1375,6 +1686,8 @@ void Pipeline::PrepareWorkerContext(WorkerContext& context, const volatile std::
   context.mac_updating = mac_updating_;
   context.l3_forwarding = l3_forwarding_;
   context.drop_unmatched = drop_unmatched_;
+  context.flow_overflow_drop = flow_overflow_drop_;
+  context.reload_barrier = &reload_barrier_;
 }
 
 std::expected<void, std::string> Pipeline::CreateDispatchRings() noexcept {
@@ -1407,7 +1720,7 @@ void Pipeline::DestroyDispatchRings() noexcept {
   dispatch_rings_.clear();
 }
 
-std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const volatile std::sig_atomic_t& force_quit,
+std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const std::atomic<int>& force_quit,
                                                                     std::uint32_t timer_period_sec) noexcept {
   const auto& active_ports{environment_.GetActivePorts()};
   auto& context{worker_contexts_[0]};
@@ -1429,10 +1742,10 @@ std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const volati
   while (force_quit == 0) {
     ProcessWorkerIteration(context, packets, transmit_buffers, transmit_counts);
     MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
-    MaybeReload(rule_manager_, reload_flag_, config_path_);
+    MaybeReload(rule_manager_, reload_flag_, config_path_, reload_barrier_, *dpi_rule_manager_.Load());
     // Purge expired flow cache entries periodically (same cadence as stats print).
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
-      flow_table_.PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
+      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
     }
   }
 
@@ -1441,7 +1754,7 @@ std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const volati
   return CollectStats(counters_);
 }
 
-std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const volatile std::sig_atomic_t& force_quit,
+std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const std::atomic<int>& force_quit,
                                                                    std::uint32_t timer_period_sec) noexcept {
   if (environment_.GetReceiveQueueCount() < worker_contexts_.size()) {
     return std::unexpected(std::format("queue mode needs receive_queues >= worker_count ({} < {})",
@@ -1467,9 +1780,9 @@ std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const volatil
   const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
   while (force_quit == 0) {
     MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
-    MaybeReload(rule_manager_, reload_flag_, config_path_);
+    MaybeReload(rule_manager_, reload_flag_, config_path_, reload_barrier_, *dpi_rule_manager_.Load());
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
-      flow_table_.PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
+      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
     }
     rte_pause();
   }
@@ -1480,7 +1793,7 @@ std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const volatil
   return CollectStats(counters_);
 }
 
-std::expected<PipelineStats, std::string> Pipeline::RunFlowHashDispatch(const volatile std::sig_atomic_t& force_quit,
+std::expected<PipelineStats, std::string> Pipeline::RunFlowHashDispatch(const std::atomic<int>& force_quit,
                                                                         std::uint32_t timer_period_sec) noexcept {
   if (environment_.GetTransmitQueueCount() < worker_contexts_.size()) {
     return std::unexpected(std::format("flow_hash mode needs transmit_queues >= worker_count ({} < {})",
@@ -1505,9 +1818,9 @@ std::expected<PipelineStats, std::string> Pipeline::RunFlowHashDispatch(const vo
   while (force_quit == 0) {
     ProcessDispatchIteration(environment_, burst_size_, packets, dispatch_rings, counters_);
     MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
-    MaybeReload(rule_manager_, reload_flag_, config_path_);
+    MaybeReload(rule_manager_, reload_flag_, config_path_, reload_barrier_, *dpi_rule_manager_.Load());
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
-      flow_table_.PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
+      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
     }
   }
 
@@ -1527,8 +1840,8 @@ void Pipeline::CollectWorkerRuleCounts() noexcept {
   }
 }
 
-std::expected<PipelineStats, std::string> Pipeline::RunUntilStopped(const volatile std::sig_atomic_t& force_quit,
-                                                                    volatile std::sig_atomic_t& reload_flag,
+std::expected<PipelineStats, std::string> Pipeline::RunUntilStopped(const std::atomic<int>& force_quit,
+                                                                    std::atomic<int>& reload_flag,
                                                                     const std::string& config_path,
                                                                     std::uint32_t timer_period_sec) noexcept {
   config_path_ = config_path;

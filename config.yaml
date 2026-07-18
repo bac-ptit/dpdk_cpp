@@ -1,239 +1,220 @@
-# ============================================================================
-# DPDK FastAPI configuration
-#
-# Layout:
-#   1. eal           - Environment Abstraction Layer (hardware init)
-#   2. app           - Application-level settings (burst, MAC, stats)
-#   3. l3_forward    - L3 routing + queue-to-lcore mappings
-#   4. mempool       - Pre-allocated mbuf pool
-#   5. port          - Per-port settings (link, descriptors, queues)
-#   6. pcap_injector - Replay pcap files into the pipeline (bench only)
-#   7. spi           - SPI filter groups (L3/L4 rules)        <- rules
-#   8. dpi           - DPI hostname filters   (L7 rules)       <- rules
-# ============================================================================
-
-# EAL (Environment Abstraction Layer) configuration — the low-level abstraction that
-# allows DPDK to access hardware resources like CPU cores, memory, and network devices.
-eal:
-  # Comma-separated list or range of logical CPU cores to use (0 = main, 1-N = workers).
-  cpu_core_list: 0-15
-  # Prefix for shared memory and hugepage files to isolate multiple DPDK instances.
-  file_prefix: spifast
-  # Use legacy memory mode (allocate all memory at startup instead of dynamic allocation).
-  legacy_memory: true
-  # Log level for DPDK (7 = debug, 6 = info, 5 = warning, 4 = error).
-  log_level: '7'
-  # Number of memory channels (depends on motherboard architecture; typically 2 or 4).
-  memory_channels: 2
-  # Amount of memory to allocate when legacy_memory is enabled, in megabytes.
-  memory_size: '1500'
-  # Disable the use of hugepages (required when running in virtual environments without hugepage support).
-  disable_hugepages: false
-  # Disable PCI device scanning (required when using virtual devices instead of physical PCI hardware).
-  disable_pci: true
-  # DPDK process type: "primary" (first instance) or "secondary" (attaches to a primary).
-  process_type: primary
-  # Virtual devices — software-based DPDK ports that do not require physical NIC hardware.
-  # net_pcap PMD reads packets from pcap files (used for reproducible benchmarks).
-  # rx_pcap is repeated to merge multiple shard files into one rx queue.
-  # infinite_rx=1 loops the file forever instead of returning ENODATA at EOF.
-  virtual_devices:
-  - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q1.pcap,infinite_rx=1
-
-# Application-level settings — burst size, MAC update, stats interval.
 app:
-  # Maximum number of packets to receive or transmit in a single burst call.
-  burst_size: 64
-  # Whether to automatically rewrite source and destination MAC addresses on forwarded frames.
+  burst_size: 128
   mac_updating: false
-  # Interval in seconds between periodic statistics output (0 = disable).
   timer_period_sec: 5
-
-# L3 (Layer 3 / Network Layer) forwarding configuration — routes packets based on
-# destination IP address using a routing table (longest prefix match).
-l3_forward:
-  # Enable or disable L3 forwarding. When enabled, L3 routing overrides default L2 port pairing.
-  enabled: false
-  # Routing lookup method: "lpm" (Longest Prefix Match) for IPv4 routing.
-  lookup_method: lpm
-  # Static IPv4 routing table — maps destination subnets to output ports.
-  ipv4_routes:
-  # Traffic destined for 192.168.100.0/24 goes to output port 0 (virtual bridge virbr1).
-  - destination_ip_address: 192.168.100.0
-    prefix_length: 24
-    output_port: 0
-  # Traffic destined for 192.168.200.0/24 goes to output port 1 (virtual bridge virbr2).
-  - destination_ip_address: 192.168.200.0
-    prefix_length: 24
-    output_port: 1
-  # MAC address table — maps each output port to the destination MAC address to write
-  # into the Ethernet header of forwarded packets.
-  ethernet_destinations:
-  # Port 0 delivers to the MAC address of VM1 (the virtual machine on virtual bridge virbr1).
-  - port_id: 0
-    mac_address: 52:54:00:5a:2c:95
-  # Port 1 delivers to the MAC address of VM2 (the virtual machine on virtual bridge virbr2).
-  - port_id: 1
-    mac_address: 52:54:00:fe:7b:5d
-  # Mapping from (port, queue) pairs to the logical core that processes them.
-  # Port 0 — 11 rx queues, distributed across lcores 1-11 (one worker per queue).
-  queue_mappings:
-  - {port_id: 0, queue_id: 0, lcore_id: 1}
-  - {port_id: 0, queue_id: 1, lcore_id: 2}
-  - {port_id: 0, queue_id: 2, lcore_id: 3}
-  - {port_id: 0, queue_id: 3, lcore_id: 4}
-  - {port_id: 0, queue_id: 4, lcore_id: 5}
-  - {port_id: 0, queue_id: 5, lcore_id: 6}
-  - {port_id: 0, queue_id: 6, lcore_id: 7}
-  - {port_id: 0, queue_id: 7, lcore_id: 8}
-  - {port_id: 0, queue_id: 8, lcore_id: 9}
-  - {port_id: 0, queue_id: 9, lcore_id: 10}
-  - {port_id: 0, queue_id: 10, lcore_id: 11}
-  # Port 1 — 11 rx queues, same workers (cross-port shared worker pool).
-  - {port_id: 1, queue_id: 0, lcore_id: 1}
-  - {port_id: 1, queue_id: 1, lcore_id: 2}
-  - {port_id: 1, queue_id: 2, lcore_id: 3}
-  - {port_id: 1, queue_id: 3, lcore_id: 4}
-  - {port_id: 1, queue_id: 4, lcore_id: 5}
-  - {port_id: 1, queue_id: 5, lcore_id: 6}
-  - {port_id: 1, queue_id: 6, lcore_id: 7}
-  - {port_id: 1, queue_id: 7, lcore_id: 8}
-  - {port_id: 1, queue_id: 8, lcore_id: 9}
-  - {port_id: 1, queue_id: 9, lcore_id: 10}
-  - {port_id: 1, queue_id: 10, lcore_id: 11}
-
-# Mempool (memory buffer pool) configuration — pre-allocated pool of fixed-size packet
-# buffers (mbufs) used by DPDK to store received and transmitted packets.
-mempool:
-  # Per-core cache size: each logical core caches this many mbufs to avoid lock contention.
-  cache_size: 256
-  # Size of each individual memory buffer (mbuf) in bytes — must be large enough to hold
-  # the maximum expected packet (including headers).
-  memory_buffer_size: 2176
-  # Name of the memory pool, used for identification in DPDK logs and debugging.
-  name: mbuf_pool
-  # Total number of memory buffers (mbufs) pre-allocated in the pool.
-  memory_buffer_count: 200000
-
-# Port (physical or virtual network interface) configuration for DPDK Ethernet devices.
-port:
-  # Interval in milliseconds between link status polling attempts.
-  link_check_interval_ms: 100
-  # Maximum number of link status polling attempts before giving up.
-  link_check_max_count: 90
-  # Link speed in megabits per second (0 means auto-negotiate / don't care).
-  link_speed: 0
-  # Bitmask of port indices to enable in hexadecimal format.
-  # '0x0' means no physical ports are managed by the port subsystem
-  # (virtual PMD ports like net_pcap/net_af_packet are still active).
-  port_bitmask: '0x0'
-  # Enable promiscuous mode — accept all packets on the port regardless of destination MAC.
-  promiscuous: true
-  # Number of receive descriptors in the hardware ring buffer for each receive queue.
-  receive_descriptors: 1024
-  # Number of receiver queues to configure on each port (0 = let PMD pick).
-  receive_queues: 0
-  # Number of transmitted descriptors in the hardware ring buffer for each transmit queue.
-  transmit_descriptors: 1024
-  # Number of transmitted queues to configure on each port (0 = let PMD pick).
-  transmit_queues: 0
-
-# pcap_injector — feeds pcap shards directly into the pipeline as a synthetic source.
-# Used for reproducible DPI benchmarks without needing a live interface.
-pcap_injector:
-  # Master switch for the injector (when false, the pipeline relies solely on net_pcap PMD).
-  enabled: true
-  # Maximum packets per burst pulled from the pcap and pushed into the rx path.
-  inject_burst_size: 64
-  # Number of times to loop over the pcap (0 = loop forever).
-  loop_count: 0
-  # Path to a single pcap shard matching DPI traffic shape (TLS ClientHello with SNI).
-  pcap_file: /home/bac/programming/viettel/dpdk_cpp/test/dpi_bench_shards/dpi_bench_q0.pcap
-  # Port id that the injector is logically associated with (used for stats only).
-  receive_port_id: 0
-
-# ============================================================================
-# SPI (Shallow Packet Inspection) configuration — classifies packets by matching
-# header fields (IP addresses, ports, protocol) against a set of user-defined rules.
-#
-# Hierarchical filter groups — sorted by precedence (ascending, smallest = highest priority).
-# Any filter matching within a group means the group matches. First matching group wins.
-# ============================================================================
-spi:
-  # Number of worker cores dedicated to packet processing.
-  worker_count: 15
-  # Packet distribution mode:
-  # - auto: queue mode for RSS-capable real NICs, flow_hash for vNIC/PCAP/software PMDs.
-  # - queue: one RX/TX queue per worker.
-  # - flow_hash: main lcore receives packets and hashes flows to worker rings.
-  packet_distribution: queue
-  # Per-worker rte_ring size used only by flow_hash mode.
-  dispatch_queue_size: 32768
-  # When true, any packet that does not match any rule is silently dropped.
-  drop_unmatched: true
-  filter_groups:
-    # --- Facebook (precedence 100) ---
-    - name: fg_l34_facebook
-      precedence: 100
-      action: forward
-      filters:
-        - {destination_ip_address: "31.13.64.0/18", protocol: tcp, label: facebook_1}
-        - {destination_ip_address: "66.220.144.0/20", protocol: tcp, label: facebook_2}
-        - {destination_ip_address: "69.63.176.0/20", protocol: tcp, label: facebook_3}
-        - {destination_ip_address: "157.240.0.0/16", protocol: tcp, label: facebook_4}
-        - {destination_ip_address: "69.220.144.5", protocol: tcp, label: facebook_5}
-
-    # --- YouTube (precedence 101) ---
-    - name: fg_l34_youtube
-      precedence: 101
-      action: forward
-      filters:
-        - {destination_ip_address: "142.250.0.0/15", destination_port: 443, protocol: tcp, label: youtube_1}
-        - {destination_ip_address: "172.217.0.0/16", destination_port: 443, protocol: tcp, label: youtube_2}
-        - {destination_ip_address: "216.58.192.0/19", destination_port: 443, protocol: tcp, label: youtube_3}
-        - {destination_ip_address: "74.125.0.1", destination_port: 443, protocol: tcp, label: youtube_4}
-
-    # --- HTTP (precedence 102) ---
-    - name: fg_l34_http
-      precedence: 102
-      action: forward
-      filters:
-        - {destination_port: 80, protocol: tcp, label: http_all}
-
-    # --- HTTPS (precedence 103) ---
-    - name: fg_l34_https
-      precedence: 103
-      action: forward
-      filters:
-        - {destination_port: 443, protocol: tcp, label: https_all}
-
-    # --- DNS (precedence 104) ---
-    - name: fg_l34_dns
-      precedence: 104
-      action: forward
-      filters:
-        - {destination_port: 53, protocol: udp, label: dns_udp}
-        - {destination_port: 53, protocol: tcp, label: dns_tcp}
-
-    # --- UDP Drop (precedence 106) ---
-    - name: fg_l34_udp_sdf1006
-      precedence: 106
-      action: drop
-      filters:
-        - {destination_port: 9999, protocol: udp, label: udp_drop}
-
-# ============================================================================
-# DPI (Deep Packet Inspection) — L7 hostname classification via TLS SNI / HTTP Host.
-# Extracts hostname from first data packet of each TCP connection.
-# ============================================================================
 dpi:
   enabled: true
+  # DPI rule groups referenced by SPI's `dpi_filter_group` link.
+  # Priorities ASC — highest-priority rule wins per hostname.
+  # fg_l7_*_filter groups are linked from SPI; fg_l7_catchall covers
+  # anything not pre-classified by SPI.
   filters:
-    # --- Facebook (priority 10) ---
-    - {hostname_pattern: "*.facebook.com", filter_group: fg_l7_facebook, priority: 10, label: facebook}
-    # --- Google (priority 30) ---
-    - {hostname_pattern: "*.google.com", filter_group: fg_l7_google, priority: 30, label: google}
-    # --- YouTube (priority 20) ---
-    - {hostname_pattern: "*.youtube.com", filter_group: fg_l7_youtube, priority: 20, label: youtube}
-    # --- Catch-all (priority 999) ---
-    - {hostname_pattern: "*", filter_group: fg_l7_default, priority: 999, label: default}
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.facebook.com'
+    label: facebook
+    priority: 10
+  - filter_group: fg_l7_youtube
+    hostname_pattern: '*.youtube.com'
+    label: youtube
+    priority: 20
+  - filter_group: fg_l7_google
+    hostname_pattern: '*.google.com'
+    label: google
+    priority: 30
+  - filter_group: fg_l7_catchall
+    hostname_pattern: '*'
+    label: catchall
+    priority: 999
+eal:
+  cpu_core_list: 0-4
+  disable_hugepages: false
+  disable_pci: true
+  file_prefix: spifast
+  legacy_memory: true
+  log_level: '7'
+  memory_channels: 2
+  memory_size: '3418'
+  process_type: primary
+  virtual_devices:
+  - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q1.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q2.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q3.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q4.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q5.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q6.pcap,infinite_rx=1
+l3_forward:
+  enabled: false
+  ethernet_destinations:
+  - mac_address: 52:54:00:5a:2c:95
+    port_id: 0
+  - mac_address: 52:54:00:fe:7b:5d
+    port_id: 1
+  ipv4_routes:
+  - destination_ip_address: 192.168.100.0
+    output_port: 0
+    prefix_length: 24
+  - destination_ip_address: 192.168.200.0
+    output_port: 1
+    prefix_length: 24
+  lookup_method: lpm
+  queue_mappings:
+  - lcore_id: 1
+    port_id: 0
+    queue_id: 0
+  - lcore_id: 2
+    port_id: 0
+    queue_id: 1
+  - lcore_id: 3
+    port_id: 0
+    queue_id: 2
+  - lcore_id: 4
+    port_id: 0
+    queue_id: 3
+  - lcore_id: 5
+    port_id: 0
+    queue_id: 4
+  - lcore_id: 6
+    port_id: 0
+    queue_id: 5
+  - lcore_id: 7
+    port_id: 0
+    queue_id: 6
+  - lcore_id: 8
+    port_id: 0
+    queue_id: 7
+  - lcore_id: 9
+    port_id: 0
+    queue_id: 8
+  - lcore_id: 10
+    port_id: 0
+    queue_id: 9
+  - lcore_id: 11
+    port_id: 0
+    queue_id: 10
+  - lcore_id: 1
+    port_id: 1
+    queue_id: 0
+  - lcore_id: 2
+    port_id: 1
+    queue_id: 1
+  - lcore_id: 3
+    port_id: 1
+    queue_id: 2
+  - lcore_id: 4
+    port_id: 1
+    queue_id: 3
+  - lcore_id: 5
+    port_id: 1
+    queue_id: 4
+  - lcore_id: 6
+    port_id: 1
+    queue_id: 5
+  - lcore_id: 7
+    port_id: 1
+    queue_id: 6
+  - lcore_id: 8
+    port_id: 1
+    queue_id: 7
+  - lcore_id: 9
+    port_id: 1
+    queue_id: 8
+  - lcore_id: 10
+    port_id: 1
+    queue_id: 9
+  - lcore_id: 11
+    port_id: 1
+    queue_id: 10
+mempool:
+  cache_size: 256
+  memory_buffer_count: 1000250
+  memory_buffer_size: 2176
+  name: mbuf_pool
+pcap_injector:
+  enabled: false
+port:
+  link_check_interval_ms: 100
+  link_check_max_count: 90
+  link_speed: 0
+  port_bitmask: '0x1'
+  promiscuous: true
+  receive_descriptors: 1024
+  receive_queues: 7
+  transmit_descriptors: 1024
+  transmit_queues: 7
+spi:
+  dispatch_queue_size: 8192
+  drop_unmatched: true
+  filter_groups:
+  # ────────────────────────────────────────────────────────────────────
+  # DPI-OPT-IN GROUPS — IP ranges that unambiguously identify an app.
+  # `l7_required: true` keeps DPI alive for them, AND
+  # `dpi_filter_group` STATICALLY LINKS the SPI match to the matching DPI
+  # group — so when SPI matches, the per-packet ExtractHostname + MatchDpi
+  # cost is skipped entirely (O(1) cached forward). Empty packets on these
+  # IPs flow straight to the flow cache. See docs_search/15_spi_to_dpi_link.md.
+  # ────────────────────────────────────────────────────────────────────
+  - action: forward
+    dpi_filter_group: fg_l7_facebook
+    filters:
+    - destination_ip_address: 31.13.64.0/18
+      label: facebook_1
+      protocol: tcp
+    - destination_ip_address: 66.220.144.0/20
+      label: facebook_2
+      protocol: tcp
+    - destination_ip_address: 69.63.176.0/20
+      label: facebook_3
+      protocol: tcp
+    - destination_ip_address: 157.240.0.0/16
+      label: facebook_4
+      protocol: tcp
+    - destination_ip_address: 69.220.144.5
+      label: facebook_5
+      protocol: tcp
+    l7_required: true
+    name: fg_l34_facebook
+    precedence: 100
+  - action: forward
+    dpi_filter_group: fg_l7_youtube
+    filters:
+    - destination_ip_address: 142.250.0.0/15
+      destination_port: 443
+      label: youtube_1
+      protocol: tcp
+    - destination_ip_address: 172.217.0.0/16
+      destination_port: 443
+      label: youtube_2
+      protocol: tcp
+    - destination_ip_address: 216.58.192.0/19
+      destination_port: 443
+      label: youtube_3
+      protocol: tcp
+    - destination_ip_address: 74.125.0.1
+      destination_port: 443
+      label: youtube_4
+      protocol: tcp
+    l7_required: true
+    name: fg_l34_youtube
+    precedence: 101
+  # ────────────────────────────────────────────────────────────────────
+  # COARSE L3/L4 GROUPS — match broad traffic but DO NOT touch L7.
+  # l7_required defaults to false so even when DPI is enabled, these
+  # groups short-circuit DPI on every packet → zero per-packet DPI cost.
+  # ────────────────────────────────────────────────────────────────────
+  - action: forward
+    filters:
+    - destination_port: 53
+      label: dns_udp
+      protocol: udp
+    - destination_port: 53
+      label: dns_tcp
+      protocol: tcp
+    name: fg_l34_dns
+    precedence: 104
+  - action: drop
+    filters:
+    - destination_port: 9999
+      label: udp_drop
+      protocol: udp
+    name: fg_l34_udp_sdf1006
+    precedence: 106
+  flow_overflow_action: drop
+  flow_ttl_sec: 300
+  max_concurrent_flows: 1000000
+  packet_distribution: auto
+  worker_count: 4

@@ -39,6 +39,20 @@ struct PipelineStats {
   std::uint64_t flow_cache_hits{};
   std::uint64_t dpi_cache_hits{};
   std::uint64_t dpi_cache_misses{};
+  /// Packets that would have triggered DPI but were short-circuited by
+  /// SPI gating (l7_required: false on the matched group, response-direction
+  /// skip, or non-TCP / non-{80,443}). The delta between this and
+  /// `parsed` shows how much DPI work the SPI rules are saving.
+  std::uint64_t dpi_skipped_by_spi{};
+  /// Packets that hit the SPI→DPI static-link fast path: SPI match
+  /// already determined the DPI group via `dpi_filter_group` in the config,
+  /// so ExtractHostname + MatchDpi were skipped. Flow cache takes the SPI
+  /// action directly. Operators use this counter to verify the link is
+  /// firing on real traffic.
+  std::uint64_t dpi_skipped_by_link{};
+  /// Flow-table `rte_hash_add_key` returned `-ENOSPC` (table full).
+  /// Incremented for every Insert failure; visible via the periodic stats print.
+  std::uint64_t flow_table_full{};
 };
 
 /// Cache-line-aligned atomic counters shared between workers and stats thread.
@@ -54,6 +68,9 @@ struct alignas(64) AtomicCounters {
   std::atomic<std::uint64_t> flow_cache_hits{};
   std::atomic<std::uint64_t> dpi_cache_hits{};
   std::atomic<std::uint64_t> dpi_cache_misses{};
+  std::atomic<std::uint64_t> dpi_skipped_by_spi{};
+  std::atomic<std::uint64_t> dpi_skipped_by_link{};
+  std::atomic<std::uint64_t> flow_table_full{};
 };
 
 /// Per-burst counters accumulated in a single worker iteration.
@@ -69,6 +86,9 @@ struct BurstCounters {
   std::uint64_t flow_cache_hits{};
   std::uint64_t dpi_cache_hits{};
   std::uint64_t dpi_cache_misses{};
+  std::uint64_t dpi_skipped_by_spi{};
+  std::uint64_t dpi_skipped_by_link{};
+  std::uint64_t flow_table_full{};
 };
 
 /// Flush pending BurstCounters into the shared AtomicCounters.
@@ -115,12 +135,26 @@ struct alignas(64) WorkerContext {
   std::uint32_t bursts_since_flush{};
   std::vector<std::uint64_t> rule_match_counts;
   rte_ring* dispatch_ring{};
-  const volatile std::sig_atomic_t* force_quit{};
+  /// Force-quit flag polled by the worker loop. `std::atomic<int>` so
+  /// the cross-lcore access (main lcore writes, worker reads) is
+  /// well-defined per the C++ memory model. In multi-worker mode this
+  /// points to `Pipeline::worker_force_quit_`; in single-worker mode
+  /// it points to the global `dpdk::ForceQuitFlag()` set by the
+  /// signal handler.
+  const std::atomic<int>* force_quit{};
   std::uint16_t burst_size{};
   std::uint16_t worker_id{};
   bool mac_updating{true};
   bool l3_forwarding{false};
   bool drop_unmatched{false};
+  /// When the flow cache is full, drop the packet (true) or forward it
+  /// without caching (false). Mirrors `SpiConfig::flow_overflow_action`.
+  bool flow_overflow_drop{true};
+  /// Set to `true` by `MaybeReload` for the duration of an in-place rule
+  /// rebuild; workers busy-wait while this is set. Combined with the
+  /// `rte_eal_mp_wait_lcore` symmetric wait, this guarantees no worker
+  /// is in the middle of `RuleTable::Match` when `RebuildInPlace` runs.
+  const std::atomic<bool>* reload_barrier{nullptr};
 
   /// Per-worker hostname → DPI result cache. Avoids re-running
   /// ExtractTlsSni/ExtractHttpHost + DpiRuleTable::Match for hostnames
@@ -128,6 +162,13 @@ struct alignas(64) WorkerContext {
   /// with the hot fields above.
   static constexpr std::size_t kWorkerCacheLineBytes{64};
   alignas(kWorkerCacheLineBytes) dpi::HostnameCache dpi_hostname_cache;
+  /// Cached `rte_rdtsc()` sampled once per burst (ProcessPortBurst,
+  /// ProcessDispatchedWorkerIteration). Passed through to Lookup() so the
+  /// per-packet hot path avoids one `rdtsc` (~24 cycles on Skylake-class)
+  /// per cache hit. Refreshed at the top of every burst; lies on the
+  /// same cache line as `dpi_hostname_cache` (aligned 64 B) to keep it
+  /// out of the hot-fields cacheline.
+  std::uint64_t current_burst_tsc{};
 };
 
 /**
@@ -174,8 +215,8 @@ class Pipeline final {
    * @param timer_period_sec Seconds between periodic stats prints (0=off).
    * @return Final pipeline statistics after the loop exits.
    */
-  [[nodiscard]] std::expected<PipelineStats, std::string> RunUntilStopped(const volatile std::sig_atomic_t& force_quit,
-                                                                          volatile std::sig_atomic_t& reload_flag,
+  [[nodiscard]] std::expected<PipelineStats, std::string> RunUntilStopped(const std::atomic<int>& force_quit,
+                                                                          std::atomic<int>& reload_flag,
                                                                           const std::string& config_path,
                                                                           std::uint32_t timer_period_sec) noexcept;
 
@@ -212,20 +253,20 @@ class Pipeline final {
    * @brief Run the hot path on the calling (main) lcore.
    * @return Final pipeline statistics.
    */
-  [[nodiscard]] std::expected<PipelineStats, std::string> RunSingleWorker(const volatile std::sig_atomic_t& force_quit,
+  [[nodiscard]] std::expected<PipelineStats, std::string> RunSingleWorker(const std::atomic<int>& force_quit,
                                                                           std::uint32_t timer_period_sec) noexcept;
   /**
    * @brief Run workers on remote lcores, poll on main lcore.
    * @return Final pipeline statistics.
    */
-  [[nodiscard]] std::expected<PipelineStats, std::string> RunMultiWorker(const volatile std::sig_atomic_t& force_quit,
+  [[nodiscard]] std::expected<PipelineStats, std::string> RunMultiWorker(const std::atomic<int>& force_quit,
                                                                          std::uint32_t timer_period_sec) noexcept;
   /**
    * @brief Run software flow-hash dispatch on main lcore plus remote workers.
    * @return Final pipeline statistics.
    */
   [[nodiscard]] std::expected<PipelineStats, std::string> RunFlowHashDispatch(
-      const volatile std::sig_atomic_t& force_quit, std::uint32_t timer_period_sec) noexcept;
+      const std::atomic<int>& force_quit, std::uint32_t timer_period_sec) noexcept;
   /**
    * @brief Read packets from a pcap file and push them into the dispatcher
    *        rings instead of calling rte_eth_rx_burst. Used to integrate
@@ -234,7 +275,7 @@ class Pipeline final {
    * @return Final pipeline statistics.
    */
   [[nodiscard]] std::expected<PipelineStats, std::string> RunPcapInjectDispatch(
-      const volatile std::sig_atomic_t& force_quit, std::uint32_t timer_period_sec) noexcept;
+      const std::atomic<int>& force_quit, std::uint32_t timer_period_sec) noexcept;
   /**
    * @brief Allocate per-worker rte_rings for flow-hash dispatch mode.
    */
@@ -249,7 +290,7 @@ class Pipeline final {
    * @param force_quit Signal flag pointer for the worker.
    * @param worker_id  Zero-based worker index.
    */
-  void PrepareWorkerContext(WorkerContext& context, const volatile std::sig_atomic_t& force_quit,
+  void PrepareWorkerContext(WorkerContext& context, const std::atomic<int>& force_quit,
                             std::uint16_t worker_id) noexcept;
   /**
    * @brief Sum per-rule match counters across all workers.
@@ -264,10 +305,10 @@ class Pipeline final {
   RuleTableManager rule_manager_;
   std::unique_ptr<dpi::DpiRuleTable> dpi_rules_;  ///< Pre-reload table (kept alive until manager Init).
   dpi::DpiRuleTableManager dpi_rule_manager_;    ///< Atomic-pointer DPI table for hot-reload.
-  FlowTable flow_table_;
+  std::unique_ptr<FlowTable> flow_table_;
   AtomicCounters counters_;
   std::string config_path_;
-  volatile std::sig_atomic_t* reload_flag_{nullptr};
+  std::atomic<int>* reload_flag_{nullptr};
   std::vector<std::uint64_t> rule_match_counts_;
   std::vector<WorkerContext> worker_contexts_;
   std::vector<rte_ring*> dispatch_rings_;
@@ -281,7 +322,25 @@ class Pipeline final {
   bool l3_forwarding_{false};
   bool drop_unmatched_{false};
   std::uint32_t flow_ttl_sec_{300};
-  volatile std::sig_atomic_t worker_force_quit_{0};
+  /// Hard ceiling on concurrent flow cache entries. Sized once at startup;
+  /// the rte_hash table never grows past this.
+  std::uint32_t max_concurrent_flows_{1'000'000};
+  /// Policy when flow table is full: "drop" (default, observable via
+  /// `flow_table_full`) or "reclassify" (forward without caching).
+  bool flow_overflow_drop_{true};
+  /// Set by `MaybeReload` for the duration of an in-place rule rebuild;
+  /// workers busy-wait while this is true. Reset by the main lcore once
+  /// the rebuild completes.
+  std::atomic<bool> reload_barrier_{false};
+  /// Per-Pipeline worker quit flag. Main lcore sets it to 1 in
+  /// `StopWorkers`; workers poll it every burst. `std::atomic<int>`
+  /// rather than `volatile sig_atomic_t` so the cross-lcore access is
+  /// well-defined per the C++ memory model (the POSIX `volatile
+  /// sig_atomic_t` idiom is correct for signal-handler→main only,
+  /// not main→worker). The signal-handler-driven global
+  /// `force_quit` in `app_signal.cpp` keeps the POSIX idiom because
+  /// it IS only touched by the signal handler + main lcore.
+  std::atomic<int> worker_force_quit_{0};
   bool workers_started_{false};
 };
 
