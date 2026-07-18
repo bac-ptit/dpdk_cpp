@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "dpdk/config/dpdk_config.hpp"
+#include <rte_vect.h>
 
 namespace {
 
@@ -243,6 +244,16 @@ std::expected<void, DpdkError> Environment::InitEal() noexcept {
   // there is no error to propagate. If SSE4.2 is unavailable, the function
   // is a no-op and the auto-detect fallback remains in effect.
   rte_hash_crc_set_alg(CRC32_SSE42_x64);
+
+  // Pin the widest SIMD bitwidth DPDK should vectorize at runtime. On
+  // AVX-512 capable CPUs (Xeon Skylake-X / Sapphire Rapids) this unlocks
+  // the AVX-512 path in `rte_acl_classify` — Intel's AVX-512 brief
+  // reports up to 3× faster ACL flow searches vs scalar. On this WSL2
+  // host (no AVX-512) it is a no-op; DPDK remains on AVX2. The call
+  // returns -ENOTSUP on hosts that have no wider-than-default bitwidth to
+  // offer — we ignore that case. See
+  // docs_search/17_os_skip_optimizations.md §3.
+  (void)rte_vect_set_max_simd_bitwidth(/*RTE_VECT_SIMD_MAX=*/512);
 
   port_count_ = rte_eth_dev_count_avail();
   if (port_count_ == 0 && !skip_ports_) {
