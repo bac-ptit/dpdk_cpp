@@ -1,5 +1,5 @@
-spi -> link tới dpi
-chương trình hiện tại: đang là O(logn), xử lý sao cho sử dụng spi phù hợp, chỉnh sửa các rule cần thiết đẻ hạn chế nhất có thể, cái này chủ yếu chắc trong file config.
+### spi -> link tới dpi
+### chương trình hiện tại: đang là O(logn), xử lý sao cho sử dụng spi phù hợp, chỉnh sửa các rule cần thiết đẻ hạn chế nhất có thể, cái này chủ yếu chắc trong file config.
 
 Hạn chế DPI:
 check METHOD
