@@ -276,7 +276,7 @@ void RunDpiCycle(const std::vector<rte_mbuf*>& mbufs, dpdk::dpi::DpiRuleTable& r
     }
     hostname = {host_result->first, host_result->second};
 
-    const auto cached_idx{cache.Lookup(hostname)};
+    const auto cached_idx{cache.Lookup(hostname, /*current_generation=*/0U)};
     if (cached_idx != dpdk::dpi::HostnameCache::kNoMatchIdx) [[likely]] {
       ++c.dpi_cache_hits;
       continue;
@@ -289,7 +289,8 @@ void RunDpiCycle(const std::vector<rte_mbuf*>& mbufs, dpdk::dpi::DpiRuleTable& r
     if (matched.matched) {
       ++c.dpi_match_after_miss;
     }
-    cache.Insert(hostname, matched.matched ? 1U : dpdk::dpi::HostnameCache::kNoMatchIdx);
+    cache.Insert(hostname, matched.matched ? 1U : dpdk::dpi::HostnameCache::kNoMatchIdx,
+                 /*current_generation=*/0U);
   }
 }
 

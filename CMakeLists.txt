@@ -75,7 +75,7 @@ target_link_libraries(${FASTAPI_APP_TARGET} PRIVATE
         ${FASTAPI_DPDK_ALIAS}
         ${FASTAPI_PCAP_ALIAS}
         -Wl,--end-group)
-target_compile_definitions(${FASTAPI_APP_TARGET} PRIVATE CONFIG_PATH="${CMAKE_CURRENT_BINARY_DIR}/config.yaml")
+target_compile_definitions(${FASTAPI_APP_TARGET} PRIVATE CONFIG_PATH="./config.yaml")
 
 # Copy config.yaml to build dir so it sits next to the executable
 configure_file(${CMAKE_SOURCE_DIR}/config.yaml ${CMAKE_CURRENT_BINARY_DIR}/config.yaml COPYONLY)

@@ -9,32 +9,36 @@ preview = ["pixi-build"]
 [dependencies]
 clang = ">=22"
 cmake = ">=4.0"
+pyyaml = ">=6.0.3,<7"
+
+[activation.env]
+PKG_CONFIG_PATH = "/usr/lib64/pkgconfig"
 
 [tasks]
-cmake = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --preset pixi"
-cmake-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --preset pixi-release"
-build = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --build --preset pixi-debug"
-build-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --preset pixi-release && env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH cmake --build --preset pixi-release"
+cmake = "cmake --preset pixi"
+cmake-release = "cmake --preset pixi-release"
+build = "cmake --build --preset pixi-debug"
+build-release = "cmake --preset pixi-release && cmake --build --preset pixi-release"
 clean = "rm -rf cmake-build-debug cmake-build-release build_debug build"
-install = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH ./script/install.sh"
-run = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh run"
-run-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh run"
-test-pcap = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh pcap"
-bench = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000"
-bench-pcap = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000"
-bench-pcap-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000"
-bench-afpacket = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh bench-afpacket 16"
-bench-afpacket-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-afpacket 16"
+install = "./script/install.sh"
+run = "BUILD_DIR=cmake-build-debug ./test/test_env.sh run"
+run-release = "BUILD_DIR=cmake-build-release ./test/test_env.sh run"
+test-pcap = "BUILD_DIR=cmake-build-release ./test/test_env.sh pcap"
+bench = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000"
+bench-pcap = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000"
+bench-pcap-release = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000"
+bench-afpacket = "BUILD_DIR=cmake-build-debug ./test/test_env.sh bench-afpacket 16"
+bench-afpacket-release = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-afpacket 16"
 # Run app with generated PCAP test traffic (SPI + DPI rules from config.yaml)
-test-pcap-debug = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"
+test-pcap-debug = "BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"
 # Run app with a custom PCAP file (pass path as argument)
-run-pcap = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"
+run-pcap = "BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"
 # Verify SPI rules match lv3.csv — generate traffic, run app, check stats
-test-spi = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH python3 test/test_spi_rules.py"
-verify-rules-release = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH python3 test/verify_rules.py --build-dir cmake-build-release"
-docs = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH doxygen Doxyfile"
-benchmark = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH ./script/benchmark.sh 1000000 15 100"
-test = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH python3 test/test_spi_rules.py"
+test-spi = "python3 test/test_spi_rules.py"
+verify-rules-release = "python3 test/verify_rules.py --build-dir cmake-build-release"
+docs = "doxygen Doxyfile"
+benchmark = "./script/benchmark.sh 1000000 15 100"
+test = "python3 test/test_spi_rules.py"
 # Hot-reload FastAPI config from disk without restarting workers.
 # 1. Copies source config.yaml into cmake-build-release/ (FastAPI reads
 #    from there via its compile-time CONFIG_PATH).
@@ -44,10 +48,23 @@ reload = "./script/reload.sh"
 # SPI-only throughput bench — forces dpi.enabled=false to exclude the
 # DPI path entirely. Compare against `bench` (which keeps the user's
 # DPI rules loaded) to measure DPI overhead separately.
-bench-spi = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-spi 1000000"
+#
+# Reads worker_count + cpu_core_list from config.yaml — set those there
+# to control parallelism. BENCH_NO_AUTO_SCALE=1 prevents the bench from
+# auto-scaling workers down based on nr_hugepages.
+#
+# count=1M is the production target — net_pcap PMD with infinite_rx=1
+# pre-loads all packets and needs `count` mbufs total (~3.5 GB
+# hugepages for 1M packets at 2176 B + EAL overhead). Hosts with
+# <~3.5 GB free RAM can't run at count=1M; the bench will tell you
+# exactly what to free.
+bench-spi = "BENCH_NO_AUTO_SCALE=1 BUILD_DIR=cmake-build-release ./test/test_env.sh bench-spi 1000000"
 # SPI+DPI throughput bench — uses pcap_injector mode (bypasses the
 # net_pcap PMD's L7-stripping bug) so DPI cache hits actually populate.
 # Generates shards with TLS ClientHello SNI records matching the
 # production DPI filter groups. Final stats will show non-zero
 # dpi_cache_hits, proving the DPI path runs end-to-end.
-bench-dpi = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH BUILD_DIR=cmake-build-release ./test/test_env.sh bench-dpi 1000000"
+#
+# Same source of truth (config.yaml) as bench-spi — both use the same
+# worker_count, so the two are directly comparable.
+bench-dpi = "BENCH_NO_AUTO_SCALE=1 BUILD_DIR=cmake-build-release ./test/test_env.sh bench-dpi 1000000"

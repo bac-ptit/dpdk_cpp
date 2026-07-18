@@ -1,49 +1,94 @@
 {
-  "version": 6,
-  "cmakeMinimumRequired": {
-    "major": 4,
-    "minor": 2
-  },
-  "configurePresets": [
-    {
-      "name": "pixi",
-      "displayName": "Pixi Debug",
-      "description": "Configure with pixi environment (Debug)",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/cmake-build-debug",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++",
-        "CMAKE_CXX_STANDARD": "26",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CMAKE_PREFIX_PATH": "${sourceDir}/.pixi/envs/default",
-        "yaml-cpp_DIR": "${sourceDir}/.pixi/envs/default/lib/cmake/yaml-cpp"
-      },
-      "environment": {
-        "PKG_CONFIG_PATH": "${sourceDir}/.pixi/envs/default/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}"
-      }
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 4,
+        "minor": 2
     },
-    {
-      "name": "pixi-release",
-      "inherits": "pixi",
-      "displayName": "Pixi Release",
-      "description": "Configure with pixi environment (Release)",
-      "binaryDir": "${sourceDir}/cmake-build-release",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG -march=native -mtune=native"
-      }
-    }
-  ],
-  "buildPresets": [
-    {
-      "name": "pixi-debug",
-      "configurePreset": "pixi"
-    },
-    {
-      "name": "pixi-release",
-      "configurePreset": "pixi-release"
-    }
-  ]
+    "configurePresets": [
+        {
+            "name": "pixi",
+            "displayName": "Pixi Debug",
+            "description": "Configure with pixi environment (Debug)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/cmake-build-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_CXX_STANDARD": "26",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_PREFIX_PATH": "${sourceDir}/.pixi/envs/default",
+                "yaml-cpp_DIR": "${sourceDir}/.pixi/envs/default/lib/cmake/yaml-cpp"
+            },
+            "environment": {
+                "PKG_CONFIG_PATH": "${sourceDir}/.pixi/envs/default/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}"
+            }
+        },
+        {
+            "name": "pixi-release",
+            "inherits": "pixi",
+            "displayName": "Pixi Release",
+            "description": "Configure with pixi environment (Release)",
+            "binaryDir": "${sourceDir}/cmake-build-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG -march=native -mtune=native"
+            }
+        },
+        {
+            "name": "wsl",
+            "displayName": "WSL Debug",
+            "description": "Configure on WSL with system packages",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/cmake-build-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_CXX_STANDARD": "26",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "wsl-release",
+            "inherits": "wsl",
+            "displayName": "WSL Release",
+            "description": "Configure on WSL with system packages (Release)",
+            "binaryDir": "${sourceDir}/cmake-build-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG -march=native -mtune=native"
+            }
+        },
+        {
+            "name": "Configure preset using toolchain file",
+            "displayName": "Configure preset using toolchain file",
+            "description": "Sets Ninja generator, build and install directory",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_TOOLCHAIN_FILE": "",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "pixi-debug",
+            "configurePreset": "pixi"
+        },
+        {
+            "name": "pixi-release",
+            "configurePreset": "pixi-release"
+        },
+        {
+            "name": "wsl-debug",
+            "configurePreset": "wsl"
+        },
+        {
+            "name": "wsl-release",
+            "configurePreset": "wsl-release"
+        }
+    ]
 }
