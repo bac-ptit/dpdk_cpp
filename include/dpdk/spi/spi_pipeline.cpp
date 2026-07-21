@@ -23,6 +23,7 @@
 #include <cstring>
 #include <expected>
 #include <format>
+#include <limits>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -353,6 +354,8 @@ void UpdateL2ForwardMacs(const rte_mbuf& packet, const rte_ether_addr& src_addr,
       .dpi_skipped_by_spi = LoadCounter(counters.dpi_skipped_by_spi),
       .dpi_skipped_by_link = LoadCounter(counters.dpi_skipped_by_link),
       .flow_table_full = LoadCounter(counters.flow_table_full),
+      .pressure_evictions = LoadCounter(counters.pressure_evictions),
+      .flow_table_resizes = LoadCounter(counters.flow_table_resizes),
   };
 }
 
@@ -376,6 +379,8 @@ void AddBurstCounters(AtomicCounters& counters, const BurstCounters& burst) noex
   counters.dpi_skipped_by_spi.fetch_add(burst.dpi_skipped_by_spi, std::memory_order_relaxed);
   counters.dpi_skipped_by_link.fetch_add(burst.dpi_skipped_by_link, std::memory_order_relaxed);
   counters.flow_table_full.fetch_add(burst.flow_table_full, std::memory_order_relaxed);
+  counters.pressure_evictions.fetch_add(burst.pressure_evictions, std::memory_order_relaxed);
+  counters.flow_table_resizes.fetch_add(burst.flow_table_resizes, std::memory_order_relaxed);
 }
 
 /// Fold worker-side counters in dispatcher mode without double-counting RX.
@@ -393,6 +398,8 @@ void AddDispatchedWorkerCounters(AtomicCounters& counters, const BurstCounters& 
   counters.dpi_skipped_by_spi.fetch_add(burst.dpi_skipped_by_spi, std::memory_order_relaxed);
   counters.dpi_skipped_by_link.fetch_add(burst.dpi_skipped_by_link, std::memory_order_relaxed);
   counters.flow_table_full.fetch_add(burst.flow_table_full, std::memory_order_relaxed);
+  counters.pressure_evictions.fetch_add(burst.pressure_evictions, std::memory_order_relaxed);
+  counters.flow_table_resizes.fetch_add(burst.flow_table_resizes, std::memory_order_relaxed);
 }
 
 /// Add per-burst counters to a worker-local stats snapshot.
@@ -411,6 +418,8 @@ void AddBurstStats(PipelineStats& stats, const BurstCounters& burst) noexcept {
   stats.dpi_skipped_by_spi += burst.dpi_skipped_by_spi;
   stats.dpi_skipped_by_link += burst.dpi_skipped_by_link;
   stats.flow_table_full += burst.flow_table_full;
+  stats.pressure_evictions += burst.pressure_evictions;
+  stats.flow_table_resizes += burst.flow_table_resizes;
 }
 
 /// Fold per-burst counters into a worker-local pending accumulator. Used
@@ -431,6 +440,8 @@ void AddBurstCounters(BurstCounters& accumulator, const BurstCounters& burst) no
   accumulator.dpi_skipped_by_spi += burst.dpi_skipped_by_spi;
   accumulator.dpi_skipped_by_link += burst.dpi_skipped_by_link;
   accumulator.flow_table_full += burst.flow_table_full;
+  accumulator.pressure_evictions += burst.pressure_evictions;
+  accumulator.flow_table_resizes += burst.flow_table_resizes;
 }
 
 /// Print the current counter state to stdout.
@@ -459,108 +470,130 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
     const auto elapsed_sec{static_cast<double>(current_tsc - start_tsc) / static_cast<double>(rte_get_tsc_hz())};
     const auto mpps{static_cast<double>(stats.received) / elapsed_sec / 1e6};
     std::println(
-        "SPI stats: received={} matched={} flow_table_full={} dpi_skipped_by_spi={} "
-        "dpi_skipped_by_link={} elapsed={:.1f}s Mpps={:.2f}",
-        stats.received, stats.matched, stats.flow_table_full, stats.dpi_skipped_by_spi,
-        stats.dpi_skipped_by_link, elapsed_sec, mpps);
+        "SPI stats: received={} matched={} flow_table_full={} pressure_evictions={} "
+        "flow_table_resizes={} dpi_skipped_by_spi={} dpi_skipped_by_link={} "
+        "elapsed={:.1f}s Mpps={:.2f}",
+        stats.received, stats.matched, stats.flow_table_full, stats.pressure_evictions,
+        stats.flow_table_resizes, stats.dpi_skipped_by_spi, stats.dpi_skipped_by_link,
+        elapsed_sec, mpps);
     timer_tsc = 0;
   }
 }
 
-/// Check the reload flag and rebuild the active RuleTable in place if requested.
+}  // namespace (anonymous) — close before Pipeline::MaybeReload so the
+                               //  member-function body has access to `this`.
+
+/// Check the reload flag and rebuild active SPI/DPI tables if requested.
 ///
-/// The in-place rebuild (PR5) eliminates the per-reload heap allocations that
-/// the prior `rule_manager.Swap(make_unique<RuleTable>(...))` did. Sequence:
-///
-///   1. Set `*reload_barrier` so workers busy-wait at the end of their
-///      current burst instead of starting a new one.
-///   2. Wait briefly for workers to drain into the barrier (cheap
-///      spin-or-sleep; workers re-check the flag at the end of every
-///      burst so the worst-case delay is one burst).
-///   3. Compile the new rules.
-///   4. Call `RebuildInPlace` on the active RuleTable — this calls
-///      `rte_acl_reset_rules` + `add_rules` + `build` on the existing
-///      `rte_acl_ctx`, which reuses its pre-allocated internal storage.
-///   5. Clear `*reload_barrier`; workers resume on their next iteration.
-///
-/// If step 4 fails (e.g. -ENOSPC because the new rule count exceeds
-/// `max_rule_num`), the old rules stay in place and we log + clear the
-/// reload flag without disturbing workers.
-[[gnu::cold]] void MaybeReload(RuleTableManager& rule_manager, std::atomic<int>* reload_flag,
-                               const std::string& config_path, std::atomic<bool>& reload_barrier,
-                               const dpdk::dpi::DpiRuleTable& dpi_table) noexcept {
-  if (reload_flag == nullptr || reload_flag->load(std::memory_order_relaxed) == 0) {
+/// The reload request is consumed with `exchange(0)`, so a second SIGUSR1
+/// arriving during a reload remains pending for the next main-loop iteration.
+/// Replacement tables are compiled while workers continue using the active
+/// tables. The main lcore then sets `reload_barrier`, waits up to 100 ms for
+/// every worker to acknowledge the pause, publishes the new tables, and
+/// releases the workers. A timeout or shutdown request cancels the publish.
+[[gnu::cold]] void dpdk::spi::Pipeline::MaybeReload(const std::atomic<int>& force_quit,
+                                                    std::atomic<int>* reload_flag,
+                                                    const std::string& config_path,
+                                                    std::atomic<bool>& reload_barrier) noexcept {
+  if (reload_flag == nullptr || reload_flag->exchange(0, std::memory_order_acq_rel) == 0 ||
+      force_quit.load(std::memory_order_relaxed) != 0) {
     return;
   }
 
-  // Pause workers before reading or mutating the active RuleTable. Workers
-  // re-check the barrier at the end of every burst, so by the time we finish
-  // compiling the new rules below, all workers should be paused.
-  reload_barrier.store(true, std::memory_order_release);
-
+  // Compile replacement tables before pausing workers. They use independent
+  // storage; only the in-place publish below needs a quiescent worker set.
   auto config{dpdk::LoadConfig(config_path)};
   if (!config) {
     std::println(stderr, "Reload failed: {}", config.error());
-    reload_flag->store(0, std::memory_order_relaxed);
-    reload_barrier.store(false, std::memory_order_release);
     return;
   }
-
-  // Brief sleep so workers have time to finish their current burst and
-  // observe the barrier. Without this, a worker mid-burst could still call
-  // RuleTable::Match after we've started mutating the ctx. 1 ms is plenty
-  // for a 64-packet burst at 100 Mpps (~640 ns).
-  std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
   auto new_rules{CompileRuleTable(config->spi)};
   if (!new_rules) {
     std::println(stderr, "Reload failed: {}", new_rules.error());
-    reload_flag->store(0, std::memory_order_relaxed);
-    reload_barrier.store(false, std::memory_order_release);
     return;
   }
 
-  // Take the active RuleTable and rebuild it in place. This call is the
-  // whole point of PR5: no new rte_acl_ctx, no new std::vector for groups
-  // (the old one is replaced by move-assignment from new_rules->groups_).
-  const auto* active = rule_manager.Load();
+  std::unique_ptr<dpi::DpiRuleTable> new_dpi_rules;
+  if (config->dpi.enabled) {
+    auto compiled_dpi{dpi::CompileDpiRuleTable(config->dpi)};
+    if (!compiled_dpi) {
+      std::println(stderr, "DPI reload failed: {}", compiled_dpi.error());
+      return;
+    }
+    new_dpi_rules = std::make_unique<dpi::DpiRuleTable>(std::move(*compiled_dpi));
+    if (const auto resolve{new_rules->ResolveDpiLinks(*new_dpi_rules)}; !resolve) {
+      std::println(stderr, "Reload failed: {}", resolve.error());
+      return;
+    }
+  }
+
+  if (force_quit.load(std::memory_order_relaxed) != 0) {
+    return;
+  }
+
+  // Pause workers and wait for an explicit acknowledgement from every remote
+  // lcore. The bounded wait prevents a failed worker from blocking SIGINT.
+  reload_barrier.store(true, std::memory_order_release);
+  constexpr std::uint64_t kMillisecondsPerSecond{1000};
+  constexpr std::uint64_t kReloadQuiesceTimeoutMs{100};
+  const auto timeout_tsc{rte_get_tsc_hz() * kReloadQuiesceTimeoutMs /
+                         kMillisecondsPerSecond,};
+  const auto wait_start_tsc{rte_rdtsc()};
+  bool wait_timed_out{false};
+  if (worker_contexts_.size() > 1) {
+    while (workers_paused_.load(std::memory_order_acquire) < worker_contexts_.size()) {
+      if (force_quit.load(std::memory_order_relaxed) != 0) {
+        break;
+      }
+      if (rte_rdtsc() - wait_start_tsc >= timeout_tsc) {
+        wait_timed_out = true;
+        break;
+      }
+      rte_pause();
+    }
+  }
+
+  if (force_quit.load(std::memory_order_relaxed) != 0 || wait_timed_out) {
+    reload_barrier.store(false, std::memory_order_release);
+    if (wait_timed_out) {
+      std::println(stderr,
+                   "Reload cancelled: only {}/{} workers reached the pause barrier",
+                   workers_paused_.load(std::memory_order_relaxed),
+                   worker_contexts_.size());
+    }
+    return;
+  }
+
+  const auto* active{rule_manager_.Load()};
   if (active == nullptr) {
     std::println(stderr, "Reload failed: no active RuleTable");
-    reload_flag->store(0, std::memory_order_relaxed);
     reload_barrier.store(false, std::memory_order_release);
     return;
   }
 
-  // Move the freshly-compiled groups + precedence_order out of new_rules
-  // so RebuildInPlace can take them by value. The new_rules RuleTable's
-  // destructor will free its (now-orphaned) acl_ctx_ — that's fine, we
-  // never adopt its ctx, we only want its rule data.
-  std::vector<CompiledFilterGroup> new_groups = std::move(*new_rules).MoveGroupsOut();
-  std::vector<std::uint32_t> new_prec = std::move(*new_rules).MovePrecedenceOrderOut();
-
-  if (const auto rebuild{const_cast<RuleTable*>(active)->RebuildInPlace(std::move(new_groups), std::move(new_prec))};
+  auto new_groups{std::move(*new_rules).MoveGroupsOut()};
+  auto new_precedence{std::move(*new_rules).MovePrecedenceOrderOut()};
+  if (const auto rebuild{const_cast<RuleTable*>(active)->RebuildInPlace(
+          std::move(new_groups), std::move(new_precedence))};
       !rebuild) {
     std::println(stderr, "Reload failed: {}", rebuild.error());
-    reload_flag->store(0, std::memory_order_relaxed);
     reload_barrier.store(false, std::memory_order_release);
     return;
   }
 
-  // Re-resolve SPI→DPI static links on the just-rebuilt active table. The
-  // freshly compiled groups start with `bound_dpi_filter_index = kNoDpiLink`;
-  // without this pass the link would silently disappear after every reload.
-  if (const auto resolve{const_cast<RuleTable*>(active)->ResolveDpiLinks(dpi_table)}; !resolve) {
-    std::println(stderr, "Reload warning: SPI→DPI links lost after reload: {}", resolve.error());
-  }
+  dpi_rule_manager_.Swap(std::move(new_dpi_rules));
+  MaybeReloadFlowTable(*config);
 
-  std::println("Rules reloaded: {} groups, {} filters (in-place)", active->GroupCount(), active->FilterCount());
-  reload_flag->store(0, std::memory_order_relaxed);
-
-  // Release workers.
+  std::println("Rules reloaded: {} groups, {} filters (in-place)",
+               active->GroupCount(), active->FilterCount());
   reload_barrier.store(false, std::memory_order_release);
 }
 
-/// Print final packet counters for each worker queue.
+namespace {
+// Reopen the anonymous namespace for the rest of the file's TU-local
+// helpers (PrintWorkerStats, PrintForwardMap, …).
+
 void PrintWorkerStats(const std::vector<WorkerContext>& contexts) noexcept {
   for (const auto& context : contexts) {
     std::println("Worker {} stats: {}", context.worker_id, context.stats);
@@ -1511,10 +1544,19 @@ void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbu
     // Pause during in-place rule rebuilds. The main lcore sets
     // `reload_barrier` before doing the rebuild and clears it after;
     // we observe the flag at the end of each burst and spin
-    // until the main lcore clears it.
-    while (context->reload_barrier != nullptr && context->reload_barrier->load(std::memory_order_acquire) &&
-           context->force_quit->load(std::memory_order_relaxed) == 0) {
-      rte_pause();
+    // until the main lcore clears it. The acq_rel fetch_add AFTER
+    // observing the barrier is what the main lcore's `workers_paused_`
+    // spin-wait blocks on — without this hand-off, the main lcore
+    // cannot prove every worker is quiescent before mutating
+    // RuleTable / FlowTable.
+    if (context->reload_barrier != nullptr && context->reload_barrier->load(std::memory_order_acquire) &&
+        context->force_quit->load(std::memory_order_relaxed) == 0) {
+      context->workers_paused->fetch_add(1, std::memory_order_acq_rel);
+      while (context->reload_barrier->load(std::memory_order_acquire) &&
+             context->force_quit->load(std::memory_order_relaxed) == 0) {
+        rte_pause();
+      }
+      context->workers_paused->fetch_sub(1, std::memory_order_release);
     }
   }
   // Drain any unflushed counters so final stats are accurate.
@@ -1532,9 +1574,17 @@ void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbu
 
   while (context->force_quit->load(std::memory_order_relaxed) == 0) {
     ProcessDispatchedWorkerIteration(*context, packets, transmit_buffers, transmit_counts);
-    while (context->reload_barrier != nullptr && context->reload_barrier->load(std::memory_order_acquire) &&
-           context->force_quit->load(std::memory_order_relaxed) == 0) {
-      rte_pause();
+    // See WorkerLoop for the rationale on the acq_rel fetch_add +
+    // release fetch_sub hand-off with the main lcore's
+    // `workers_paused_` spin-wait.
+    if (context->reload_barrier != nullptr && context->reload_barrier->load(std::memory_order_acquire) &&
+        context->force_quit->load(std::memory_order_relaxed) == 0) {
+      context->workers_paused->fetch_add(1, std::memory_order_acq_rel);
+      while (context->reload_barrier->load(std::memory_order_acquire) &&
+             context->force_quit->load(std::memory_order_relaxed) == 0) {
+        rte_pause();
+      }
+      context->workers_paused->fetch_sub(1, std::memory_order_release);
     }
   }
   // Drain any unflushed counters so final stats are accurate.
@@ -1563,6 +1613,8 @@ void FlushAtomicCounters(AtomicCounters& counters, const BurstCounters& pending)
   counters.dpi_skipped_by_spi.fetch_add(pending.dpi_skipped_by_spi, std::memory_order_relaxed);
   counters.dpi_skipped_by_link.fetch_add(pending.dpi_skipped_by_link, std::memory_order_relaxed);
   counters.flow_table_full.fetch_add(pending.flow_table_full, std::memory_order_relaxed);
+  counters.pressure_evictions.fetch_add(pending.pressure_evictions, std::memory_order_relaxed);
+  counters.flow_table_resizes.fetch_add(pending.flow_table_resizes, std::memory_order_relaxed);
 }
 
 Pipeline::Pipeline(const dpdk::Environment& environment, RuleTable initial_rules,
@@ -1611,6 +1663,55 @@ Pipeline::Pipeline(const dpdk::Environment& environment, RuleTable initial_rules
 Pipeline::~Pipeline() {
   StopWorkers();
   DestroyDispatchRings();
+}
+
+void Pipeline::MaybeReloadFlowTable(const DpdkConfig& config) noexcept {
+  const auto new_max{config.spi.max_concurrent_flows};
+  if (new_max == max_concurrent_flows_) {
+    return;
+  }
+
+  // Caller (the main-lcore run loop) already set reload_barrier_ and
+  // slept 1 ms so workers are spinning in their pause loop. We are now
+  // the only writer to `flow_table_` and to the `WorkerContext::flow_table`
+  // raw pointer. Do the migration, swap, repoint.
+  std::println("FlowTable resize: {} -> {} entries (migrating active flows)",
+               max_concurrent_flows_, new_max);
+
+  auto new_table{std::make_unique<FlowTable>(new_max)};
+  if (!new_table->IsValid()) {
+    std::println(stderr, "FlowTable resize failed: rte_hash_create({}) returned null — keeping {} entries",
+                 new_max, max_concurrent_flows_);
+    return;
+  }
+
+  // Best-effort migration: copy every occupied slot from the old table
+  // to the new one. For a "grow" resize, all slots fit; for a "shrink"
+  // resize, later slots are silently dropped (the operator shrunk the
+  // table; we honour their intent and let those flows re-classify on
+  // next packet). Workers are paused so no concurrent Insert / Purge
+  // is in flight — no lock needed.
+  std::size_t migrated{0};
+  flow_table_->ForEachOccupied(
+      [&new_table, &migrated](const FlowKey& key, std::uint64_t count, Action action) {
+        if (new_table->InsertRaw(key, count, action) == FlowInsertResult::kOk) {
+          ++migrated;
+        }
+      });
+
+  // Publish: move the new table into `flow_table_` (frees the old on
+  // scope exit of the local unique_ptr we're about to overwrite), then
+  // repoint every worker's raw pointer. After `reload_barrier_` clears
+  // (caller does this after we return), workers see the new pointer on
+  // their next ProcessPortBurst.
+  flow_table_ = std::move(new_table);
+  for (auto& ctx : worker_contexts_) {
+    ctx.flow_table = flow_table_.get();
+  }
+  max_concurrent_flows_ = new_max;
+  counters_.flow_table_resizes.fetch_add(1, std::memory_order_relaxed);
+
+  std::println("FlowTable resize complete: migrated={} flows, new capacity={}", migrated, new_max);
 }
 
 std::expected<void, std::string> Pipeline::StartWorkers(WorkerEntryPoint entry_point) noexcept {
@@ -1688,6 +1789,7 @@ void Pipeline::PrepareWorkerContext(WorkerContext& context, const std::atomic<in
   context.drop_unmatched = drop_unmatched_;
   context.flow_overflow_drop = flow_overflow_drop_;
   context.reload_barrier = &reload_barrier_;
+  context.workers_paused = &workers_paused_;
 }
 
 std::expected<void, std::string> Pipeline::CreateDispatchRings() noexcept {
@@ -1720,40 +1822,6 @@ void Pipeline::DestroyDispatchRings() noexcept {
   dispatch_rings_.clear();
 }
 
-std::expected<PipelineStats, std::string> Pipeline::RunSingleWorker(const std::atomic<int>& force_quit,
-                                                                    std::uint32_t timer_period_sec) noexcept {
-  const auto& active_ports{environment_.GetActivePorts()};
-  auto& context{worker_contexts_[0]};
-  PrepareWorkerContext(context, force_quit, 0);
-
-  std::println("Entering SPI packet-processing loop");
-  std::println("Single-worker direct mode on main lcore");
-  PrintForwardMap(active_ports);
-  PrintQueueMap(1);
-
-  std::array<rte_mbuf*, kMaxBurstCapacity> packets{};
-  std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>> transmit_buffers(environment_.GetPortCount());
-  std::vector<std::uint16_t> transmit_counts(environment_.GetPortCount());
-  const auto start_tsc{rte_rdtsc()};
-  std::uint64_t previous_tsc{start_tsc};
-  std::uint64_t timer_tsc{};
-  const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
-
-  while (force_quit == 0) {
-    ProcessWorkerIteration(context, packets, transmit_buffers, transmit_counts);
-    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
-    MaybeReload(rule_manager_, reload_flag_, config_path_, reload_barrier_, *dpi_rule_manager_.Load());
-    // Purge expired flow cache entries periodically (same cadence as stats print).
-    if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
-      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
-    }
-  }
-
-  rule_match_counts_ = std::move(context.rule_match_counts);
-  PrintWorkerStats(worker_contexts_);
-  return CollectStats(counters_);
-}
-
 std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const std::atomic<int>& force_quit,
                                                                    std::uint32_t timer_period_sec) noexcept {
   if (environment_.GetReceiveQueueCount() < worker_contexts_.size()) {
@@ -1778,13 +1846,22 @@ std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const std::at
   std::uint64_t previous_tsc{start_tsc};
   std::uint64_t timer_tsc{};
   const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
-  while (force_quit == 0) {
+  while (force_quit.load(std::memory_order_relaxed) == 0) {
     MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
-    MaybeReload(rule_manager_, reload_flag_, config_path_, reload_barrier_, *dpi_rule_manager_.Load());
+    MaybeReload(force_quit, reload_flag_, config_path_, reload_barrier_);
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
-      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
+      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
     }
-    rte_pause();
+    if (flow_ttl_sec_ > 0 && flow_table_->ShouldEvictOnPressure()) {
+      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
+      flow_table_->ResetOverflowCount();
+      counters_.pressure_evictions.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Yield the main lcore when there's no work — keeps Ctrl+C latency at
+    // ~100 µs while letting the scheduler put this core to sleep. `rte_pause`
+    // is only a CPU PAUSE hint (~10 cycles), it spins forever at GHz and
+    // makes the housekeeping loop look "stuck" in `top`.
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 
   StopWorkers();
@@ -1815,12 +1892,17 @@ std::expected<PipelineStats, std::string> Pipeline::RunFlowHashDispatch(const st
   std::uint64_t timer_tsc{};
   const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
   const std::span dispatch_rings{dispatch_rings_.data(), dispatch_rings_.size()};
-  while (force_quit == 0) {
+  while (force_quit.load(std::memory_order_relaxed) == 0) {
     ProcessDispatchIteration(environment_, burst_size_, packets, dispatch_rings, counters_);
     MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
-    MaybeReload(rule_manager_, reload_flag_, config_path_, reload_barrier_, *dpi_rule_manager_.Load());
+    MaybeReload(force_quit, reload_flag_, config_path_, reload_barrier_);
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
-      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz());
+      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
+    }
+    if (flow_ttl_sec_ > 0 && flow_table_->ShouldEvictOnPressure()) {
+      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
+      flow_table_->ResetOverflowCount();
+      counters_.pressure_evictions.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -1847,8 +1929,23 @@ std::expected<PipelineStats, std::string> Pipeline::RunUntilStopped(const std::a
   config_path_ = config_path;
   reload_flag_ = &reload_flag;
 
-  if (worker_contexts_.size() == 1) {
-    return RunSingleWorker(force_quit, timer_period_sec);
+  // M5: single-worker mode is removed. The pipeline now requires at least
+  // two worker lcores — the main lcore alone is a serialisation point that
+  // can't sustain line-rate packet processing, and it was the only path
+  // that ran `ProcessWorkerIteration` on the main lcore (contending with
+  // the stats/reload/purge work that RunMultiWorker keeps on the main
+  // lcore for proper Ctrl+C responsiveness). Setting worker_count=1 used
+  // to silently switch to a single-lcore hot path; we now refuse it so
+  // the operator gets a clear error instead of a mysteriously-slow
+  // pipeline.
+  if (worker_contexts_.size() < 2) {
+    return std::unexpected(std::format(
+        "spi.worker_count must be >= 2 (got {}). Single-worker mode is "
+        "no longer supported; the pipeline requires at least one main "
+        "lcore plus one or more worker lcores for proper Ctrl+C "
+        "responsiveness and to keep the signal-polling loop free of "
+        "packet-processing work.",
+        worker_contexts_.size()));
   }
 
   const auto packet_distribution{

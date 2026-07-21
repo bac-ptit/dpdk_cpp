@@ -140,28 +140,45 @@ def should_match(index, total, target):
     return ((index + 1) * target // total) > (index * target // total)
 
 
-def bench_packet(index, matching):
+def bench_packet(index, matching, shard=0):
     """Build one benchmark packet.
     Matching packets use SPI rules from lv3.csv; miss packets don't match.
     Drop packets match the drop rule (UDP port 9999).
+    `shard` rewrites the source-IP to `10.<shard>.0.1` so different shards
+    produce disjoint 5-tuples; without this rewrite, all shards share the
+    same canonical tuple sequence and the FlowTable's per-slot
+    `last_seen_tsc` becomes a true-sharing cache line that MESI ping-pongs
+    across all worker lcores (≈50% scaling at 4→7 workers instead of
+    linear). SPI rules match on dst_ip, so the varying src_ip does not
+    affect SPI matching.
     """
     dst_mac = 'a0:36:bc:65:8f:11'
     src_mac = '00:00:00:00:00:01'
     rules = SPI_MATCH_RULES if matching else SPI_MISS_RULES
-    proto, src_ip, dst_ip, port = rules[index % len(rules)]
+    proto, _, dst_ip, port = rules[index % len(rules)]
+    src_ip = f'10.{shard}.0.1'
     sport = 1024 + (index % 60000)
     return make_packet(proto, dst_mac, src_mac, src_ip, dst_ip, sport, port), matching
 
 
-def build_sharded_bench_pcaps(directory, count, shards, match_percent, prefix):
+def build_sharded_bench_pcaps(directory, count, shards, match_percent, prefix, response_percent=100):
     """Generate benchmark PCAP shards for multi-queue net_pcap tests.
     Generates a mix of match, miss, and drop packets.
     Drop packets: 5% of total, match fg_l34_udp_sdf1006 (UDP port 9999).
+
+    `response_percent` (0-100): for each match/miss packet, also emit a
+    response counterpart with src/dst IP and ports swapped (MACs swapped
+    too). The response shares the canonical FlowKey with its request, so
+    the second packet of the pair triggers a flow cache hit — proves the
+    cache works end-to-end. Drop packets get NO response (dropped flows
+    don't continue).
     """
     if shards <= 0:
         raise ValueError('shards must be greater than 0')
     if not 0 <= match_percent <= 100:
         raise ValueError('match-percent must be between 0 and 100')
+    if not 0 <= response_percent <= 100:
+        raise ValueError('response-percent must be between 0 and 100')
 
     os.makedirs(directory, exist_ok=True)
     handles = []
@@ -182,33 +199,54 @@ def build_sharded_bench_pcaps(directory, count, shards, match_percent, prefix):
     matched = 0
     dropped = 0
     missed = 0
+    responses = 0
     shard_counts = [0] * shards
+    dst_mac = 'a0:36:bc:65:8f:11'
+    src_mac = '00:00:00:00:00:01'
     try:
+        ts = 1000
         for index in range(count):
             shard = index % shards
             local_index = shard_counts[shard]
             shard_counts[shard] += 1
 
+            # Per-shard source-IP rewrite (see bench_packet docstring).
+            src_ip = f'10.{shard}.0.1'
+            sport = 1024 + (local_index % 60000)
+
             # Determine packet type: drop (5%), match, or miss
             if index < drop_count:
-                # Drop packet
-                dst_mac = 'a0:36:bc:65:8f:11'
-                src_mac = '00:00:00:00:00:01'
-                proto, src_ip, dst_ip, port = SPI_DROP_RULES[local_index % len(SPI_DROP_RULES)]
-                sport = 1024 + (local_index % 60000)
+                # Drop packet — no response (dropped flows don't continue).
+                proto, _, dst_ip, port = SPI_DROP_RULES[local_index % len(SPI_DROP_RULES)]
                 packet = make_packet(proto, dst_mac, src_mac, src_ip, dst_ip, sport, port)
                 dropped += 1
-            elif index < drop_count + match_count:
-                # Match packet
-                packet, _ = bench_packet(local_index, True)
-                matched += 1
+                handles[shard].write(pcap_pkt_hdr(ts, len(packet)))
+                handles[shard].write(packet)
+                ts += 1
             else:
-                # Miss packet
-                packet, _ = bench_packet(local_index, False)
-                missed += 1
+                # Match or miss packet
+                matching = (index < drop_count + match_count)
+                rules = SPI_MATCH_RULES if matching else SPI_MISS_RULES
+                proto, _, dst_ip, port = rules[local_index % len(rules)]
+                packet = make_packet(proto, dst_mac, src_mac, src_ip, dst_ip, sport, port)
+                if matching:
+                    matched += 1
+                else:
+                    missed += 1
+                handles[shard].write(pcap_pkt_hdr(ts, len(packet)))
+                handles[shard].write(packet)
+                ts += 1
 
-            handles[shard].write(pcap_pkt_hdr(1000 + index, len(packet)))
-            handles[shard].write(packet)
+                # Optional response — swap IP/port and MACs. Same proto.
+                # Deterministic: (local_index % 100) < response_percent so
+                # the output is reproducible across runs.
+                if response_percent > 0 and (local_index % 100) < response_percent:
+                    response = make_packet(proto, src_mac, dst_mac, dst_ip, src_ip, port, sport)
+                    handles[shard].write(pcap_pkt_hdr(ts, len(response)))
+                    handles[shard].write(response)
+                    ts += 1
+                    responses += 1
+
             if (index + 1) % 100000 == 0:
                 print(f"  ... {index + 1}/{count}")
     finally:
@@ -216,8 +254,10 @@ def build_sharded_bench_pcaps(directory, count, shards, match_percent, prefix):
             handle.close()
 
     size_mb = sum(os.path.getsize(path) for path in paths) / (1024 * 1024)
+    total = count + responses
     print(
-        f"Generated {shards} shards in {directory}: {count} packets "
+        f"Generated {shards} shards in {directory}: {count} requests + "
+        f"{responses} responses = {total} packets "
         f"({matched} match, {missed} miss, {dropped} drop, {size_mb:.1f} MB)")
 
 
@@ -231,11 +271,16 @@ def main():
                         help='Generate this many benchmark PCAP shards in path')
     parser.add_argument('--match-percent', type=int, default=DEFAULT_MATCH_PERCENT,
                         help='Percentage of generated packets that match SPI rules')
+    parser.add_argument('--response-percent', type=int, default=100,
+                        help='Percentage of match/miss packets that get a response '
+                             'with swapped IP/port (default 100, set 0 to disable)')
     parser.add_argument('--prefix', default='bench_q',
                         help='Filename prefix for sharded benchmark pcaps')
     args = parser.parse_args()
     if args.count > 0 and args.shards > 0:
-        build_sharded_bench_pcaps(args.path, args.count, args.shards, args.match_percent, args.prefix)
+        build_sharded_bench_pcaps(args.path, args.count, args.shards,
+                                  args.match_percent, args.prefix,
+                                  args.response_percent)
     elif args.count > 0:
         build_bench_pcap(args.path, args.count)
     else:

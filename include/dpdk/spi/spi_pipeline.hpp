@@ -53,6 +53,16 @@ struct PipelineStats {
   /// Flow-table `rte_hash_add_key` returned `-ENOSPC` (table full).
   /// Incremented for every Insert failure; visible via the periodic stats print.
   std::uint64_t flow_table_full{};
+  /// Number of times the main lcore triggered an out-of-cadence
+  /// `PurgeExpired` because `FlowTable::ShouldEvictOnPressure()` returned
+  /// true (overflow events exceeded `max_concurrent_flows / 100`).
+  /// A non-zero rate here means short-lived flows are reclaiming slots
+  /// before the next insert has to be dropped.
+  std::uint64_t pressure_evictions{};
+  /// Number of times `FlowTable` was resized on SIGUSR1 reload (i.e.
+  /// `max_concurrent_flows` changed between reloads). Counts migration
+  /// events; each one copies `N` occupied slots to a new table.
+  std::uint64_t flow_table_resizes{};
 };
 
 /// Cache-line-aligned atomic counters shared between workers and stats thread.
@@ -71,6 +81,8 @@ struct alignas(64) AtomicCounters {
   std::atomic<std::uint64_t> dpi_skipped_by_spi{};
   std::atomic<std::uint64_t> dpi_skipped_by_link{};
   std::atomic<std::uint64_t> flow_table_full{};
+  std::atomic<std::uint64_t> pressure_evictions{};
+  std::atomic<std::uint64_t> flow_table_resizes{};
 };
 
 /// Per-burst counters accumulated in a single worker iteration.
@@ -89,6 +101,8 @@ struct BurstCounters {
   std::uint64_t dpi_skipped_by_spi{};
   std::uint64_t dpi_skipped_by_link{};
   std::uint64_t flow_table_full{};
+  std::uint64_t pressure_evictions{};
+  std::uint64_t flow_table_resizes{};
 };
 
 /// Flush pending BurstCounters into the shared AtomicCounters.
@@ -152,9 +166,17 @@ struct alignas(64) WorkerContext {
   bool flow_overflow_drop{true};
   /// Set to `true` by `MaybeReload` for the duration of an in-place rule
   /// rebuild; workers busy-wait while this is set. Combined with the
-  /// `rte_eal_mp_wait_lcore` symmetric wait, this guarantees no worker
-  /// is in the middle of `RuleTable::Match` when `RebuildInPlace` runs.
+  /// `workers_paused` counter (read by the main lcore after setting the
+  /// barrier), this guarantees no worker is in the middle of
+  /// `RuleTable::Match` or `FlowTable::Lookup` / `Insert` when
+  /// `RebuildInPlace` or `MaybeReloadFlowTable` runs.
   const std::atomic<bool>* reload_barrier{nullptr};
+  /// Back-pointer to the Pipeline's `workers_paused_` counter. Workers
+  /// `fetch_add(1)` when entering the reload pause loop and
+  /// `fetch_sub(1)` when exiting; the main lcore spins on the counter to
+  /// prove all workers have reached the pause before mutating shared
+  /// state.
+  std::atomic<std::size_t>* workers_paused{nullptr};
 
   /// Per-worker hostname → DPI result cache. Avoids re-running
   /// ExtractTlsSni/ExtractHttpHost + DpiRuleTable::Match for hostnames
@@ -250,12 +272,6 @@ class Pipeline final {
   [[nodiscard]] std::expected<void, std::string> LaunchWorker(std::size_t worker_id, unsigned lcore_id,
                                                               WorkerEntryPoint entry_point) noexcept;
   /**
-   * @brief Run the hot path on the calling (main) lcore.
-   * @return Final pipeline statistics.
-   */
-  [[nodiscard]] std::expected<PipelineStats, std::string> RunSingleWorker(const std::atomic<int>& force_quit,
-                                                                          std::uint32_t timer_period_sec) noexcept;
-  /**
    * @brief Run workers on remote lcores, poll on main lcore.
    * @return Final pipeline statistics.
    */
@@ -301,6 +317,34 @@ class Pipeline final {
    */
   void StopWorkers() noexcept;
 
+  /**
+   * @brief Resize `flow_table_` if the reloaded config changed
+   *        `max_concurrent_flows`. Allocates a fresh `FlowTable`,
+   *        best-effort migrates the active entries from the old one,
+   *        publishes the new pointer via every `WorkerContext`, and
+   *        frees the retired table once the reload barrier clears.
+   *
+   * Called from `MaybeReload` inside the same reload_barrier window.
+   * Workers are paused so no concurrent `FlowTable::Insert` or
+   * `PurgeExpired` may run while this is in flight — that's the contract
+   * that lets us iterate the old `cells_` and `last_seen_tsc_` arrays
+   * without locks.
+   *
+   * Static-allocation discipline: this is a one-shot allocation on
+   * operator action (SIGUSR1). The hot path remains alloc-free; the heap
+   * stays monotonic across all worker iterations between reloads.
+   */
+  void MaybeReloadFlowTable(const DpdkConfig& config) noexcept;
+
+  /**
+   * @brief SIGUSR1-triggered reload. Reloads SPI rules in place,
+   *        re-resolves SPI→DPI links, and resizes the flow table if
+   *        `max_concurrent_flows` changed. Sets `reload_barrier_` for
+   *        the duration so workers pause and we can mutate shared state.
+   */
+  void MaybeReload(const std::atomic<int>& force_quit, std::atomic<int>* reload_flag,
+                   const std::string& config_path, std::atomic<bool>& reload_barrier) noexcept;
+
   const dpdk::Environment& environment_;
   RuleTableManager rule_manager_;
   std::unique_ptr<dpi::DpiRuleTable> dpi_rules_;  ///< Pre-reload table (kept alive until manager Init).
@@ -332,6 +376,19 @@ class Pipeline final {
   /// workers busy-wait while this is true. Reset by the main lcore once
   /// the rebuild completes.
   std::atomic<bool> reload_barrier_{false};
+  /// Counter of worker lcores currently paused inside the reload_barrier
+  /// spin loop. Workers increment on entering the pause loop and decrement
+  /// on exit; the main lcore spins on this counter after setting
+  /// `reload_barrier_` to know exactly when every worker has observed the
+  /// barrier. This replaces the previous heuristic 1 ms sleep in
+  /// `MaybeReload`, which could leave workers mid-burst while the main
+  /// lcore mutated `RuleTable` / `FlowTable`, racing on `Match()` and
+  /// `Insert()` calls (and use-after-free when `MaybeReloadFlowTable`
+  /// replaced `flow_table_`).
+  ///
+  /// Sits on its own cache line so worker fetch_add/fetch_sub traffic
+  /// doesn't false-share with `reload_barrier_` or the rule-manager state.
+  alignas(64) std::atomic<std::size_t> workers_paused_{0};
   /// Per-Pipeline worker quit flag. Main lcore sets it to 1 in
   /// `StopWorkers`; workers poll it every burst. `std::atomic<int>`
   /// rather than `volatile sig_atomic_t` so the cross-lcore access is

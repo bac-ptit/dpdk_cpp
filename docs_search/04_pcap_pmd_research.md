@@ -35,6 +35,24 @@ The plateau at 10→15 workers means **the pipeline CPU ceiling matches the per-
 | 1.4 | Pcap PMD RX is per-packet copy from libpcap into freshly-allocated mbuf (no zero-copy) | pcap_ethdev.c source |
 | 1.5 | Per-queue ceiling ≈ 3-5 Mpps on modern x86 (MEDIUM confidence, mailing-list reports) | canonical knowledge |
 
+### DPDK 25.11 queue-limit clarification (verified 2026-07-19)
+
+The installed project version is DPDK 25.11.0. In that exact release,
+`RTE_PMD_PCAP_MAX_QUEUES` is 16, but `eth_dev_info_get()` reports
+`max_rx_queues = dev->data->nb_rx_queues`. Therefore the runtime value is the
+number of repeated `rx_pcap=` entries used to construct `net_pcap0`, not the
+compile-time ceiling. With four `rx_pcap=` entries in `config.yaml`, the PMD
+correctly reports `max_rx_queues=4`; a 15-queue benchmark requires 15 distinct
+PCAP entries/shards, while 16 is the driver's hard ceiling.
+
+**Source:** https://raw.githubusercontent.com/DPDK/dpdk/v25.11/drivers/net/pcap/pcap_ethdev.c
+
+**Applies to:** `config.yaml` must keep `spi.worker_count`,
+`port.receive_queues`, `port.transmit_queues`, and the number of `rx_pcap=`
+entries aligned for queue-per-worker PCAP replay. Increasing queues beyond the
+available physical cores or pipeline/memory-bandwidth limit can reduce rather
+than improve throughput, so compare measured Mpps across queue counts.
+
 ### Multi-shard behavior (HIGH confidence)
 
 | # | Claim | Source |

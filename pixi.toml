@@ -10,9 +10,21 @@ preview = ["pixi-build"]
 clang = ">=22"
 cmake = ">=4.0"
 pyyaml = ">=6.0.3,<7"
+clangxx = ">=22.1.7,<23"
+llvm-tools = ">=22.1.7,<23"
+lld = ">=22.1.7,<23"
+ninja = ">=1.13.2,<2"
+llvm = ">=22.1.7,<23"
+libpcap = ">=1.10.6,<2"
+compiler-rt = ">=22.1.7,<23"
 
 [activation.env]
 PKG_CONFIG_PATH = "/usr/lib64/pkgconfig"
+# Force clang to use ld.lld for every link. Without this, the IPO/LTO
+# test in CMakeLists.txt invokes x86_64-conda-linux-gnu-ld which then
+# looks for LLVMgold.so — a plugin that doesn't exist for LLVM 22 in
+# this environment. ld.lld has LTO built in, no plugin needed.
+LDFLAGS = "-fuse-ld=lld"
 
 [tasks]
 cmake = "cmake --preset pixi"
@@ -21,50 +33,34 @@ build = "cmake --build --preset pixi-debug"
 build-release = "cmake --preset pixi-release && cmake --build --preset pixi-release"
 clean = "rm -rf cmake-build-debug cmake-build-release build_debug build"
 install = "./script/install.sh"
-run = "BUILD_DIR=cmake-build-debug ./test/test_env.sh run"
-run-release = "BUILD_DIR=cmake-build-release ./test/test_env.sh run"
-test-pcap = "BUILD_DIR=cmake-build-release ./test/test_env.sh pcap"
-bench = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000"
-bench-pcap = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000"
-bench-pcap-release = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-pcap 1000000"
-bench-afpacket = "BUILD_DIR=cmake-build-debug ./test/test_env.sh bench-afpacket 16"
-bench-afpacket-release = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-afpacket 16"
-# Run app with generated PCAP test traffic (SPI + DPI rules from config.yaml)
-test-pcap-debug = "BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"
-# Run app with a custom PCAP file (pass path as argument)
-run-pcap = "BUILD_DIR=cmake-build-debug ./test/test_env.sh pcap"
-# Verify SPI rules match lv3.csv — generate traffic, run app, check stats
-test-spi = "python3 test/test_spi_rules.py"
-verify-rules-release = "python3 test/verify_rules.py --build-dir cmake-build-release"
+# test_env.sh has only three jobs: (1) generate pcap shards for the
+# requested count, (2) copy $PROJECT_DIR/config.yaml next to the binary,
+# (3) run the binary with a timeout. Every other setting (memory_size,
+# cpu_core_list, queues, SPI/DPI rules, l3_forward, ...) is read from
+# config.yaml and never touched by the bench script.
+#
+# worker_count, pcap shard directory, and any other bench-relevant knobs
+# are read out of config.yaml — no per-task override here. Set
+# dpi.enabled: false in config.yaml for SPI-only behaviour.
 docs = "doxygen Doxyfile"
 benchmark = "./script/benchmark.sh 1000000 15 100"
 test = "python3 test/test_spi_rules.py"
-# Hot-reload FastAPI config from disk without restarting workers.
-# 1. Copies source config.yaml into cmake-build-release/ (FastAPI reads
-#    from there via its compile-time CONFIG_PATH).
-# 2. Sends SIGUSR1; the signal handler triggers MaybeReload() on the main
-#    lcore which re-reads and atomically swaps rule tables.
+# Verify SPI rules match lv3.csv — generate traffic, run app, check stats.
+test-spi = "python3 test/test_spi_rules.py"
+verify-rules-release = "python3 test/verify_rules.py --build-dir cmake-build-release"
+# Hot-reload FastAPI config from disk without restarting workers. test_env.sh
+# copies the source config.yaml into $BUILD_DIR; FastAPI's compile-time
+# CONFIG_PATH resolves to that copy, so SIGUSR1 reloads from disk.
 reload = "./script/reload.sh"
-# SPI-only throughput bench — forces dpi.enabled=false to exclude the
-# DPI path entirely. Compare against `bench` (which keeps the user's
-# DPI rules loaded) to measure DPI overhead separately.
-#
-# Reads worker_count + cpu_core_list from config.yaml — set those there
-# to control parallelism. BENCH_NO_AUTO_SCALE=1 prevents the bench from
-# auto-scaling workers down based on nr_hugepages.
-#
-# count=1M is the production target — net_pcap PMD with infinite_rx=1
-# pre-loads all packets and needs `count` mbufs total (~3.5 GB
-# hugepages for 1M packets at 2176 B + EAL overhead). Hosts with
-# <~3.5 GB free RAM can't run at count=1M; the bench will tell you
-# exactly what to free.
-bench-spi = "BENCH_NO_AUTO_SCALE=1 BUILD_DIR=cmake-build-release ./test/test_env.sh bench-spi 1000000"
-# SPI+DPI throughput bench — uses pcap_injector mode (bypasses the
-# net_pcap PMD's L7-stripping bug) so DPI cache hits actually populate.
-# Generates shards with TLS ClientHello SNI records matching the
-# production DPI filter groups. Final stats will show non-zero
-# dpi_cache_hits, proving the DPI path runs end-to-end.
-#
-# Same source of truth (config.yaml) as bench-spi — both use the same
-# worker_count, so the two are directly comparable.
-bench-dpi = "BENCH_NO_AUTO_SCALE=1 BUILD_DIR=cmake-build-release ./test/test_env.sh bench-dpi 1000000"
+# ──────────────────────────────────────────────────────────────────────
+# Benchmark tasks. Two subcommands live in test/test_env.sh.
+# ──────────────────────────────────────────────────────────────────────
+# gen_test_pcap.py — 5-tuple only (TCP SYN, UDP, DNS), NO payload. Used
+# to measure pure SPI throughput: without L7 there's nothing for
+# ExtractHostname / MatchDpi to chew on, so the DPI path is bypassed
+# regardless of DPI rules in config.yaml. Use this to isolate SPI cost.
+bench-spi = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-spi 500000"
+# gen_dpi_bench_pcap.py — TCP SYN + TLS ClientHello with SNIs matching the
+# production DPI filter groups. End-to-end benchmark using whatever
+# rules config.yaml declares (SPI + DPI when DPI is enabled).
+bench = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench 500000"

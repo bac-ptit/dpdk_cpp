@@ -3,7 +3,7 @@ app:
   mac_updating: false
   timer_period_sec: 5
 dpi:
-  enabled: true
+  enabled: false
   # DPI rule groups referenced by SPI's `dpi_filter_group` link.
   # Priorities ASC — highest-priority rule wins per hostname.
   # fg_l7_*_filter groups are linked from SPI; fg_l7_catchall covers
@@ -26,14 +26,14 @@ dpi:
     label: catchall
     priority: 999
 eal:
-  cpu_core_list: 0-4
+  cpu_core_list: 0-7
   disable_hugepages: false
   disable_pci: true
   file_prefix: spifast
   legacy_memory: true
-  log_level: '7'
+  log_level: '8'
   memory_channels: 2
-  memory_size: '3418'
+  memory_size: '4000'
   process_type: primary
   virtual_devices:
   - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q1.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q2.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q3.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q4.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q5.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q6.pcap,infinite_rx=1
@@ -79,7 +79,7 @@ l3_forward:
     queue_id: 7
   - lcore_id: 9
     port_id: 0
-    queue_id: 8
+    queue_id: 81
   - lcore_id: 10
     port_id: 0
     queue_id: 9
@@ -121,7 +121,7 @@ l3_forward:
     queue_id: 10
 mempool:
   cache_size: 256
-  memory_buffer_count: 1000250
+  memory_buffer_count: 1050000
   memory_buffer_size: 2176
   name: mbuf_pool
 pcap_injector:
@@ -213,8 +213,40 @@ spi:
       protocol: udp
     name: fg_l34_udp_sdf1006
     precedence: 106
+  # ────────────────────────────────────────────────────────────────────
+  # HTTP REQUEST/RESPONSE PAIR (per notepad) — VM1 ↔ VM2 over port 80.
+  # Demonstrates the canonical FlowKey + is_response DPI-skip pattern:
+  #   - fg_http_request matches the request (VM1 → VM2:80). First packet
+  #     populates the flow cache; DPI extracts Host header (l7_required).
+  #   - fg_http_response matches the response (VM2:80 → VM1) ONLY when the
+  #     cache misses (response arrives first, or TTL expired between).
+  #     With l7_required: false the response never re-runs hostname DPI —
+  #     the canonical cache entry already covers it.
+  # The pair is fully specified (src_ip + dst_ip + port + proto) so both
+  # filters are TSS-eligible → O(1) hash probe on every cache miss.
+  # ────────────────────────────────────────────────────────────────────
+  - action: forward
+    filters:
+    - destination_ip_address: 192.168.200.180
+      destination_port: 80
+      label: HTTP_REQUEST
+      protocol: tcp
+      source_ip_address: 192.168.100.130
+    l7_required: true
+    name: fg_http_request
+    precedence: 102
+  - action: forward
+    filters:
+    - destination_ip_address: 192.168.100.130
+      label: HTTP_RESPONSE
+      protocol: tcp
+      source_ip_address: 192.168.200.180
+      source_port: 80
+    l7_required: false
+    name: fg_http_response
+    precedence: 103
   flow_overflow_action: drop
   flow_ttl_sec: 300
   max_concurrent_flows: 1000000
-  packet_distribution: auto
-  worker_count: 4
+  packet_distribution: queue
+  worker_count: 7

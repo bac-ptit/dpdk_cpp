@@ -152,3 +152,28 @@ test/test_env.sh                    # cmd_bench_spi delegates to cmd_bench_dpi w
 
 4. **The 8 % gap remaining is `bench-spi`'s mispredict cost**, not a real
    pipeline difference. Production is gap-free.
+
+## Worker/queue scaling (`pixi run bench`, verified 2026-07-19)
+
+The simplified benchmark driver was run exactly once per configuration with
+1,000,000 DPI-shaped packets, `infinite_rx=1`, queue-per-worker distribution,
+DPI disabled by the user's config, and a 15-second process timeout. Every test
+kept `memory_buffer_count=1,050,000`, `max_concurrent_flows=1,000,000`, and
+used one distinct `rx_pcap=` shard per worker.
+
+| Workers / RX queues | CPU layout | Burst | Mempool cache | Mpps | Gbps |
+|---:|---|---:|---:|---:|---:|
+| 4 | one worker per physical core | 128 | 256 | 32.90 | 16.85 |
+| 7 | one worker on each non-main physical core | 128 | 256 | 50.93 | 26.08 |
+| 11 | physical cores plus four SMT siblings | 128 | 256 | 61.83 | 31.66 |
+| **15** | all 16 logical CPUs (main + 15 workers) | **128** | **256** | **72.70** | **37.22** |
+| 15 | all logical CPUs | 256 | 256 | 43.09 | 22.06 |
+| 15 | all logical CPUs | 128 | 512 | 71.90 | 36.81 |
+
+The tested winner is 15 queues/workers with burst 128 and mempool cache 256.
+It produced no flow-table-full events, pressure evictions, resizes, malformed
+packets, or PMD queue errors. Burst 256 regressed throughput by about 41%; the
+512-object mempool cache did not beat 256. Since the PCAP PMD hard ceiling is
+16 queues and one lcore is reserved as main, 15 workers is the maximum layout
+for this host and this single `net_pcap` device. These are single-run synthetic
+PCAP results, not production-NIC confidence intervals.

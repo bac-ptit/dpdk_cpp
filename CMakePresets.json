@@ -17,8 +17,7 @@
                 "CMAKE_CXX_COMPILER": "clang++",
                 "CMAKE_CXX_STANDARD": "26",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "CMAKE_PREFIX_PATH": "${sourceDir}/.pixi/envs/default",
-                "yaml-cpp_DIR": "${sourceDir}/.pixi/envs/default/lib/cmake/yaml-cpp"
+                "CMAKE_PREFIX_PATH": "${sourceDir}/.pixi/envs/default"
             },
             "environment": {
                 "PKG_CONFIG_PATH": "${sourceDir}/.pixi/envs/default/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}"

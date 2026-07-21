@@ -78,21 +78,37 @@ def dst_to_hostname(dst_ip, dst_port):
     """Return the hostname to embed in the L7 payload for the given 5-tuple.
 
     Returns None for miss / drop packets (no L7 payload needed).
+
+    Maps must match docs/spi_rules.csv exactly: every IP here is in a
+    specific fg_l34_* SPI rule, and the hostname must align with the
+    DPI group that rule's `dpi_filter_group` declares. Misaligned
+    hostnames still get classified correctly via the SPI→DPI static
+    link, but the wasted ExtractHostname work skews the dpi_cache_*
+    counters in bench output.
     """
-    # Facebook cluster — IP varies but all in FB ranges
+    # Facebook cluster — every IP below is in a fg_l34_facebook CIDR
+    # rule (CSV rules 1–5: 31.13.64.0/18, 66.220.144.0/20,
+    # 69.63.176.0/20, 157.240.0.0/16, exact 69.220.144.5).
     fb_ips = {
         '31.13.65.1', '66.220.145.1', '69.63.177.1', '157.240.1.1', '69.220.144.5',
     }
-    yt_ips = {'142.250.1.1', '216.58.193.1'}   # YouTube range
-    google_ips = {'172.217.1.1', '74.125.0.1'}  # Google range
+    # YouTube cluster — ALL four IPs in fg_l34_youtube (CSV rules 6–9:
+    # 142.250.0.0/15, 172.217.0.0/16, 216.58.192.0/19, exact 74.125.0.1).
+    # Note: 172.217.0.0/16 and 74.125.0.1 are in YouTube per the docs,
+    # even though both ranges are owned by Google. config.yaml + the
+    # CSV both label them as YouTube so the pcap must follow.
+    yt_ips = {'142.250.1.1', '216.58.193.1', '172.217.1.1', '74.125.0.1'}
+    # No google_ips set: docs/spi_rules.csv has no SPI rule that maps
+    # to a Google-IP range, so the SPI→DPI link path can never land on
+    # fg_l7_google. Packets to other IPs fall through to the catch-all
+    # fg_l7_catchall DPI rule via the `*.example` miss hostnames below.
 
     if dst_ip in fb_ips:
         return ('www.facebook.com' if dst_port == 443 else 'facebook.com')
     if dst_ip in yt_ips:
         return ('www.youtube.com' if dst_port == 443 else 'youtube.com')
-    if dst_ip in google_ips:
-        return ('www.google.com' if dst_port == 443 else 'google.com')
-    # 10.0.0.1 (HTTP/HTTPS catch-all)
+    # 10.0.0.1 (HTTP/HTTPS catch-all) — matches CSV's fg_l34_http_sdf1003
+    # / fg_l34_https_sdf1004 (dst_ip=NA, port=80/443, tcp).
     if dst_ip == '10.0.0.1':
         return ('www.example.com' if dst_port == 443 else 'example.com')
 
@@ -129,7 +145,7 @@ def make_udp_packet(dst_mac, src_mac, src_ip, dst_ip, sport, dport, payload=b'')
 # ──────────────────────────────────────────────────────────────────────
 
 
-def build_sharded_dpi_pcaps(directory, count, shards, match_percent, prefix):
+def build_sharded_dpi_pcaps(directory, count, shards, match_percent, prefix, response_percent=100):
     """Generate benchmark PCAP shards with full L7 payload for DPI bench.
 
     Layout (matches `build_sharded_bench_pcaps`):
@@ -138,11 +154,20 @@ def build_sharded_dpi_pcaps(directory, count, shards, match_percent, prefix):
         carry TLS ClientHello (port 443) or HTTP GET (port 80) with a
         hostname matched by the production DPI filter groups
       - the rest are miss packets (TCP/UDP without DPI match)
+
+    `response_percent` (0-100): for each match/miss packet, also emit a
+    response counterpart with src/dst IP and ports swapped (MACs swapped
+    too). The response shares the canonical FlowKey with its request, so
+    the second packet of the pair triggers a flow cache hit. Response
+    payload is empty (cache hit means DPI doesn't re-process the response
+    anyway). Drop packets get NO response.
     """
     if shards <= 0:
         raise ValueError('shards must be greater than 0')
     if not 0 <= match_percent <= 100:
         raise ValueError('match-percent must be between 0 and 100')
+    if not 0 <= response_percent <= 100:
+        raise ValueError('response-percent must be between 0 and 100')
 
     os.makedirs(directory, exist_ok=True)
     handles = []
@@ -162,24 +187,39 @@ def build_sharded_dpi_pcaps(directory, count, shards, match_percent, prefix):
     matched = 0
     dropped = 0
     missed = 0
+    responses = 0
     shard_counts = [0] * shards
     dst_mac = 'a0:36:bc:65:8f:11'
     src_mac = '00:00:00:00:00:01'
 
     try:
+        ts = 1000
         for index in range(count):
             shard = index % shards
             local_index = shard_counts[shard]
             shard_counts[shard] += 1
 
+            # Per-shard disjoint source-IP — `10.<shard>.0.1`. Without this
+            # rewrite, every shard's local_index=j produces the same
+            # 5-tuple, so under multi-worker load all workers hit the same
+            # FlowTable slot and the same `last_seen_tsc` cache line —
+            # true-sharing via MESI coherence caps scaling well below
+            # linear (≈50% when going from 4 → 7 workers). SPI rules match
+            # on dst_ip, so varying src_ip does not affect SPI matching.
+            # Uses src_ip (full 32-bit space) rather than a sport shift so
+            # shards > 10 don't wrap-around the 60 000 ephemeral-port range.
+            src_ip = f'10.{shard}.0.1'
+            sport = 1024 + (local_index % 60000)
+
             if index < drop_count:
-                proto, src_ip, dst_ip, port = SPI_DROP_RULES[local_index % len(SPI_DROP_RULES)]
-                sport = 1024 + (local_index % 60000)
+                proto, _, dst_ip, port = SPI_DROP_RULES[local_index % len(SPI_DROP_RULES)]
                 pkt = make_udp_packet(dst_mac, src_mac, src_ip, dst_ip, sport, port)
                 dropped += 1
+                handles[shard].write(pcap_pkt_hdr(ts, len(pkt)))
+                handles[shard].write(pkt)
+                ts += 1
             elif index < drop_count + match_count:
-                proto, src_ip, dst_ip, port = SPI_MATCH_RULES[local_index % len(SPI_MATCH_RULES)]
-                sport = 1024 + (local_index % 60000)
+                proto, _, dst_ip, port = SPI_MATCH_RULES[local_index % len(SPI_MATCH_RULES)]
                 hostname = dst_to_hostname(dst_ip, port)
                 if proto == 'tcp' and hostname is not None:
                     payload = (make_tls_clienthello(hostname) if port == 443
@@ -190,9 +230,27 @@ def build_sharded_dpi_pcaps(directory, count, shards, match_percent, prefix):
                     import gen_test_pcap
                     pkt = gen_test_pcap.make_packet(proto, dst_mac, src_mac, src_ip, dst_ip, sport, port)
                 matched += 1
+                handles[shard].write(pcap_pkt_hdr(ts, len(pkt)))
+                handles[shard].write(pkt)
+                ts += 1
+
+                # Optional response — swap IP/port + MACs. Empty payload
+                # (cache hit, DPI doesn't re-process). Deterministic via
+                # (local_index % 100) < response_percent for reproducible
+                # runs.
+                if response_percent > 0 and (local_index % 100) < response_percent:
+                    if proto == 'tcp':
+                        response = make_tcp_packet(src_mac, dst_mac, dst_ip, src_ip,
+                                                   port, sport, b'')
+                    else:
+                        response = make_udp_packet(src_mac, dst_mac, dst_ip, src_ip,
+                                                   port, sport)
+                    handles[shard].write(pcap_pkt_hdr(ts, len(response)))
+                    handles[shard].write(response)
+                    ts += 1
+                    responses += 1
             else:
-                proto, src_ip, dst_ip, port = SPI_MISS_RULES[local_index % len(SPI_MISS_RULES)]
-                sport = 1024 + (local_index % 60000)
+                proto, _, dst_ip, port = SPI_MISS_RULES[local_index % len(SPI_MISS_RULES)]
                 # Miss packets: include a non-matching hostname to exercise DPI cache negative path.
                 if proto == 'tcp':
                     payload = make_tls_clienthello(f'unknown-host-{index}.example')
@@ -200,9 +258,24 @@ def build_sharded_dpi_pcaps(directory, count, shards, match_percent, prefix):
                 else:
                     pkt = make_udp_packet(dst_mac, src_mac, src_ip, dst_ip, sport, port)
                 missed += 1
+                handles[shard].write(pcap_pkt_hdr(ts, len(pkt)))
+                handles[shard].write(pkt)
+                ts += 1
 
-            handles[shard].write(pcap_pkt_hdr(1000 + index, len(pkt)))
-            handles[shard].write(pkt)
+                # Optional response for miss packets too (canonical key
+                # still matches, exercises cache for non-SPI-matched flows).
+                if response_percent > 0 and (local_index % 100) < response_percent:
+                    if proto == 'tcp':
+                        response = make_tcp_packet(src_mac, dst_mac, dst_ip, src_ip,
+                                                   port, sport, b'')
+                    else:
+                        response = make_udp_packet(src_mac, dst_mac, dst_ip, src_ip,
+                                                   port, sport)
+                    handles[shard].write(pcap_pkt_hdr(ts, len(response)))
+                    handles[shard].write(response)
+                    ts += 1
+                    responses += 1
+
             if (index + 1) % 100000 == 0:
                 print(f'  ... {index + 1}/{count}')
     finally:
@@ -210,8 +283,10 @@ def build_sharded_dpi_pcaps(directory, count, shards, match_percent, prefix):
             handle.close()
 
     size_mb = sum(os.path.getsize(path) for path in paths) / (1024 * 1024)
+    total = count + responses
     print(
-        f'Generated {shards} shards in {directory}: {count} packets '
+        f'Generated {shards} shards in {directory}: {count} requests + '
+        f'{responses} responses = {total} packets '
         f'({matched} match, {missed} miss, {dropped} drop, {size_mb:.1f} MB)'
     )
 
@@ -229,6 +304,9 @@ def main():
                         help='Number of shards (default 15)')
     parser.add_argument('--match-percent', type=int, default=70,
                         help='Percentage of generated packets that match SPI rules')
+    parser.add_argument('--response-percent', type=int, default=100,
+                        help='Percentage of match/miss packets that get a response '
+                             'with swapped IP/port (default 100, set 0 to disable)')
     parser.add_argument('--prefix', default='dpi_bench_q',
                         help='Filename prefix for sharded DPI benchmark pcaps')
     args = parser.parse_args()
@@ -237,9 +315,12 @@ def main():
         raise ValueError('shards must be greater than 0')
     if not 0 <= args.match_percent <= 100:
         raise ValueError('match-percent must be between 0 and 100')
+    if not 0 <= args.response_percent <= 100:
+        raise ValueError('response-percent must be between 0 and 100')
 
     build_sharded_dpi_pcaps(args.path, args.count, args.shards,
-                            args.match_percent, args.prefix)
+                            args.match_percent, args.prefix,
+                            args.response_percent)
 
 
 if __name__ == '__main__':
