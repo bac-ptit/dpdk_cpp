@@ -151,13 +151,18 @@ def bench_packet(index, matching, shard=0):
     across all worker lcores (≈50% scaling at 4→7 workers instead of
     linear). SPI rules match on dst_ip, so the varying src_ip does not
     affect SPI matching.
+
+    sport is pinned to {80, 443} so the 5-tuple space stays small enough
+    for the flow table (see build_sharded_bench_pcaps for the full
+    rationale — cycling through 60k ephemeral ports would overflow the
+    1M flow table on the first pcap loop and starve cache hits).
     """
     dst_mac = 'a0:36:bc:65:8f:11'
     src_mac = '00:00:00:00:00:01'
     rules = SPI_MATCH_RULES if matching else SPI_MISS_RULES
     proto, _, dst_ip, port = rules[index % len(rules)]
     src_ip = f'10.{shard}.0.1'
-    sport = 1024 + (index % 60000)
+    sport = 80 if (index % 2 == 0) else 443
     return make_packet(proto, dst_mac, src_mac, src_ip, dst_ip, sport, port), matching
 
 
@@ -212,7 +217,14 @@ def build_sharded_bench_pcaps(directory, count, shards, match_percent, prefix, r
 
             # Per-shard source-IP rewrite (see bench_packet docstring).
             src_ip = f'10.{shard}.0.1'
-            sport = 1024 + (local_index % 60000)
+            # Pin sport to {80, 443} so the 5-tuple space stays tiny.
+            # Cycling through 60k ephemeral ports would generate ~8.6M
+            # unique 5-tuples per shard (>> 1M flow table), turning every
+            # packet into a cache miss and overflowing the table on the
+            # first loop. With sport ∈ {80, 443} we get ~288 unique
+            # tuples per shard × 7 shards = ~2K total — every packet from
+            # the second pcap loop onwards is a cache hit.
+            sport = 80 if (local_index % 2 == 0) else 443
 
             # Determine packet type: drop (5%), match, or miss
             if index < drop_count:

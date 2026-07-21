@@ -175,6 +175,8 @@ def run_test(name, packets, cfg, pcap_path, tx_pcap):
     return parse_stats(output), output
 
 
+
+
 def main():
     with open(os.path.join(PROJECT_DIR, "config.yaml")) as f:
         cfg = yaml.safe_load(f)

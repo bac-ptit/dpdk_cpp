@@ -13,6 +13,8 @@
 #include <rte_tcp.h>
 #include <rte_udp.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,6 +25,7 @@
 #include <cstring>
 #include <expected>
 #include <format>
+#include <iostream>
 #include <limits>
 #include <iterator>
 #include <memory>
@@ -469,7 +472,14 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
     const auto stats{CollectStats(counters)};
     const auto elapsed_sec{static_cast<double>(current_tsc - start_tsc) / static_cast<double>(rte_get_tsc_hz())};
     const auto mpps{static_cast<double>(stats.received) / elapsed_sec / 1e6};
+    // Print to std::cerr (unbuffered by default, separate stream from workers'
+    // stdout) so a stdout-mutex contention or pipe-buffer stall on the main
+    // lcore can never appear as the dispatcher "hanging". std::cerr MUST come
+    // FIRST — the (ostream, fmt, args...) overload of std::println picks it as
+    // the destination; placing it after the format string makes the compiler
+    // treat it as a format arg (no std::formatter<ostream> exists → build fail).
     std::println(
+        std::cerr,
         "SPI stats: received={} matched={} flow_table_full={} pressure_evictions={} "
         "flow_table_resizes={} dpi_skipped_by_spi={} dpi_skipped_by_link={} "
         "elapsed={:.1f}s Mpps={:.2f}",
@@ -702,7 +712,12 @@ void PrintDispatchMap(const dpdk::Environment& environment, std::size_t worker_c
     ++counters.flow_table_full;
     if (context.flow_overflow_drop) {
       // Tell the caller to drop this packet; DropPacket frees the mbuf and
-      // increments `dropped_by_rule` + `dropped`.
+      // increments `dropped_by_rule` + `dropped`. Bump `matched` so the
+      // matched counter stays consistent with the dropped_by_rule counter
+      // (every `dropped_by_rule++` must correspond to exactly one
+      // `matched++`; otherwise the rule engine's credit is hidden in
+      // the overflow path and stats look like SPI never matched anything).
+      ++counters.matched;
       return {.metadata = metadata, .action = Action::kDrop, .parsed = true, .matched = true};
     }
     // reclassify: forward without caching. Decrement `matched` so the caller
@@ -888,9 +903,19 @@ struct DpiMatch {
       if (context.flow_table->Insert(key, /*match_count=*/1, spi_match.action) != FlowInsertResult::kOk) [[unlikely]] {
         ++counters.flow_table_full;
         if (context.flow_overflow_drop) {
+          // Bump `matched` for counter consistency: the returned
+          // PacketClassification has matched=true, so the caller will
+          // increment `dropped_by_rule`; without this bump the matched
+          // counter would under-count every overflow drop.
+          ++counters.matched;
           return {.metadata = metadata, .action = Action::kDrop, .parsed = true, .matched = true};
         }
-        // overflow policy == reclassify: don't cache, fall through.
+        // overflow policy == reclassify: don't cache, fall through. Bump
+        // matched here too — the caller treats this packet as a successful
+        // match (action=spi_match.action, matched=true) but we did NOT cache
+        // the entry. Still count as matched because the rule engine did its
+        // job; only the cache failed.
+        ++counters.matched;
         return {.metadata = metadata, .action = spi_match.action, .parsed = true, .matched = true};
       }
       ++counters.dpi_skipped_by_link;
@@ -1150,10 +1175,18 @@ struct DpiMatch {
     if (context.flow_table->Insert(key, /*match_count=*/1, spi_match.action) != FlowInsertResult::kOk) [[unlikely]] {
       ++counters.flow_table_full;
       if (context.flow_overflow_drop) {
+        // Bump `matched` for counter consistency with the returned
+        // PacketClassification (action=Drop, matched=true → caller will
+        // increment dropped_by_rule). Without this bump, every overflow
+        // drop under-counts the matched counter.
+        ++counters.matched;
         action = Action::kDrop;
         matched = true;
       }
       // matched stays false → caller treats as unknown → forwards.
+      // NOTE: reclassify path keeps matched=false intentionally — the
+      // caller will increment `unknown`, not `dropped_by_rule`, so we
+      // don't bump `matched` here.
     } else {
       ++counters.dpi_skipped_by_link;
       ++counters.matched;
@@ -1194,10 +1227,14 @@ struct DpiMatch {
       // Flow table is full (-ENOSPC). Apply configured overflow policy.
       ++counters.flow_table_full;
       if (context.flow_overflow_drop) {
+        // Bump `matched` for counter consistency (returned PacketClassification
+        // will have matched=true → caller increments dropped_by_rule).
+        ++counters.matched;
         action = Action::kDrop;
         matched = true;
       }
       // reclassify: matched stays false; caller treats as unknown and forwards.
+      // No `matched` bump here — caller increments `unknown`, not `dropped_by_rule`.
     } else {
       ++counters.matched;
       action = final_action;
@@ -1290,6 +1327,9 @@ void BulkFlowLookup(FlowTable& flow_table,
         // Flow table is full (-ENOSPC). Apply configured overflow policy.
         ++counters.flow_table_full;
         if (context.flow_overflow_drop) {
+          // Bump `matched` for counter consistency with the returned
+          // PacketClassification (matched=true → caller increments dropped_by_rule).
+          ++counters.matched;
           action = Action::kDrop;
           matched = true;
         } else {
@@ -1852,11 +1892,6 @@ std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const std::at
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
       flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
     }
-    if (flow_ttl_sec_ > 0 && flow_table_->ShouldEvictOnPressure()) {
-      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
-      flow_table_->ResetOverflowCount();
-      counters_.pressure_evictions.fetch_add(1, std::memory_order_relaxed);
-    }
     // Yield the main lcore when there's no work — keeps Ctrl+C latency at
     // ~100 µs while letting the scheduler put this core to sleep. `rte_pause`
     // is only a CPU PAUSE hint (~10 cycles), it spins forever at GHz and
@@ -1893,16 +1928,16 @@ std::expected<PipelineStats, std::string> Pipeline::RunFlowHashDispatch(const st
   const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
   const std::span dispatch_rings{dispatch_rings_.data(), dispatch_rings_.size()};
   while (force_quit.load(std::memory_order_relaxed) == 0) {
+    static auto last_tick_tsc{std::uint64_t{rte_rdtsc()}};
+    if (const auto now{rte_rdtsc()}; now - last_tick_tsc > rte_get_tsc_hz() * 5) {
+      std::println(stderr, "[loop] main tick force_quit={}", force_quit.load(std::memory_order_relaxed));
+      last_tick_tsc = now;
+    }
     ProcessDispatchIteration(environment_, burst_size_, packets, dispatch_rings, counters_);
     MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
     MaybeReload(force_quit, reload_flag_, config_path_, reload_barrier_);
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
       flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
-    }
-    if (flow_ttl_sec_ > 0 && flow_table_->ShouldEvictOnPressure()) {
-      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
-      flow_table_->ResetOverflowCount();
-      counters_.pressure_evictions.fetch_add(1, std::memory_order_relaxed);
     }
   }
 

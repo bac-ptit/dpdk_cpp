@@ -22,6 +22,9 @@ std::atomic<int> reload_requested{0};
  * @param signal  The received signal number.
  */
 void HandleSignal(int signal) noexcept {
+  // Async-signal-safe: ONLY lock-free atomic stores. std::println /
+  // std::cerr allocate and lock, which deadlocks against any normal-path
+  // std::println(stderr, ...) that was interrupted mid-write.
   if (signal == SIGINT || signal == SIGTERM) {
     force_quit.store(1, std::memory_order_relaxed);
   } else if (signal == SIGUSR1) {

@@ -331,6 +331,7 @@ class FlowTable final {
       }
       data = free_list_.back();
       free_list_.pop_back();
+      rte_spinlock_unlock(&freelist_lock_);
     }
     // Initialise the slot before publishing — a concurrent Lookup must
     // observe either the pre-Insert empty state (action_and_count == 0) or
@@ -371,6 +372,7 @@ class FlowTable final {
       }
       data = free_list_.back();
       free_list_.pop_back();
+      rte_spinlock_unlock(&freelist_lock_);
     }
     data->last_seen_tsc.store(rte_rdtsc(), std::memory_order_relaxed);
     const auto packed{(match_count << kFlowMatchCountShift)

@@ -59,8 +59,8 @@ reload = "./script/reload.sh"
 # to measure pure SPI throughput: without L7 there's nothing for
 # ExtractHostname / MatchDpi to chew on, so the DPI path is bypassed
 # regardless of DPI rules in config.yaml. Use this to isolate SPI cost.
-bench-spi = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-spi 500000"
+bench-spi = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-spi 1000000"
 # gen_dpi_bench_pcap.py — TCP SYN + TLS ClientHello with SNIs matching the
 # production DPI filter groups. End-to-end benchmark using whatever
 # rules config.yaml declares (SPI + DPI when DPI is enabled).
-bench = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench 500000"
+bench = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench 1000000"
