@@ -114,6 +114,10 @@ int main() {
     return 1;
   }
 
+  // Free raw uncompiled filter group strings from memory immediately
+  config->spi.filter_groups.clear();
+  config->spi.filter_groups.shrink_to_fit();
+
   auto dpi_rules{CompileDpiRules(dpi_config)};
   if (!dpi_rules) {
     std::println(stderr, "{}", dpi_rules.error());

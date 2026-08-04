@@ -526,6 +526,10 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
     return;
   }
 
+  // Free raw uncompiled filter group strings from memory immediately
+  config->spi.filter_groups.clear();
+  config->spi.filter_groups.shrink_to_fit();
+
   std::unique_ptr<dpi::DpiRuleTable> new_dpi_rules;
   if (config->dpi.enabled) {
     auto compiled_dpi{dpi::CompileDpiRuleTable(config->dpi)};
