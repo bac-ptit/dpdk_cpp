@@ -1,6 +1,10 @@
 #pragma once
 
+#include <arpa/inet.h>
+
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <format>
 #include <string_view>
 #include <utility>
@@ -14,6 +18,15 @@ namespace dpdk {
 /// Format an IPv4 address in host byte order as "A.B.C.D".
 [[nodiscard]] inline auto FormatIpv4(std::uint32_t ip, std::format_context& ctx) noexcept {
   return std::format_to(ctx.out(), "{}.{}.{}.{}", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+}
+
+/// Format an IPv6 address array as text.
+[[nodiscard]] inline auto FormatIpv6(const std::array<std::uint8_t, 16>& ip, std::format_context& ctx) noexcept {
+  in6_addr addr{};
+  std::memcpy(&addr.s6_addr, ip.data(), 16);
+  char buf[INET6_ADDRSTRLEN]{};
+  inet_ntop(AF_INET6, &addr, buf, sizeof(buf));
+  return std::format_to(ctx.out(), "{}", buf);
 }
 
 }  // namespace dpdk
@@ -51,11 +64,23 @@ template <>
 struct std::formatter<dpdk::spi::PacketMetadata> : std::formatter<std::string_view> {
   static auto format(const dpdk::spi::PacketMetadata& m, std::format_context& ctx) noexcept {
     auto out = std::format_to(ctx.out(), "{} src=", m.protocol);
-    out = dpdk::FormatIpv4(m.source_ip_address, ctx);
-    out = std::format_to(out, ":{}", m.source_port);
-    out = std::format_to(out, " dst=");
-    out = dpdk::FormatIpv4(m.destination_ip_address, ctx);
-    return std::format_to(out, ":{}", m.destination_port);
+    if (m.ip_version == dpdk::spi::IpVersion::kIpv4) {
+      out = dpdk::FormatIpv4(rte_be_to_cpu_32(m.source_ip_be), ctx);
+      out = std::format_to(out, ":{}", rte_be_to_cpu_16(m.source_port_be));
+      out = std::format_to(out, " dst=");
+      out = dpdk::FormatIpv4(rte_be_to_cpu_32(m.destination_ip_be), ctx);
+      out = std::format_to(out, ":{}", rte_be_to_cpu_16(m.destination_port_be));
+    } else {
+      out = dpdk::FormatIpv6(m.source_ip6_address, ctx);
+      out = std::format_to(out, ":{}", rte_be_to_cpu_16(m.source_port_be));
+      out = std::format_to(out, " dst=");
+      out = dpdk::FormatIpv6(m.destination_ip6_address, ctx);
+      out = std::format_to(out, ":{}", rte_be_to_cpu_16(m.destination_port_be));
+    }
+    if (m.hostname != nullptr && m.hostname_length > 0) {
+      out = std::format_to(out, " host={}", std::string_view(m.hostname, m.hostname_length));
+    }
+    return out;
   }
 };
 

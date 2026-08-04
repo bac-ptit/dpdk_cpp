@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <string>
@@ -39,6 +40,26 @@ namespace dpdk::spi {
  *         or an error string.
  */
 [[nodiscard]] std::expected<std::pair<std::uint32_t, std::uint32_t>, std::string> ParseCidr(
+    const std::string& cidr) noexcept;
+
+/**
+ * @brief Parse text IPv6 address into 16-byte array.
+ *
+ * Converts "2001:db8::1" into raw 16-byte representation.
+ * @param address The IPv6 address string.
+ * @return 16-byte array on success, or an error string.
+ */
+[[nodiscard]] std::expected<std::array<std::uint8_t, 16>, std::string> ParseIpv6Address(
+    const std::string& address) noexcept;
+
+/**
+ * @brief Parse IPv6 CIDR notation into address array and prefix length.
+ *
+ * Parses "2001:db8::/32" into (address_array, prefix_length).
+ * @param cidr The IPv6 CIDR string.
+ * @return Pair of (16-byte address, prefix length), or an error string.
+ */
+[[nodiscard]] std::expected<std::pair<std::array<std::uint8_t, 16>, std::uint16_t>, std::string> ParseIpv6Cidr(
     const std::string& cidr) noexcept;
 
 }  // namespace dpdk::spi

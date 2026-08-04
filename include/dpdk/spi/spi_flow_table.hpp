@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
@@ -55,6 +56,25 @@ static_assert(sizeof(FlowKey) == kFlowKeySize);
   }
   return FlowKey{.src_ip = sip, .dst_ip = dip, .src_port = sp, .dst_port = dp,
                  .protocol = proto, .pad = {}};
+}
+
+/// Build a canonical FlowKey directly from PacketMetadata for IPv4 or IPv6.
+[[gnu::hot, gnu::always_inline]] static inline FlowKey MakeCanonicalFromMetadata(
+    const PacketMetadata& meta) noexcept {
+  if (meta.ip_version == IpVersion::kIpv4) [[likely]] {
+    return MakeCanonical(meta.source_ip_be, meta.destination_ip_be,
+                         meta.source_port_be, meta.destination_port_be, meta.protocol);
+  }
+
+  // For IPv6, fold the 16-byte IPv6 addresses using 32-bit XOR words for high performance
+  std::uint32_t s6_head{}, s6_tail{}, d6_head{}, d6_tail{};
+  std::memcpy(&s6_head, meta.source_ip6_address.data(), sizeof(std::uint32_t));
+  std::memcpy(&s6_tail, meta.source_ip6_address.data() + 12, sizeof(std::uint32_t));
+  std::memcpy(&d6_head, meta.destination_ip6_address.data(), sizeof(std::uint32_t));
+  std::memcpy(&d6_tail, meta.destination_ip6_address.data() + 12, sizeof(std::uint32_t));
+
+  return MakeCanonical(s6_head ^ s6_tail, d6_head ^ d6_tail,
+                       meta.source_port_be, meta.destination_port_be, meta.protocol);
 }
 
 // ============================================================================

@@ -255,6 +255,9 @@ struct SpiConfig {
   /// "drop" — drop the packet (predictable, observable via `flow_table_full`).
   /// "reclassify" — forward without caching; the next packet re-runs SPI/DPI.
   std::string flow_overflow_action{"drop"};
+  /// Path to binary BEVE or YAML rule stream file (e.g. "rules.beve").
+  /// When specified, rules are loaded directly from this binary stream file.
+  std::string rule_path;
   /// Hierarchical filter groups — sorted by precedence (ascending).
   std::vector<SpiFilterGroupConfig> filter_groups;
 };
@@ -279,6 +282,12 @@ struct DpiConfig {
   bool enabled{false};
   /// Ordered list of DPI filters (sorted by priority after compilation).
   std::vector<DpiFilterConfig> filters;
+};
+
+/// Standalone rule store container for binary stream files.
+struct RuleStoreConfig {
+  std::vector<SpiFilterGroupConfig> filter_groups;
+  DpiConfig dpi;
 };
 
 /// Pcap injector — bypass net_pcap PMD's payload truncation by reading a

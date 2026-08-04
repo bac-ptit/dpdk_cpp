@@ -5,6 +5,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "dpdk/config/dpdk_config.hpp"
@@ -117,11 +118,16 @@ class DpiRuleTable final {
   /// highest-priority match.
   std::vector<CompiledDpiFilter> filters_;
 
-  /// Exact-match rules (small, < 10 entries typical). Linear scan.
+  /// Exact-match lookup map (O(1) hash table).
+  std::unordered_map<std::string_view, std::uint16_t> exact_map_;
+
+  /// Suffix-match lookup map (O(1) hash table keyed by domain e.g. "facebook.com").
+  std::unordered_map<std::string_view, std::uint16_t> suffix_map_;
+
+  /// Exact-match rules list.
   std::vector<std::pair<std::string_view, std::uint16_t>> exact_list_;
 
-  /// Suffix-match rules sorted by domain ASC for early-exit on mismatch.
-  /// ~25 entries typical, fits in 1-2 cache lines.
+  /// Suffix-match rules list.
   std::vector<DpiSuffixEntry> suffix_list_;
 
   /// Index into `filters_` of the `*` catch-all rule, or sentinel if none.

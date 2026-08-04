@@ -7,18 +7,26 @@
 
 #include "dpdk/spi/spi_rule_engine.hpp"
 
+struct rte_ip_frag_tbl;
+
 namespace dpdk::spi {
 
 /**
- * @brief Parse Ethernet/IPv4/TCP/UDP headers from a raw mbuf into metadata.
+ * @brief Parse Ethernet/IPv4/IPv6/TCP/UDP headers from a raw mbuf into metadata.
  *
- * Walks the mbuf chain at offset 0: Ethernet, IPv4, (TCP | UDP). Only
- * IPv4 packets with known L4 protocols are parsed; all others return nullopt.
+ * Walks the mbuf chain: Ethernet, IPv4/IPv6, (TCP | UDP).
+ * If `frag_tbl` is provided and the packet is fragmented, performs IP reassembly
+ * using DPDK librte_ip_frag and enforces OWASP fragment normalization rules.
+ *
  * @param packet  The received mbuf to parse.
- * @return PacketMetadata on success, or nullopt for unsupported/malformed
- *         packets.
+ * @param frag_tbl Optional IP fragment table for reassembly.
+ * @param tsc_timestamp Current TSC timestamp.
+ * @return PacketMetadata on success, or nullopt for unsupported/malformed/in-progress fragment packets.
  */
-[[nodiscard]] std::optional<PacketMetadata> ParsePacket(const rte_mbuf& packet) noexcept;
+[[nodiscard]] std::optional<PacketMetadata> ParsePacket(
+    const rte_mbuf& packet,
+    struct ::rte_ip_frag_tbl* frag_tbl = nullptr,
+    std::uint64_t tsc_timestamp = 0) noexcept;
 
 /**
  * @brief Extract hostname from TLS ClientHello SNI extension.

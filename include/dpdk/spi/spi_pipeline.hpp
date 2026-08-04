@@ -24,6 +24,8 @@
 struct rte_mbuf;
 struct rte_ring;
 
+struct rte_ip_frag_tbl;
+
 namespace dpdk::spi {
 
 /// Snapshot of pipeline counters collected at a point in time.
@@ -137,6 +139,7 @@ struct alignas(64) WorkerContext {
   /// active DpiRuleTable pointer under a memory_order_acquire load.
   const dpi::DpiRuleTableManager* dpi_rule_manager{};
   FlowTable* flow_table{};
+  struct ::rte_ip_frag_tbl* ip_frag_tbl{nullptr};
   const std::vector<L3RouteEntry>* l3_routes{};
   const std::vector<EthernetDestinationEntry>* ethernet_destinations{};
   AtomicCounters* counters{};
@@ -276,7 +279,7 @@ class Pipeline final {
    * @return Final pipeline statistics.
    */
   [[nodiscard]] std::expected<PipelineStats, std::string> RunMultiWorker(const std::atomic<int>& force_quit,
-                                                                         std::uint32_t timer_period_sec) noexcept;
+                                                                          std::uint32_t timer_period_sec) noexcept;
   /**
    * @brief Run software flow-hash dispatch on main lcore plus remote workers.
    * @return Final pipeline statistics.
@@ -336,12 +339,6 @@ class Pipeline final {
    */
   void MaybeReloadFlowTable(const DpdkConfig& config) noexcept;
 
-  /**
-   * @brief SIGUSR1-triggered reload. Reloads SPI rules in place,
-   *        re-resolves SPI→DPI links, and resizes the flow table if
-   *        `max_concurrent_flows` changed. Sets `reload_barrier_` for
-   *        the duration so workers pause and we can mutate shared state.
-   */
   void MaybeReload(const std::atomic<int>& force_quit, std::atomic<int>* reload_flag,
                    const std::string& config_path, std::atomic<bool>& reload_barrier) noexcept;
 

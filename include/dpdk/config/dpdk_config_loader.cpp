@@ -6,11 +6,17 @@
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <format>
+#include <fstream>
+#include <glaze/glaze.hpp>
 #include <glaze/yaml.hpp>
 #include <limits>
 #include <optional>
+#include <print>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -474,8 +480,60 @@ std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexce
  */
 std::expected<DpdkConfig, std::string> LoadConfig(const std::string& path) noexcept {
   DpdkConfig config;
-  if (const auto parse_error{glz::read_file_yaml(config, path)}; parse_error) {
-    return std::unexpected(std::format("Failed to parse '{}': {}", path, glz::format_error(parse_error)));
+  if (path.ends_with(".beve") || path.ends_with(".bin")) {
+    std::string buffer;
+    if (const auto parse_error{glz::read_file_beve(config, path, buffer)}; parse_error) {
+      return std::unexpected(std::format("Failed to parse binary BEVE '{}': {}", path, glz::format_error(parse_error)));
+    }
+  } else {
+    if (const auto parse_error{glz::read_file_yaml(config, path)}; parse_error) {
+      return std::unexpected(std::format("Failed to parse YAML '{}': {}", path, glz::format_error(parse_error)));
+    }
+  }
+
+  // If spi.rule_path is specified, prioritize loading rules from that stream file
+  if (!config.spi.rule_path.empty()) {
+    const std::string& rule_path{config.spi.rule_path};
+    std::println("[Config] Reading binary rule stream from '{}'...", rule_path);
+    RuleStoreConfig rule_store;
+    bool loaded{false};
+
+    if (rule_path.ends_with(".beve") || rule_path.ends_with(".bin")) {
+      std::string buffer;
+      if (const auto err{glz::read_file_beve(rule_store, rule_path, buffer)}; !err) {
+        loaded = true;
+      } else {
+        DpdkConfig full_cfg;
+        std::string buf2;
+        if (const auto err2{glz::read_file_beve(full_cfg, rule_path, buf2)}; !err2) {
+          rule_store.filter_groups = std::move(full_cfg.spi.filter_groups);
+          rule_store.dpi = std::move(full_cfg.dpi);
+          loaded = true;
+        }
+      }
+    } else {
+      if (const auto err{glz::read_file_yaml(rule_store, rule_path)}; !err) {
+        loaded = true;
+      } else {
+        DpdkConfig full_cfg;
+        if (const auto err2{glz::read_file_yaml(full_cfg, rule_path)}; !err2) {
+          rule_store.filter_groups = std::move(full_cfg.spi.filter_groups);
+          rule_store.dpi = std::move(full_cfg.dpi);
+          loaded = true;
+        }
+      }
+    }
+
+    if (!loaded) {
+      return std::unexpected(std::format("Failed to load rule_path stream file: '{}'", rule_path));
+    }
+
+    if (!rule_store.filter_groups.empty()) {
+      config.spi.filter_groups = std::move(rule_store.filter_groups);
+    }
+    if (rule_store.dpi.enabled || !rule_store.dpi.filters.empty()) {
+      config.dpi = std::move(rule_store.dpi);
+    }
   }
 
   if (const auto valid{ValidateConfig(config)}; !valid) {
@@ -483,6 +541,20 @@ std::expected<DpdkConfig, std::string> LoadConfig(const std::string& path) noexc
   }
 
   return config;
+}
+
+std::expected<void, std::string> SaveConfigBinary(const DpdkConfig& config, const std::string& path) noexcept {
+  if (const auto write_error{glz::write_file_beve(config, path, std::string{})}; write_error) {
+    return std::unexpected(std::format("Failed to save binary BEVE '{}': {}", path, glz::format_error(write_error)));
+  }
+  return {};
+}
+
+std::expected<void, std::string> SaveRuleStoreBinary(const RuleStoreConfig& rule_store, const std::string& path) noexcept {
+  if (const auto write_error{glz::write_file_beve(rule_store, path, std::string{})}; write_error) {
+    return std::unexpected(std::format("Failed to save rule store binary BEVE '{}': {}", path, glz::format_error(write_error)));
+  }
+  return {};
 }
 
 }  // namespace dpdk

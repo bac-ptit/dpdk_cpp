@@ -8,6 +8,7 @@
 #include <expected>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -18,6 +19,9 @@ namespace dpdk::spi {
 struct FlowKey;  // Defined in spi_flow_table.hpp (forward decl to avoid
                  //  circular include — TSS needs FlowKey shape only).
 }  // namespace dpdk::spi
+
+struct rte_fib;
+struct rte_member_setsum;
 
 namespace dpdk::dpi {
 class DpiRuleTable;
@@ -76,22 +80,47 @@ enum class Action : std::uint8_t {
   kDrop,
 };
 
-/// Minimal parsed packet fields needed by the classifier.
-struct PacketMetadata {
-  /// Parsed L4 protocol.
-  Protocol protocol{};
-  /// IPv4 source address in host byte order.
-  std::uint32_t source_ip_address{};
-  /// IPv4 destination address in host byte order.
-  std::uint32_t destination_ip_address{};
-  /// TCP/UDP source port in host byte order.
-  std::uint16_t source_port{};
-  /// TCP/UDP destination port in host byte order.
-  std::uint16_t destination_port{};
+/// IP network protocol version.
+enum class IpVersion : std::uint8_t {
+  kIpv4 = 4,
+  kIpv6 = 6,
+};
+
+/// Minimal parsed packet fields needed by the classifier (aligned to 64-byte L1 cache line).
+struct alignas(64) PacketMetadata {
+  /// IPv6 source address (16 raw bytes; all zeros if IPv4).
+  std::array<std::uint8_t, 16> source_ip6_address{};
+  /// IPv6 destination address (16 raw bytes; all zeros if IPv4).
+  std::array<std::uint8_t, 16> destination_ip6_address{};
   /// L7 hostname extracted from TLS SNI or HTTP Host header (nullptr if not extracted).
   const char* hostname{nullptr};
+  /// IPv4 source address in Big-Endian network byte order (0 if IPv6).
+  std::uint32_t source_ip_be{};
+  /// IPv4 destination address in Big-Endian network byte order (0 if IPv6).
+  std::uint32_t destination_ip_be{};
+  /// TCP/UDP source port in Big-Endian network byte order.
+  std::uint16_t source_port_be{};
+  /// TCP/UDP destination port in Big-Endian network byte order.
+  std::uint16_t destination_port_be{};
   /// Length of hostname string (not null-terminated in mbuf).
   std::uint16_t hostname_length{};
+  /// Parsed L4 protocol.
+  Protocol protocol{};
+  /// IP version (IPv4 vs IPv6).
+  IpVersion ip_version{IpVersion::kIpv4};
+};
+
+/// Classification result returned by RuleTable::Match (aligned to 64-byte L1 cache line).
+struct alignas(64) ClassificationResult {
+  std::string_view group_name;
+  std::string_view label;
+  std::uint32_t group_precedence{0};
+  /// Mirror of the matched group's `bound_dpi_filter_index` (== `kNoDpiLink` on miss).
+  std::uint32_t bound_dpi_filter_index{kNoDpiLink};
+  Action action{Action::kForward};
+  bool matched{false};
+  /// Mirror of the matched group's l7_required. False on miss.
+  bool l7_required{false};
 };
 
 /// Compiled filter — hot-path representation of a single SpiFilterConfig.
@@ -171,33 +200,25 @@ struct CompiledFilterGroup {
   ~CompiledFilterGroup() = default;
 };
 
-/// Shared ACL field definitions — MASK type with bitmask values.
+/// Shared ACL field definitions — DPDK canonical 5-tuple layout.
 inline constexpr std::array<rte_acl_field_def, kAclNumFields> kAclFieldDefs{{
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kSrcIp), .input_index = 0,
-     .offset = offsetof(AclInputData, src_ip_be)},
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kDstIp), .input_index = 0,
-     .offset = offsetof(AclInputData, dst_ip_be)},
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint16_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kSrcPort), .input_index = 0,
-     .offset = offsetof(AclInputData, src_port_be)},
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint16_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kDstPort), .input_index = 0,
-     .offset = offsetof(AclInputData, dst_port_be)},
-    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint8_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kProtocol), .input_index = 0,
+    {.type = RTE_ACL_FIELD_TYPE_BITMASK, .size = sizeof(uint8_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kProtocol), .input_index = 0,
      .offset = offsetof(AclInputData, protocol)},
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kSrcIp), .input_index = 1,
+     .offset = offsetof(AclInputData, src_ip_be)},
+    {.type = RTE_ACL_FIELD_TYPE_MASK, .size = sizeof(uint32_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kDstIp), .input_index = 2,
+     .offset = offsetof(AclInputData, dst_ip_be)},
+    {.type = RTE_ACL_FIELD_TYPE_RANGE, .size = sizeof(uint16_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kSrcPort), .input_index = 3,
+     .offset = offsetof(AclInputData, src_port_be)},
+    {.type = RTE_ACL_FIELD_TYPE_RANGE, .size = sizeof(uint16_t), .field_index = static_cast<uint32_t>(AclFieldIndex::kDstPort), .input_index = 3,
+     .offset = offsetof(AclInputData, dst_port_be)},
 }};
 
-/// Classification result returned by RuleTable::Match.
-struct ClassificationResult {
-  std::string_view group_name;
-  std::string_view label;
-  Action action{Action::kForward};
-  std::uint32_t group_precedence{0};
-  bool matched{false};
-  /// Mirror of the matched group's l7_required. False on miss.
-  bool l7_required{false};
-  /// Mirror of the matched group's `bound_dpi_filter_index` (== `kNoDpiLink`
-  /// on miss). Carried through `Match()` so `TryDpiClassify` can take the
-  /// static-link fast path without an extra config lookup.
-  std::uint32_t bound_dpi_filter_index{kNoDpiLink};
+/// ACL context chunk holding up to kMaxCategories (64) filter groups.
+struct AclChunk {
+  rte_acl_ctx* ctx{nullptr};
+  std::size_t start_group_index{0};
+  std::size_t group_count{0};
 };
 
 /**
@@ -208,9 +229,14 @@ struct ClassificationResult {
  */
 class RuleTable final {
  public:
-  /// Build a RuleTable from a sorted list of filter groups, the combined
-  /// rte_acl_ctx, and the precedence-ordered category walk. All three must
-  /// come from the same `CompileRuleTable` call — never construct ad hoc.
+  /// Build a RuleTable from a sorted list of filter groups, ACL context chunks,
+  /// and the precedence-ordered category walk.
+  RuleTable(std::vector<CompiledFilterGroup> groups, std::vector<AclChunk> acl_chunks,
+            std::vector<std::uint32_t> precedence_order,
+            struct rte_fib* fib_ctx = nullptr,
+            struct rte_member_setsum* member_ctx = nullptr) noexcept;
+
+  /// Backward-compatible constructor for a single ACL context.
   RuleTable(std::vector<CompiledFilterGroup> groups, rte_acl_ctx* acl_ctx,
             std::vector<std::uint32_t> precedence_order) noexcept;
 
@@ -257,17 +283,27 @@ class RuleTable final {
 
   /**
    * @brief Match packet against all groups in precedence order.
-   *
-   * Single `rte_acl_classify` call against the combined context returns a
-   * `results[cat]` for every category; we then walk the categories in
-   * precedence order (lowest precedence value = highest priority) and
-   * return the first category with a non-zero userdata.
-   *
-   * Complexity: O(log n) for the ACL trie walk, plus O(G) for the
-   * precedence walk — strictly better than the per-group loop's O(G·log n)
-   * because the per-group context-switch overhead disappears.
    */
   [[nodiscard]] ClassificationResult Match(const PacketMetadata& packet) const noexcept;
+
+  /**
+   * @brief Vectorized SIMD bulk classification for a burst of packets (AVX2/AVX-512 accelerated).
+   *
+   * @param packets Input metadata burst (up to 32 packets).
+   * @param results Output classification results burst (must be sized >= packets.size()).
+   */
+  [[gnu::hot]] void MatchBulk(std::span<const PacketMetadata> packets,
+                              std::span<ClassificationResult> results) const noexcept;
+
+  /// Bulk FIB lookup for destination IPs. Returns ClassificationResult for FIB hits.
+  /// Packets that miss FIB are indicated by results[i].matched == false.
+  [[gnu::hot]] void FibLookupBulk(std::span<const PacketMetadata> packets,
+                                  std::span<ClassificationResult> results) const noexcept;
+
+  /// Bulk membership test. Returns true in skip_acl[i] if packet i definitely
+  /// does NOT match any rule (can skip ACL entirely).
+  [[gnu::hot]] void MemberFilterBulk(std::span<const PacketMetadata> packets,
+                                     std::span<bool> skip_acl) const noexcept;
 
   /**
    * @brief Resolve SPI→DPI static link bindings in-place.
@@ -327,11 +363,11 @@ class RuleTable final {
     return ClassificationResult{
         .group_name = group.name,
         .label = {},
-        .action = group.action,
         .group_precedence = group.precedence,
+        .bound_dpi_filter_index = group.bound_dpi_filter_index,
+        .action = group.action,
         .matched = true,
         .l7_required = group.l7_required,
-        .bound_dpi_filter_index = group.bound_dpi_filter_index,
     };
   }
 
@@ -343,9 +379,8 @@ class RuleTable final {
 
  private:
   std::vector<CompiledFilterGroup> groups_;
-  /// Combined rte_acl_ctx holding all groups' filters. One `rte_acl_classify`
-  /// call returns a result for every category — we then walk categories in
-  /// `precedence_order_` to find the highest-precedence match.
+  /// Vector of ACL context chunks (each holding up to 64 categories).
+  std::vector<AclChunk> acl_chunks_;
   rte_acl_ctx* acl_ctx_{nullptr};
   /// Category indices in precedence order (lower precedence value first).
   /// `precedence_order_[i] = cat_index` means "check `results[cat_index]`
@@ -373,6 +408,11 @@ class RuleTable final {
   static constexpr std::size_t kTssCapacity{128};
   std::array<TssEntry, kTssCapacity> tss_{};
   std::size_t tss_size_{0};
+
+  struct rte_fib* fib_ctx_{nullptr};
+  struct rte_member_setsum* member_ctx_{nullptr};
+  bool has_wildcard_ip_rules_{false};
+  static constexpr uint64_t kFibDefaultNh{0};
 
   /// Build the TSS table from the (already sorted, category_index-assigned)
   /// groups. Called by `CompileRuleTable` once after groups sort. Filters

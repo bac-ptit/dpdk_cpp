@@ -209,7 +209,7 @@ def main():
     # === SPI DROP TEST ===
     drop_cfg = dict(cfg)
     drop_cfg["spi"] = dict(cfg["spi"])
-    drop_cfg["spi"]["filter_groups"] = list(cfg["spi"]["filter_groups"]) + [{
+    drop_cfg["spi"]["filter_groups"] = list(cfg["spi"].get("filter_groups") or []) + [{
         "name": "fg_l34_udp_sdf1006", "precedence": 106, "action": "drop",
         "filters": [{"protocol": "udp", "destination_port": 9999, "label": "udp_drop"}],
     }]

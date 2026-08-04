@@ -5,7 +5,9 @@
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_gro.h>
 #include <rte_ip.h>
+#include <rte_ip_frag.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
@@ -239,7 +241,7 @@ struct PacketClassification {
 [[nodiscard]] std::optional<std::uint16_t> LookupL3TransmitPort(const std::vector<L3RouteEntry>& routes,
                                                                 const PacketMetadata& metadata) noexcept {
   for (const auto& route : routes) {
-    if ((metadata.destination_ip_address & route.prefix_mask) == route.network_address) {
+    if ((rte_be_to_cpu_32(metadata.destination_ip_be) & route.prefix_mask) == route.network_address) {
       return route.output_port;
     }
   }
@@ -500,7 +502,7 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
 /// Replacement tables are compiled while workers continue using the active
 /// tables. The main lcore then sets `reload_barrier`, waits up to 100 ms for
 /// every worker to acknowledge the pause, publishes the new tables, and
-/// releases the workers. A timeout or shutdown request cancels the publish.
+/// releases the workers. A timeout or shutdown request cancels the reload.
 [[gnu::cold]] void dpdk::spi::Pipeline::MaybeReload(const std::atomic<int>& force_quit,
                                                     std::atomic<int>* reload_flag,
                                                     const std::string& config_path,
@@ -548,7 +550,7 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
   constexpr std::uint64_t kMillisecondsPerSecond{1000};
   constexpr std::uint64_t kReloadQuiesceTimeoutMs{100};
   const auto timeout_tsc{rte_get_tsc_hz() * kReloadQuiesceTimeoutMs /
-                         kMillisecondsPerSecond,};
+                         kMillisecondsPerSecond};
   const auto wait_start_tsc{rte_rdtsc()};
   bool wait_timed_out{false};
   if (worker_contexts_.size() > 1) {
@@ -756,12 +758,13 @@ void ExtractHostname(const rte_mbuf& packet, PacketMetadata& metadata) noexcept 
     payload_off = l4_off + tcp_hdr_len;
   }
 
-  if (metadata.destination_port == kTlsPort) {
+  const auto dst_port{rte_be_to_cpu_16(metadata.destination_port_be)};
+  if (dst_port == kTlsPort) {
     if (const auto sni{ExtractTlsSni(packet, payload_off)}) {
       metadata.hostname = sni->first;
       metadata.hostname_length = sni->second;
     }
-  } else if (metadata.destination_port == kHttpPort) {
+  } else if (dst_port == kHttpPort) {
     if (const auto host{ExtractHttpHost(packet, payload_off)}) {
       metadata.hostname = host->first;
       metadata.hostname_length = host->second;
@@ -856,15 +859,11 @@ struct DpiMatch {
  */
 [[nodiscard, gnu::hot]] PacketClassification ClassifyPacket(WorkerContext& context, BurstCounters& counters,
                                                             const rte_mbuf& packet) noexcept {
-  if (auto parsed{ParsePacket(packet)}) {
+  if (auto parsed{ParsePacket(packet, context.ip_frag_tbl, context.current_burst_tsc)}) {
     ++counters.parsed;
     auto metadata{*parsed};
 
-    const FlowKey key{MakeCanonical(metadata.source_ip_address,
-                                  metadata.destination_ip_address,
-                                  metadata.source_port,
-                                  metadata.destination_port,
-                                  metadata.protocol)};
+    const FlowKey key{MakeCanonicalFromMetadata(metadata)};
 
     // Cache hit — fast path. Returns std::optional<FlowEntryView>; on the
     // hot path the view is captured into a register and the action bit is
@@ -1199,7 +1198,9 @@ struct DpiMatch {
     ++counters.dpi_skipped_by_spi;
     return;
   }
-  if (metadata.destination_port != kTlsPort && metadata.destination_port != kHttpPort) [[likely]] {
+  const auto dst_port{rte_be_to_cpu_16(metadata.destination_port_be)};
+  const auto src_port{rte_be_to_cpu_16(metadata.source_port_be)};
+  if (dst_port != kTlsPort && dst_port != kHttpPort) [[likely]] {
     ++counters.dpi_skipped_by_spi;
     return;
   }
@@ -1210,8 +1211,8 @@ struct DpiMatch {
   // applies via the lookup hit in ResolvePacketAction, so we don't need
   // to run hostname extraction or DPI matching here.
   constexpr std::uint16_t kWellKnownPortMax{1024};
-  const bool is_response{(metadata.source_port == kHttpPort || metadata.source_port == kTlsPort) &&
-                         metadata.destination_port >= kWellKnownPortMax};
+  const bool is_response{(src_port == kHttpPort || src_port == kTlsPort) &&
+                         dst_port >= kWellKnownPortMax};
   if (is_response) [[likely]] {
     ++counters.dpi_skipped_by_spi;
     return;
@@ -1265,11 +1266,7 @@ struct DpiMatch {
     if (auto parsed{ParsePacket(*packet)}) {
       ++counters.parsed;
       metadata[n_parsed] = *parsed;
-      keys[n_parsed] = MakeCanonical(parsed->source_ip_address,
-                                     parsed->destination_ip_address,
-                                     parsed->source_port,
-                                     parsed->destination_port,
-                                     parsed->protocol);
+      keys[n_parsed] = MakeCanonicalFromMetadata(*parsed);
       packet_to_parsed[i] = static_cast<std::uint16_t>(n_parsed);
       ++n_parsed;
     } else {
@@ -1293,56 +1290,6 @@ void BulkFlowLookup(FlowTable& flow_table,
                           chunk_size,
                           now_tsc,
                           results.subspan(chunk_start, chunk_size));
-  }
-}
-
-/// Resolve flow action: cache hit → fast path, miss → SPI + DPI.
-[[gnu::hot, gnu::always_inline]] inline void ResolvePacketAction(
-    WorkerContext& context, BurstCounters& counters,
-    const rte_mbuf& packet, PacketMetadata& metadata,
-    const FlowKey& key, const BulkResult& bulk_result,
-    Action& action, bool& matched) noexcept {
-  if (bulk_result.valid) [[likely]] {
-    // Snapshot taken inside LookupBulk — no second acquire-load, no
-    // position-lifetime window. See docs_search/13 §H4.
-    ++counters.flow_cache_hits;
-    action = bulk_result.view.action;
-    matched = true;
-    return;
-  }
-
-  const auto* rules{context.rule_manager->Load()};
-  ClassificationResult spi_match{};
-  if (const auto tss_hit{rules->ProbeTss(key)}; tss_hit != RuleTable::kNoTssHit) [[likely]] {
-    spi_match = rules->ResultForCategory(tss_hit);
-  } else {
-    spi_match = rules->Match(metadata);
-  }
-  TryDpiClassify(context, counters, packet, metadata, spi_match, key,
-                 action, matched);
-
-  if (!matched) {
-    if (spi_match.matched) {
-      if (context.flow_table->Insert(key, /*match_count=*/1, spi_match.action) != FlowInsertResult::kOk) [[unlikely]] {
-        // Flow table is full (-ENOSPC). Apply configured overflow policy.
-        ++counters.flow_table_full;
-        if (context.flow_overflow_drop) {
-          // Bump `matched` for counter consistency with the returned
-          // PacketClassification (matched=true → caller increments dropped_by_rule).
-          ++counters.matched;
-          action = Action::kDrop;
-          matched = true;
-        } else {
-          ++counters.unknown;
-        }
-      } else {
-        ++counters.matched;
-        action = spi_match.action;
-        matched = true;
-      }
-    } else {
-      ++counters.unknown;
-    }
   }
 }
 
@@ -1375,7 +1322,7 @@ void BulkFlowLookup(FlowTable& flow_table,
 }
 
 /// Finalize classification and forward all packets in the burst.
-void FinalizePackets(WorkerContext& context,
+[[gnu::hot]] void FinalizePackets(WorkerContext& context,
                      const std::vector<std::uint16_t>& active_ports,
                      std::uint16_t port_id,
                      std::span<rte_mbuf*> received_packets,
@@ -1387,18 +1334,135 @@ void FinalizePackets(WorkerContext& context,
                      std::vector<std::uint16_t>& transmit_counts,
                      BurstCounters& counters) noexcept {
   constexpr std::uint16_t kUnmapped{std::numeric_limits<std::uint16_t>::max()};
+  const auto* rules{context.rule_manager->Load()};
+
+  std::array<ClassificationResult, kMaxBurstCapacity> spi_matches{};
+  std::array<std::uint16_t, kMaxBurstCapacity> acl_miss_indices{};
+  std::array<PacketMetadata, kMaxBurstCapacity> acl_miss_metadata{};
+  std::array<ClassificationResult, kMaxBurstCapacity> acl_miss_results{};
+  std::size_t n_acl_misses{0};
+
+  // Phase 1: Check Flow Cache and TSS pre-check first
   for (auto i{0UZ}; i < received_packets.size(); ++i) {
+    const auto parsed_idx{packet_to_parsed[i]};
+    if (parsed_idx == kUnmapped) continue;
+
+    const auto& bulk_result{bulk_results[parsed_idx]};
+    if (bulk_result.valid) [[likely]] {
+      continue;
+    }
+
+    const auto& key{keys[parsed_idx]};
+    if (const auto tss_hit{rules->ProbeTss(key)}; tss_hit != RuleTable::kNoTssHit) [[likely]] {
+      spi_matches[parsed_idx] = rules->ResultForCategory(tss_hit);
+    } else {
+      acl_miss_indices[n_acl_misses] = static_cast<std::uint16_t>(parsed_idx);
+      acl_miss_metadata[n_acl_misses] = metadata[parsed_idx];
+      ++n_acl_misses;
+    }
+  }
+
+  // Phase 1.5: FIB bulk lookup for cache/TSS misses
+  if (n_acl_misses > 0 && rules) {
+    const std::span fib_meta_span{acl_miss_metadata.data(), n_acl_misses};
+    std::array<ClassificationResult, kMaxBurstCapacity> fib_results{};
+    const std::span fib_res_span{fib_results.data(), n_acl_misses};
+    rules->FibLookupBulk(fib_meta_span, fib_res_span);
+
+    // Collect packets that FIB matched vs still need ACL
+    std::array<std::uint16_t, kMaxBurstCapacity> real_acl_miss_indices{};
+    std::array<PacketMetadata, kMaxBurstCapacity> real_acl_miss_metadata{};
+    std::size_t n_real_acl_misses{0};
+
+    for (std::size_t m{0}; m < n_acl_misses; ++m) {
+      const auto parsed_idx{acl_miss_indices[m]};
+      if (fib_results[m].matched) {
+        spi_matches[parsed_idx] = fib_results[m];
+      } else {
+        real_acl_miss_indices[n_real_acl_misses] = acl_miss_indices[m];
+        real_acl_miss_metadata[n_real_acl_misses] = acl_miss_metadata[m];
+        ++n_real_acl_misses;
+      }
+    }
+
+    // Phase 1.7: Member filter — skip ACL for definite non-matches
+    std::array<std::uint16_t, kMaxBurstCapacity> final_acl_indices{};
+    std::array<PacketMetadata, kMaxBurstCapacity> final_acl_metadata{};
+    std::size_t n_final_acl{0};
+
+    if (n_real_acl_misses > 0) {
+      std::array<bool, kMaxBurstCapacity> skip_acl{};
+      const std::span member_meta_span{real_acl_miss_metadata.data(), n_real_acl_misses};
+      const std::span skip_span{skip_acl.data(), n_real_acl_misses};
+      rules->MemberFilterBulk(member_meta_span, skip_span);
+
+      for (std::size_t m{0}; m < n_real_acl_misses; ++m) {
+        if (!skip_acl[m]) {
+          final_acl_indices[n_final_acl] = real_acl_miss_indices[m];
+          final_acl_metadata[n_final_acl] = real_acl_miss_metadata[m];
+          ++n_final_acl;
+        }
+        // If skip_acl[m] == true, spi_matches[idx] remains {} (matched=false)
+      }
+    }
+
+    // Phase 2: ACL only for packets that passed both FIB and Member filters
+    if (n_final_acl > 0) {
+      const std::span miss_meta_span{final_acl_metadata.data(), n_final_acl};
+      const std::span miss_res_span{acl_miss_results.data(), n_final_acl};
+      rules->MatchBulk(miss_meta_span, miss_res_span);
+      for (std::size_t m{0}; m < n_final_acl; ++m) {
+        const auto parsed_idx{final_acl_indices[m]};
+        spi_matches[parsed_idx] = acl_miss_results[m];
+      }
+    }
+  }
+
+  // Phase 3: Finalize packet actions and forward
+  for (auto i{0UZ}; i < received_packets.size(); ++i) {
+    rte_prefetch0(rte_pktmbuf_mtod(received_packets[i], void*));
     auto* const packet{received_packets[i]};
     const auto parsed_idx{packet_to_parsed[i]};
     if (parsed_idx == kUnmapped) [[unlikely]] {
       DropPacket(counters, packet);
       continue;
     }
+
     Action action{Action::kForward};
     bool matched{false};
-    ResolvePacketAction(context, counters, *packet, metadata[parsed_idx],
-                        keys[parsed_idx], bulk_results[parsed_idx],
-                        action, matched);
+    const auto& bulk_result{bulk_results[parsed_idx]};
+
+    if (bulk_result.valid) [[likely]] {
+      ++counters.flow_cache_hits;
+      action = bulk_result.view.action;
+      matched = true;
+    } else {
+      const auto& key{keys[parsed_idx]};
+      const auto& spi_match{spi_matches[parsed_idx]};
+      TryDpiClassify(context, counters, *packet, metadata[parsed_idx], spi_match, key, action, matched);
+
+      if (!matched) {
+        if (spi_match.matched) {
+          if (context.flow_table->Insert(key, /*match_count=*/1, spi_match.action) != FlowInsertResult::kOk) [[unlikely]] {
+            ++counters.flow_table_full;
+            if (context.flow_overflow_drop) {
+              ++counters.matched;
+              action = Action::kDrop;
+              matched = true;
+            } else {
+              ++counters.unknown;
+            }
+          } else {
+            ++counters.matched;
+            action = spi_match.action;
+            matched = true;
+          }
+        } else {
+          ++counters.unknown;
+        }
+      }
+    }
+
     const PacketClassification classification{
         .metadata = metadata[parsed_idx], .action = action,
         .parsed = true, .matched = matched};
@@ -1804,6 +1868,12 @@ void Pipeline::StopWorkers() noexcept {
 
   worker_force_quit_.store(1, std::memory_order_relaxed);
   rte_eal_mp_wait_lcore();
+  for (auto& context : worker_contexts_) {
+    if (context.ip_frag_tbl != nullptr) {
+      rte_ip_frag_table_destroy(context.ip_frag_tbl);
+      context.ip_frag_tbl = nullptr;
+    }
+  }
   workers_started_ = false;
 }
 
@@ -1813,6 +1883,11 @@ void Pipeline::PrepareWorkerContext(WorkerContext& context, const std::atomic<in
   context.rule_manager = &rule_manager_;
   context.dpi_rule_manager = &dpi_rule_manager_;
   context.flow_table = flow_table_.get();
+  if (context.ip_frag_tbl == nullptr) {
+    const std::uint64_t max_cycles{(rte_get_tsc_hz() + 999) / 1000 * 10000};
+    const int socket_id{static_cast<int>(rte_lcore_to_socket_id(worker_id))};
+    context.ip_frag_tbl = rte_ip_frag_table_create(4096, 16, 65536, max_cycles, socket_id);
+  }
   context.l3_routes = &l3_routes_;
   context.ethernet_destinations = &ethernet_destinations_;
   context.counters = &counters_;
@@ -1892,10 +1967,6 @@ std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const std::at
     if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
       flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
     }
-    // Yield the main lcore when there's no work — keeps Ctrl+C latency at
-    // ~100 µs while letting the scheduler put this core to sleep. `rte_pause`
-    // is only a CPU PAUSE hint (~10 cycles), it spins forever at GHz and
-    // makes the housekeeping loop look "stuck" in `top`.
     std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 
@@ -1964,15 +2035,6 @@ std::expected<PipelineStats, std::string> Pipeline::RunUntilStopped(const std::a
   config_path_ = config_path;
   reload_flag_ = &reload_flag;
 
-  // M5: single-worker mode is removed. The pipeline now requires at least
-  // two worker lcores — the main lcore alone is a serialisation point that
-  // can't sustain line-rate packet processing, and it was the only path
-  // that ran `ProcessWorkerIteration` on the main lcore (contending with
-  // the stats/reload/purge work that RunMultiWorker keeps on the main
-  // lcore for proper Ctrl+C responsiveness). Setting worker_count=1 used
-  // to silently switch to a single-lcore hot path; we now refuse it so
-  // the operator gets a clear error instead of a mysteriously-slow
-  // pipeline.
   if (worker_contexts_.size() < 2) {
     return std::unexpected(std::format(
         "spi.worker_count must be >= 2 (got {}). Single-worker mode is "

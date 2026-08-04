@@ -156,5 +156,12 @@ target_link_libraries(${FASTAPI_APP_TARGET} PRIVATE
         -Wl,--end-group)
 target_compile_definitions(${FASTAPI_APP_TARGET} PRIVATE CONFIG_PATH="./config.yaml")
 
+# Binary BEVE Stream converter tool
+add_executable(yaml2beve tools/yaml2beve.cpp)
+target_link_libraries(yaml2beve PRIVATE
+        fastapi_common
+        ${FASTAPI_CONFIG_ALIAS})
+
 # Copy config.yaml to build dir so it sits next to the executable
 configure_file(${CMAKE_SOURCE_DIR}/config.yaml ${CMAKE_CURRENT_BINARY_DIR}/config.yaml COPYONLY)
+

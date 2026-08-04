@@ -28,3 +28,15 @@ __pycache__/
 
 # perf stat captures (large, regenerated per bench session)
 bench-results/*.perf
+
+# AI and local environment files
+.gemini/
+GEMINI.md
+
+# Generated binary rules, PCAPs & large configs (>100MB)
+*.beve
+*.pcap
+*.yamlc
+config_8m.yaml
+test/beve_shards/
+

@@ -4,11 +4,14 @@
 #include <rte_byteorder.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_ip6.h>
+#include <rte_ip_frag.h>
 #include <rte_prefetch.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
 
 #include <array>
+#include <cstring>
 #include <span>
 
 namespace {
@@ -65,6 +68,25 @@ template <typename Header>
   return true;
 }
 
+[[nodiscard, gnu::always_inline]] inline bool IsIpv4Fragmented(const rte_ipv4_hdr& ipv4_hdr) noexcept {
+  return rte_ipv4_frag_pkt_is_fragmented(&ipv4_hdr) != 0;
+}
+
+[[nodiscard, gnu::always_inline]] inline bool IsValidFragment(const rte_ipv4_hdr& ipv4_hdr) noexcept {
+  const std::uint16_t flag_offset{rte_be_to_cpu_16(ipv4_hdr.fragment_offset)};
+  const std::uint16_t offset{static_cast<std::uint16_t>((flag_offset & RTE_IPV4_HDR_OFFSET_MASK) * 8)};
+  const std::uint16_t mf{static_cast<std::uint16_t>(flag_offset & RTE_IPV4_HDR_MF_FLAG)};
+
+  if (offset == 0 && mf != 0) {
+    const std::uint16_t total_len{rte_be_to_cpu_16(ipv4_hdr.total_length)};
+    const std::uint32_t header_len{rte_ipv4_hdr_len(&ipv4_hdr)};
+    if (total_len < header_len + 8) {
+      return false; // OWASP: Drop tiny fragment attack
+    }
+  }
+  return true;
+}
+
 [[nodiscard, gnu::always_inline]] inline std::uint16_t ReadUint16Be(
     std::span<const unsigned char> data, std::uint32_t offset) noexcept {
   constexpr std::uint32_t kByteShift{8U};
@@ -79,16 +101,37 @@ ParseL4(const rte_mbuf& packet, std::uint32_t l4_offset,
         const rte_ipv4_hdr& ipv4_hdr,
         const dpdk::spi::Protocol proto) noexcept {
   L4Header hdr{};
-  if (!ReadHeader(packet, l4_offset, hdr)) [[unlikely]] {
+  if (!ReadHeaderFast(packet, l4_offset, hdr)) [[unlikely]] {
     return std::nullopt;
   }
   return dpdk::spi::PacketMetadata{
+      .source_ip_be = ipv4_hdr.src_addr,
+      .destination_ip_be = ipv4_hdr.dst_addr,
+      .source_port_be = hdr.src_port,
+      .destination_port_be = hdr.dst_port,
       .protocol = proto,
-      .source_ip_address = rte_be_to_cpu_32(ipv4_hdr.src_addr),
-      .destination_ip_address = rte_be_to_cpu_32(ipv4_hdr.dst_addr),
-      .source_port = rte_be_to_cpu_16(hdr.src_port),
-      .destination_port = rte_be_to_cpu_16(hdr.dst_port),
+      .ip_version = dpdk::spi::IpVersion::kIpv4,
   };
+}
+
+template <typename L4Header>
+[[nodiscard, gnu::always_inline]] inline std::optional<dpdk::spi::PacketMetadata>
+ParseL4Ipv6(const rte_mbuf& packet, std::uint32_t l4_offset,
+            const rte_ipv6_hdr& ipv6_hdr,
+            const dpdk::spi::Protocol proto) noexcept {
+  L4Header hdr{};
+  if (!ReadHeaderFast(packet, l4_offset, hdr)) [[unlikely]] {
+    return std::nullopt;
+  }
+  dpdk::spi::PacketMetadata meta{
+      .source_port_be = hdr.src_port,
+      .destination_port_be = hdr.dst_port,
+      .protocol = proto,
+      .ip_version = dpdk::spi::IpVersion::kIpv6,
+  };
+  std::memcpy(meta.source_ip6_address.data(), &ipv6_hdr.src_addr, 16);
+  std::memcpy(meta.destination_ip6_address.data(), &ipv6_hdr.dst_addr, 16);
+  return meta;
 }
 
 [[nodiscard]] const void* ReadPayload(const rte_mbuf& packet,
@@ -255,38 +298,82 @@ FindHostHeaderValue(
 namespace dpdk::spi {
 
 [[nodiscard, gnu::hot]] std::optional<PacketMetadata> ParsePacket(
-    const rte_mbuf& packet) noexcept {
+    const rte_mbuf& packet,
+    struct ::rte_ip_frag_tbl* frag_tbl,
+    std::uint64_t tsc_timestamp) noexcept {
+  const rte_mbuf* current_packet{&packet};
   rte_ether_hdr ether_hdr{};
-  if (!ReadHeaderFast(packet, 0, ether_hdr)) [[unlikely]] {
+  if (!ReadHeaderFast(*current_packet, 0, ether_hdr)) [[unlikely]] {
     return std::nullopt;
   }
 
-  if (rte_be_to_cpu_16(ether_hdr.ether_type) !=
-      RTE_ETHER_TYPE_IPV4) [[unlikely]] {
+  const auto ether_type{rte_be_to_cpu_16(ether_hdr.ether_type)};
+
+  if (ether_type == RTE_ETHER_TYPE_IPV4) [[likely]] {
+    constexpr std::uint32_t ipv4_offset{sizeof(rte_ether_hdr)};
+    rte_ipv4_hdr ipv4_hdr{};
+    if (!ReadHeaderFast(*current_packet, ipv4_offset, ipv4_hdr)) [[unlikely]] {
+      return std::nullopt;
+    }
+
+    if (IsIpv4Fragmented(ipv4_hdr)) {
+      if (!IsValidFragment(ipv4_hdr)) [[unlikely]] {
+        return std::nullopt; // OWASP: Drop malformed / tiny fragment attack
+      }
+      if (frag_tbl != nullptr) {
+        struct rte_ip_frag_death_row death_row{};
+        rte_mbuf* reassembled = rte_ipv4_frag_reassemble_packet(
+            frag_tbl, &death_row, const_cast<rte_mbuf*>(current_packet),
+            tsc_timestamp, &ipv4_hdr);
+        rte_ip_frag_free_death_row(&death_row, 0);
+        if (reassembled == nullptr) {
+          // Waiting for remaining fragments of this packet
+          return std::nullopt;
+        }
+        current_packet = reassembled;
+        if (!ReadHeaderFast(*current_packet, ipv4_offset, ipv4_hdr)) [[unlikely]] {
+          return std::nullopt;
+        }
+      }
+    }
+
+    const auto ipv4_header_len{rte_ipv4_hdr_len(&ipv4_hdr)};
+    if (ipv4_header_len < sizeof(rte_ipv4_hdr)) [[unlikely]] {
+      return std::nullopt;
+    }
+
+    const auto l4_offset{
+        static_cast<std::uint32_t>(ipv4_offset + ipv4_header_len)};
+
+    if (ipv4_hdr.next_proto_id == IPPROTO_TCP) [[likely]] {
+      return ParseL4<rte_tcp_hdr>(*current_packet, l4_offset, ipv4_hdr,
+                                  Protocol::kTcp);
+    }
+    if (ipv4_hdr.next_proto_id == IPPROTO_UDP) {
+      return ParseL4<rte_udp_hdr>(*current_packet, l4_offset, ipv4_hdr,
+                                  Protocol::kUdp);
+    }
     return std::nullopt;
   }
 
-  constexpr std::uint32_t ipv4_offset{sizeof(rte_ether_hdr)};
-  rte_ipv4_hdr ipv4_hdr{};
-  if (!ReadHeaderFast(packet, ipv4_offset, ipv4_hdr)) [[unlikely]] {
+  if (ether_type == RTE_ETHER_TYPE_IPV6) {
+    constexpr std::uint32_t ipv6_offset{sizeof(rte_ether_hdr)};
+    rte_ipv6_hdr ipv6_hdr{};
+    if (!ReadHeaderFast(packet, ipv6_offset, ipv6_hdr)) [[unlikely]] {
+      return std::nullopt;
+    }
+
+    constexpr std::uint32_t l4_offset{ipv6_offset + sizeof(rte_ipv6_hdr)};
+
+    if (ipv6_hdr.proto == IPPROTO_TCP) [[likely]] {
+      return ParseL4Ipv6<rte_tcp_hdr>(packet, l4_offset, ipv6_hdr,
+                                      Protocol::kTcp);
+    }
+    if (ipv6_hdr.proto == IPPROTO_UDP) {
+      return ParseL4Ipv6<rte_udp_hdr>(packet, l4_offset, ipv6_hdr,
+                                      Protocol::kUdp);
+    }
     return std::nullopt;
-  }
-
-  const auto ipv4_header_len{rte_ipv4_hdr_len(&ipv4_hdr)};
-  if (ipv4_header_len < sizeof(rte_ipv4_hdr)) [[unlikely]] {
-    return std::nullopt;
-  }
-
-  const auto l4_offset{
-      static_cast<std::uint32_t>(ipv4_offset + ipv4_header_len)};
-
-  if (ipv4_hdr.next_proto_id == IPPROTO_TCP) [[likely]] {
-    return ParseL4<rte_tcp_hdr>(packet, l4_offset, ipv4_hdr,
-                                Protocol::kTcp);
-  }
-  if (ipv4_hdr.next_proto_id == IPPROTO_UDP) {
-    return ParseL4<rte_udp_hdr>(packet, l4_offset, ipv4_hdr,
-                                Protocol::kUdp);
   }
 
   return std::nullopt;

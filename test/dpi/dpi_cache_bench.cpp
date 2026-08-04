@@ -230,7 +230,8 @@ void RunDpiCycle(const std::vector<rte_mbuf*>& mbufs, dpdk::dpi::DpiRuleTable& r
       ++c.dns_noport;
       continue;
     }
-    if (md.destination_port != kTlsPort && md.destination_port != kHttpPort) {
+    const std::uint16_t dst_port{rte_be_to_cpu_16(md.destination_port_be)};
+    if (dst_port != kTlsPort && dst_port != kHttpPort) {
       ++c.dns_noport;
       continue;
     }
@@ -265,7 +266,7 @@ void RunDpiCycle(const std::vector<rte_mbuf*>& mbufs, dpdk::dpi::DpiRuleTable& r
     std::optional<std::pair<const char*, std::uint16_t>> host_result;
     {
       const auto start{std::chrono::steady_clock::now()};
-      host_result = (md.destination_port == kTlsPort)
+      host_result = (dst_port == kTlsPort)
                         ? dpdk::spi::ExtractTlsSni(pkt, payload_off)
                         : dpdk::spi::ExtractHttpHost(pkt, payload_off);
       const auto end{std::chrono::steady_clock::now()};

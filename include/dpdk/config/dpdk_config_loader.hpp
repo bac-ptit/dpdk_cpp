@@ -18,13 +18,31 @@ namespace dpdk {
 [[nodiscard]] std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexcept;
 
 /**
- * @brief Load and validate YAML configuration from the given file path.
+ * @brief Load and validate configuration from YAML or binary BEVE file.
  *
- * Parses config.yaml via Glaze reflection, then runs semantic validation
- * through @ref ValidateConfig.
- * @param path  Filesystem path to the YAML configuration file.
+ * Supports both text `.yaml` and high-performance binary `.beve` / `.bin` files via Glaze.
+ * Runs semantic validation through @ref ValidateConfig.
+ * @param path  Filesystem path to the YAML or BEVE configuration file.
  * @return A validated DpdkConfig on success, or an error string.
  */
 [[nodiscard]] std::expected<DpdkConfig, std::string> LoadConfig(const std::string& path) noexcept;
+
+/**
+ * @brief Save configuration in Glaze BEVE binary format for fast sub-millisecond reloads.
+ *
+ * @param config  The validated DpdkConfig struct.
+ * @param path    Filesystem path to write binary configuration (e.g. "config.beve").
+ * @return Void on success, or an error string.
+ */
+[[nodiscard]] std::expected<void, std::string> SaveConfigBinary(const DpdkConfig& config, const std::string& path) noexcept;
+
+/**
+ * @brief Save standalone rule store in Glaze BEVE binary format.
+ *
+ * @param rule_store The RuleStoreConfig struct containing filter_groups and dpi.
+ * @param path       Filesystem path to write binary rule stream (e.g. "rules.beve").
+ * @return Void on success, or an error string.
+ */
+[[nodiscard]] std::expected<void, std::string> SaveRuleStoreBinary(const RuleStoreConfig& rule_store, const std::string& path) noexcept;
 
 }  // namespace dpdk

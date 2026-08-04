@@ -64,3 +64,6 @@ bench-spi = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench-spi 1000000"
 # production DPI filter groups. End-to-end benchmark using whatever
 # rules config.yaml declares (SPI + DPI when DPI is enabled).
 bench = "BUILD_DIR=cmake-build-release ./test/test_env.sh bench 1000000"
+gen-rules = "python3 script/gen_rules.py --groups 100 --rules 50 --out rules.beve"
+gen-rules-large = "python3 script/gen_rules.py --groups 4096 --rules 2048 --out rules_8m.beve"
+gen-pcap-frag = "python3 script/gen_test_fragments_pcap.py --count 100 --out test/bench_fragments.pcap"

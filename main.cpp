@@ -66,11 +66,19 @@ void PrintStat(dpdk::spi::Pipeline& pipeline, std::uint32_t timer_period_sec) {
  * @return 0 on success, 1 on error.
  */
 int main() {
+  std::println("[Config] Loading system configuration from '{}'...", CONFIG_PATH);
+  const auto config_start{std::chrono::high_resolution_clock::now()};
+
   auto config{dpdk::LoadConfig(CONFIG_PATH)};
   if (!config) {
     std::println(stderr, "Config error: {}", config.error());
     return 1;
   }
+
+  const auto config_end{std::chrono::high_resolution_clock::now()};
+  const auto config_sec{std::chrono::duration<double>(config_end - config_start).count()};
+  std::println("[Config] Loaded configuration in {:.4f} seconds (rule_path: '{}')",
+               config_sec, config->spi.rule_path);
 
   // Stash the runtime fields Pipeline needs before *config is moved into
   // the Environment. Copy instead of move so *config is still valid
@@ -97,18 +105,26 @@ int main() {
   }
 
   // Now compile rules (requires EAL for rte_acl_create).
+  std::println("[SPI] Compiling {} filter groups into DPDK ACL tables (please wait)...", spi_config.filter_groups.size());
+  const auto rule_load_start{std::chrono::high_resolution_clock::now()};
+
   auto rule_table{dpdk::spi::CompileRuleTable(spi_config)};
   if (!rule_table) {
     std::println(stderr, "SPI compile error: {}", rule_table.error());
     return 1;
   }
-  std::println("Loaded {} SPI filter groups, {} filters", rule_table->GroupCount(), rule_table->FilterCount());
 
   auto dpi_rules{CompileDpiRules(dpi_config)};
   if (!dpi_rules) {
     std::println(stderr, "{}", dpi_rules.error());
     return 1;
   }
+
+  const auto rule_load_end{std::chrono::high_resolution_clock::now()};
+  const auto elapsed_sec{std::chrono::duration<double>(rule_load_end - rule_load_start).count()};
+
+  std::println("Loaded and compiled {} SPI filter groups ({} filters) in {:.4f} seconds!",
+               rule_table->GroupCount(), rule_table->FilterCount(), elapsed_sec);
 
   dpdk::spi::Pipeline pipeline{env, std::move(*rule_table), std::move(*dpi_rules), *config};
   PrintStat(pipeline, timer_period_sec);

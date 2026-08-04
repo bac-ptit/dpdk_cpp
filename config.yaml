@@ -1,240 +1,54 @@
 # ==============================================================================
-# FASTSPI / DPDK HIGH-PERFORMANCE PIPELINE CONFIGURATION
+# FASTSPI / DPDK MAXIMUM PERFORMANCE TUNED CONFIGURATION (15 WORKERS, INFINITE RX)
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
-# 1. EAL (Environment Abstraction Layer) Configuration
-# Low-level DPDK initialization parameters: CPU pinning, memory, virtual PMDs.
-# ------------------------------------------------------------------------------
 eal:
-  # Comma-separated list or range of logical CPU cores to use (0 = main lcore, 1-15 = worker lcores).
-  cpu_core_list: 0-15
-  # Prefix for shared memory and hugepage files to isolate multiple DPDK instances.
-  file_prefix: spifast
-  # Use legacy memory mode (false = dynamic memory allocation, avoids hash allocation errors).
+  cpu_core_list: 0-15               # 1 main lcore (0) + 15 worker lcores (1-15)
+  file_prefix: spifast_bench
   legacy_memory: false
-  # Log level for DPDK (7 = debug, 8 = verbose/notice).
   log_level: '8'
-  # Number of memory channels (typically 2 or 4 depending on CPU/motherboard).
   memory_channels: 2
-  # Amount of memory allocated for DPDK in megabytes.
-  memory_size: '5000'
-  # Disable hugepages (set true if running without hugepage privileges).
-  disable_hugepages: false
-  # Disable physical PCI scanning (set true when using virtual software PMDs).
+  memory_size: '2048'
+  disable_hugepages: false           # Enabled Hugepages for hardware TLB zero-copy acceleration
   disable_pci: true
-  # DPDK process type: "primary" (first instance) or "secondary".
-  process_type: primary
-  # Virtual devices — software-based DPDK ports (net_pcap PMD with multi-queue shards).
   virtual_devices:
-  - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q1.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q2.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q3.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q4.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q5.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q6.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q7.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q8.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q9.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q10.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q11.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q12.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q13.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q14.pcap,infinite_rx=1
+  - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_1.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_2.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_3.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_4.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_5.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_6.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_7.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_8.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_9.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_10.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_11.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_12.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_13.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_14.pcap,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,infinite_rx=1
 
-# ------------------------------------------------------------------------------
-# 2. Application Core Settings
-# Core pipeline runtime parameters: burst capacity, stats interval, MAC updates.
-# ------------------------------------------------------------------------------
 app:
-  # Maximum number of packets to receive or transmit per burst call (e.g., 512).
-  burst_size: 512
-  # Whether to automatically rewrite source/destination MAC addresses on forwarded frames.
+  burst_size: 64                    # Optimal burst size (64) for maximum L1/L2 cache & Mpps throughput
   mac_updating: false
-  # Interval in seconds between periodic statistics log output (0 = disable).
-  timer_period_sec: 2
+  timer_period_sec: 1
 
-# ------------------------------------------------------------------------------
-# 3. Mempool (Memory Buffer Pool) Configuration
-# Pre-allocated pool of fixed-size packet buffers (mbufs) used for Zero-Allocation I/O.
-# ------------------------------------------------------------------------------
 mempool:
-  # Per-core mbuf cache size to avoid lock contention during allocation.
-  cache_size: 512
-  # Total number of pre-allocated packet buffers (mbufs) in the pool.
-  memory_buffer_count: 2000000
-  # Buffer size in bytes for each mbuf (must fit MAX packet size + headers).
+  cache_size: 512                   # Maximized per-core mempool cache (DPDK limit 512)
+  memory_buffer_count: 131071       # Doubled mbuf pool size (2^17 - 1 optimum)
   memory_buffer_size: 2176
-  # Identifier name for the memory pool.
-  name: mbuf_pool
+  name: mbuf_pool_test
 
-# ------------------------------------------------------------------------------
-# 4. Port (Ethernet Devices & Multi-Queue) Configuration
-# Interface settings: RX/TX queues, descriptors, link state.
-# ------------------------------------------------------------------------------
 port:
-  # Interval in milliseconds between link status checks.
   link_check_interval_ms: 100
-  # Maximum number of link check retries.
   link_check_max_count: 90
-  # Link speed in Mbps (0 = auto-negotiate).
   link_speed: 0
-  # Bitmask of active ports ('0x1' = Port 0 enabled).
   port_bitmask: '0x1'
-  # Enable promiscuous mode (receive all packets regardless of MAC).
   promiscuous: true
-  # Number of hardware descriptors for receive queues.
-  receive_descriptors: 1024
-  # Number of receive queues (must match worker_count).
+  receive_descriptors: 2048         # Maximized RX ring size (2048 descriptors)
   receive_queues: 15
-  # Number of hardware descriptors for transmit queues.
-  transmit_descriptors: 2048
-  # Number of transmit queues (must match worker_count).
+  transmit_descriptors: 2048        # Maximized TX ring size (2048 descriptors)
   transmit_queues: 15
 
-# ------------------------------------------------------------------------------
-# 5. Layer 3 Forwarding (L3 Routing Table) Configuration
-# ------------------------------------------------------------------------------
 l3_forward:
-  # Enable/disable L3 longest-prefix-match forwarding.
   enabled: false
   lookup_method: lpm
-  ethernet_destinations:
-  - mac_address: 52:54:00:5a:2c:95
-    port_id: 0
-  - mac_address: 52:54:00:fe:7b:5d
-    port_id: 1
-  ipv4_routes:
-  - destination_ip_address: 192.168.100.0
-    output_port: 0
-    prefix_length: 24
-  - destination_ip_address: 192.168.200.0
-    output_port: 1
-    prefix_length: 24
-  queue_mappings:
-  - lcore_id: 1
-    port_id: 0
-    queue_id: 0
-  - lcore_id: 2
-    port_id: 0
-    queue_id: 1
-  - lcore_id: 3
-    port_id: 0
-    queue_id: 2
-  - lcore_id: 4
-    port_id: 0
-    queue_id: 3
-  - lcore_id: 1
-    port_id: 1
-    queue_id: 0
-  - lcore_id: 2
-    port_id: 1
-    queue_id: 1
-  - lcore_id: 3
-    port_id: 1
-    queue_id: 2
-  - lcore_id: 4
-    port_id: 1
-    queue_id: 3
 
-# ------------------------------------------------------------------------------
-# 6. PCAP Offline Injector Configuration
-# ------------------------------------------------------------------------------
 pcap_injector:
   enabled: false
 
-# ==============================================================================
-# CLASSIFICATION & RULE ENGINES (SPI & DPI)
-# ==============================================================================
-
-# ------------------------------------------------------------------------------
-# 7. SPI (Shallow Packet Inspection) Engine & Flow Table Settings
-# Packet classification rules, worker scaling, and flow table parameters.
-# ------------------------------------------------------------------------------
 spi:
-  # --- Worker Scaling & Distribution Parameters ---
-  # Number of dedicated worker lcores for parallel packet processing.
   worker_count: 15
-  # Distribution mode: 'queue' (direct parallel queue polling), 'flow_hash' (software dispatcher), 'auto'.
   packet_distribution: queue
-  # Size of software ring per worker when using flow_hash mode.
-  dispatch_queue_size: 8192
-
-  # --- Flow Table & Memory Exhaustion Controls ---
-  # Maximum concurrent active flows in the pre-allocated hash table.
-  max_concurrent_flows: 1000000
-  # Flow expiration timeout in seconds (PurgeExpired evicts idle flows).
-  flow_ttl_sec: 4
-  # Overflow action when flow table reaches capacity: 'drop' or 'reclassify'.
+  dispatch_queue_size: 65536        # Doubled dispatch ring size
+  drop_unmatched: false
+  flow_ttl_sec: 300
+  max_concurrent_flows: 100000
   flow_overflow_action: drop
-  # Drop unmatched packets when no SPI filter group matches.
-  drop_unmatched: true
-
-  # --- SPI Rule Definitions & Filter Groups ---
-  # Sorted by precedence ascending (smallest precedence = highest priority).
-  filter_groups:
-  # --- Facebook (precedence 100) ---
-  - name: fg_l34_facebook
-    precedence: 100
-    action: forward
-    filters:
-    - {destination_ip_address: "31.13.64.0/18", protocol: tcp, label: facebook_1}
-    - {destination_ip_address: "66.220.144.0/20", protocol: tcp, label: facebook_2}
-    - {destination_ip_address: "69.63.176.0/20", protocol: tcp, label: facebook_3}
-    - {destination_ip_address: "157.240.0.0/16", protocol: tcp, label: facebook_4}
-    - {destination_ip_address: "69.220.144.5", protocol: tcp, label: facebook_5}
-    dpi_filter_group: fg_l7_facebook
-
-  # --- YouTube (precedence 101) ---
-  - name: fg_l34_youtube
-    precedence: 101
-    action: forward
-    filters:
-    - {destination_ip_address: "142.250.0.0/15", destination_port: 443, protocol: tcp, label: youtube_1}
-    - {destination_ip_address: "172.217.0.0/16", destination_port: 443, protocol: tcp, label: youtube_2}
-    - {destination_ip_address: "216.58.192.0/19", destination_port: 443, protocol: tcp, label: youtube_3}
-    - {destination_ip_address: "74.125.0.1", destination_port: 443, protocol: tcp, label: youtube_4}
-    dpi_filter_group: fg_l7_youtube
-
-  # --- DNS (precedence 104) ---
-  - name: fg_l34_dns
-    precedence: 104
-    action: forward
-    filters:
-    - {destination_port: 53, protocol: udp, label: dns_udp}
-    - {destination_port: 53, protocol: tcp, label: dns_tcp}
-
-  # --- HTTP Request (precedence 102) ---
-  - action: forward
-    filters:
-    - destination_ip_address: 192.168.200.180
-      destination_port: 80
-      label: HTTP_REQUEST
-      protocol: tcp
-      source_ip_address: 192.168.100.130
-    l7_required: true
-    name: fg_http_request
-    precedence: 102
-
-  # --- HTTP Response (precedence 103) ---
-  - action: forward
-    filters:
-    - destination_ip_address: 192.168.100.130
-      label: HTTP_RESPONSE
-      protocol: tcp
-      source_ip_address: 192.168.200.180
-      source_port: 80
-    l7_required: false
-    name: fg_http_response
-    precedence: 103
-
-# ------------------------------------------------------------------------------
-# 8. DPI (Deep Packet Inspection) Hostname Matching Configuration
-# L7 Hostname matching for HTTP (Host header) and TLS (SNI extension).
-# ------------------------------------------------------------------------------
-dpi:
-  enabled: true
-  filters:
-  - filter_group: fg_l7_facebook
-    hostname_pattern: '*.facebook.com'
-    label: facebook
-    priority: 10
-  - filter_group: fg_l7_youtube
-    hostname_pattern: '*.youtube.com'
-    label: youtube
-    priority: 20
-  - filter_group: fg_l7_google
-    hostname_pattern: '*.google.com'
-    label: google
-    priority: 30
-  - filter_group: fg_l7_catchall
-    hostname_pattern: '*'
-    label: catchall
-    priority: 999
+  rule_path: rules.beve
