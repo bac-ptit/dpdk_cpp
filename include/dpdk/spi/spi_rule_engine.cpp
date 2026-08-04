@@ -739,29 +739,44 @@ std::expected<RuleTable, std::string> CompileRuleTable(
     return AclChunk{.ctx = chunk_ctx, .start_group_index = start_idx, .group_count = chunk_count};
   };
 
-  std::vector<std::future<std::expected<AclChunk, std::string>>> futures;
-  futures.reserve(task_specs.size());
-
-  for (const auto& spec : task_specs) {
-    futures.push_back(std::async(std::launch::async, compile_chunk_fn, spec));
-  }
-
   std::vector<AclChunk> acl_chunks;
   acl_chunks.reserve(task_specs.size());
 
-  for (auto& fut : futures) {
-    auto res{fut.get()};
-    if (!res) {
-      for (auto& c : acl_chunks) {
-        if (c.ctx != nullptr) rte_acl_free(c.ctx);
-      }
-      return std::unexpected(res.error());
+  // Compile chunks in batches of 2 to cap peak build-time memory usage
+  constexpr std::size_t kMaxConcurrentCompiles{2};
+  for (std::size_t i = 0; i < task_specs.size(); i += kMaxConcurrentCompiles) {
+    const std::size_t batch_count = std::min<std::size_t>(kMaxConcurrentCompiles, task_specs.size() - i);
+    std::vector<std::future<std::expected<AclChunk, std::string>>> futures;
+    futures.reserve(batch_count);
+
+    for (std::size_t b = 0; b < batch_count; ++b) {
+      futures.push_back(std::async(std::launch::async, compile_chunk_fn, task_specs[i + b]));
     }
-    acl_chunks.push_back(*res);
+
+    for (auto& fut : futures) {
+      auto res{fut.get()};
+      if (!res) {
+        for (auto& c : acl_chunks) {
+          if (c.ctx != nullptr) rte_acl_free(c.ctx);
+        }
+        return std::unexpected(res.error());
+      }
+      acl_chunks.push_back(std::move(*res));
+    }
   }
 
   std::vector<std::uint32_t> precedence_order(groups.size());
   std::iota(precedence_order.begin(), precedence_order.end(), 0U);
+
+  // Count CIDR routes to dynamically size num_tbl8 and save ~2GB RAM when unused
+  std::size_t total_cidr_routes{0};
+  for (const auto& group : groups) {
+    for (const auto& filter : group.filters) {
+      if (filter.match_destination_cidr) {
+        ++total_cidr_routes;
+      }
+    }
+  }
 
   // Build FIB and Member structures
   struct rte_fib_conf fib_conf{};
@@ -769,7 +784,7 @@ std::expected<RuleTable, std::string> CompileRuleTable(
   fib_conf.default_nh = 0;
   fib_conf.max_routes = static_cast<int>(total_rules + 1);
   fib_conf.dir24_8.nh_sz = RTE_FIB_DIR24_8_8B;
-  fib_conf.dir24_8.num_tbl8 = 1 << 20;
+  fib_conf.dir24_8.num_tbl8 = std::min<uint32_t>(1U << 20, std::max<uint32_t>(256U, static_cast<uint32_t>(total_cidr_routes * 4U)));
   fib_conf.flags = RTE_FIB_F_LOOKUP_NETWORK_ORDER;
 
   struct rte_fib* fib_ctx = rte_fib_create("spi_fib", static_cast<int>(rte_socket_id()), &fib_conf);
@@ -777,8 +792,10 @@ std::expected<RuleTable, std::string> CompileRuleTable(
   std::size_t total_member_keys = 0;
   for (const auto& group : groups) {
     for (const auto& filter : group.filters) {
-      if (filter.match_destination_ip || filter.match_destination_cidr) {
+      if (filter.match_destination_ip) {
         ++total_member_keys;
+      } else if (filter.match_destination_cidr && filter.destination_prefix_length >= 20) {
+        total_member_keys += (1U << (32U - filter.destination_prefix_length));
       }
     }
   }

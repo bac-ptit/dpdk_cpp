@@ -1,5 +1,5 @@
 # ==============================================================================
-# FASTSPI / DPDK MAXIMUM PERFORMANCE TUNED CONFIGURATION (15 WORKERS, INFINITE RX)
+# FASTSPI / DPDK PRODUCTION BENCHMARK CONFIGURATION (15 WORKERS, INFINITE RX, 6GB RAM)
 # ==============================================================================
 
 eal:
@@ -8,20 +8,20 @@ eal:
   legacy_memory: false
   log_level: '8'
   memory_channels: 2
-  memory_size: '2048'
-  disable_hugepages: false           # Enabled Hugepages for hardware TLB zero-copy acceleration
+  memory_size: '12000'               # Increased memory allocation to 6000 MB (6GB)
+  disable_hugepages: false           # Hugepages enabled for hardware TLB zero-copy acceleration
   disable_pci: true
   virtual_devices:
   - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_1.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_2.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_3.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_4.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_5.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_6.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_7.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_8.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_9.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_10.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_11.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_12.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_13.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_14.pcap,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,infinite_rx=1
 
 app:
-  burst_size: 64                    # Optimal burst size (64) for maximum L1/L2 cache & Mpps throughput
+  burst_size: 64                    # Maximized burst size (64) for peak Mpps throughput
   mac_updating: false
   timer_period_sec: 1
 
 mempool:
-  cache_size: 512                   # Maximized per-core mempool cache (DPDK limit 512)
-  memory_buffer_count: 131071       # Doubled mbuf pool size (2^17 - 1 optimum)
+  cache_size: 512                   # Maximized per-core mempool cache
+  memory_buffer_count: 131071       # Expanded mbuf pool size
   memory_buffer_size: 2176
   name: mbuf_pool_test
 
@@ -31,9 +31,9 @@ port:
   link_speed: 0
   port_bitmask: '0x1'
   promiscuous: true
-  receive_descriptors: 2048         # Maximized RX ring size (2048 descriptors)
+  receive_descriptors: 2048         # Maximized RX ring size
   receive_queues: 15
-  transmit_descriptors: 2048        # Maximized TX ring size (2048 descriptors)
+  transmit_descriptors: 2048        # Maximized TX ring size
   transmit_queues: 15
 
 l3_forward:
@@ -46,9 +46,9 @@ pcap_injector:
 spi:
   worker_count: 15
   packet_distribution: queue
-  dispatch_queue_size: 65536        # Doubled dispatch ring size
+  dispatch_queue_size: 65536
   drop_unmatched: false
   flow_ttl_sec: 300
   max_concurrent_flows: 100000
   flow_overflow_action: drop
-  rule_path: rules.beve
+  rule_path: rules_8m.beve
