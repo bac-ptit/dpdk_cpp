@@ -612,29 +612,55 @@ std::expected<void, std::string> RuleTable::RebuildInPlace(
 
 std::expected<RuleTable, std::string> CompileRuleTable(
     const SpiConfig& config) noexcept {
-  std::vector<CompiledFilterGroup> groups;
-  groups.reserve(config.filter_groups.size());
+  const std::size_t total_groups{config.filter_groups.size()};
+  std::vector<CompiledFilterGroup> groups(total_groups);
 
-  for (const auto& [group_index, group_config] : config.filter_groups | std::views::enumerate) {
-    CompiledFilterGroup group;
-    group.name = group_config.name;
-    group.precedence = group_config.precedence;
-    group.action = ParseAction(group_config.action);
-    group.l7_required = group_config.l7_required;
-    group.bound_dpi_name = group_config.dpi_filter_group;
-    group.bound_dpi_filter_index = kNoDpiLink;
-    group.category_index = static_cast<std::uint32_t>(groups.size());
+  const std::size_t sys_cpus{std::max<std::size_t>(1, std::thread::hardware_concurrency())};
+  const std::size_t parse_threads{
+      std::clamp<std::size_t>(config.max_compilation_threads, 1, sys_cpus)};
 
-    group.filters.reserve(group_config.filters.size());
-    for (const auto& [filter_index, filter_config] : group_config.filters | std::views::enumerate) {
-      auto filter{CompileFilter(filter_config, group_index, filter_index)};
-      if (!filter) {
-        return std::unexpected(filter.error());
+  auto parse_group_range_fn = [&](std::size_t start_g, std::size_t end_g) -> std::expected<void, std::string> {
+    for (std::size_t group_index = start_g; group_index < end_g; ++group_index) {
+      const auto& group_config = config.filter_groups[group_index];
+      CompiledFilterGroup group;
+      group.name = group_config.name;
+      group.precedence = group_config.precedence;
+      group.action = ParseAction(group_config.action);
+      group.l7_required = group_config.l7_required;
+      group.bound_dpi_name = group_config.dpi_filter_group;
+      group.bound_dpi_filter_index = kNoDpiLink;
+      group.category_index = static_cast<std::uint32_t>(group_index);
+
+      group.filters.reserve(group_config.filters.size());
+      for (const auto& [filter_index, filter_config] : group_config.filters | std::views::enumerate) {
+        auto filter{CompileFilter(filter_config, group_index, filter_index)};
+        if (!filter) {
+          return std::unexpected(filter.error());
+        }
+        group.filters.push_back(std::move(*filter));
       }
-      group.filters.push_back(std::move(*filter));
+      groups[group_index] = std::move(group);
     }
+    return {};
+  };
 
-    groups.push_back(std::move(group));
+  const std::size_t groups_per_thread = (total_groups + parse_threads - 1) / parse_threads;
+  std::vector<std::future<std::expected<void, std::string>>> parse_futures;
+  parse_futures.reserve(parse_threads);
+
+  for (std::size_t t = 0; t < parse_threads; ++t) {
+    const std::size_t start_g = t * groups_per_thread;
+    const std::size_t end_g = std::min(total_groups, start_g + groups_per_thread);
+    if (start_g < end_g) {
+      parse_futures.push_back(std::async(std::launch::async, parse_group_range_fn, start_g, end_g));
+    }
+  }
+
+  for (auto& fut : parse_futures) {
+    auto res{fut.get()};
+    if (!res) {
+      return std::unexpected(res.error());
+    }
   }
 
   // Sort groups by precedence (ascending — smallest = highest priority).
@@ -678,16 +704,10 @@ std::expected<RuleTable, std::string> CompileRuleTable(
     }
   }
 
-  const std::size_t num_threads{std::max<std::size_t>(1, std::thread::hardware_concurrency())};
+  const std::size_t num_threads{parse_threads};
   std::println("[SPI] Compiling {} ACL chunks (256 groups/chunk) in parallel across {} CPU cores...", task_specs.size(), num_threads);
 
   auto compile_chunk_fn = [&](const ChunkTaskSpec spec) -> std::expected<AclChunk, std::string> {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    const auto cpu_target{spec.chunk_id % num_threads};
-    CPU_SET(cpu_target, &cpuset);
-    (void)::pthread_setaffinity_np(::pthread_self(), sizeof(cpu_set_t), &cpuset);
-
     const std::size_t start_idx{spec.start_group_index};
     const std::size_t chunk_count{spec.chunk_count};
 
@@ -743,9 +763,7 @@ std::expected<RuleTable, std::string> CompileRuleTable(
   acl_chunks.reserve(task_specs.size());
 
   // Compile chunks in batches capped by max_compilation_threads and available CPU cores
-  const std::size_t sys_cpus{std::max<std::size_t>(1, std::thread::hardware_concurrency())};
-  const std::size_t kMaxConcurrentCompiles{
-      std::clamp<std::size_t>(config.max_compilation_threads, 1, sys_cpus)};
+  const std::size_t kMaxConcurrentCompiles{parse_threads};
   for (std::size_t i = 0; i < task_specs.size(); i += kMaxConcurrentCompiles) {
     const std::size_t batch_count = std::min<std::size_t>(kMaxConcurrentCompiles, task_specs.size() - i);
     std::vector<std::future<std::expected<AclChunk, std::string>>> futures;
