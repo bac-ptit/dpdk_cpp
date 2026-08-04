@@ -29,7 +29,9 @@
 namespace {
 
 constexpr std::size_t kEalArgReserve{16};
-constexpr std::uint64_t kDefaultRssHash{RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV4_UDP};
+constexpr std::uint64_t kDefaultRssHash{
+    RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_FRAG_IPV4 | RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV4_UDP |
+    RTE_ETH_RSS_IPV6 | RTE_ETH_RSS_FRAG_IPV6 | RTE_ETH_RSS_NONFRAG_IPV6_TCP | RTE_ETH_RSS_NONFRAG_IPV6_UDP};
 constexpr std::array<std::string_view, 11> kSoftwareBackedDriverPrefixes{
     "net_af_packet", "net_pcap",    "net_tap",  "net_ring",    "net_memif",  "net_vhost",
     "net_virtio",    "net_vmxnet3", "net_null", "net_softnic", "net_af_xdp",
