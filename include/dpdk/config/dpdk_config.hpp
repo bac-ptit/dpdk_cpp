@@ -255,6 +255,8 @@ struct SpiConfig {
   /// "drop" — drop the packet (predictable, observable via `flow_table_full`).
   /// "reclassify" — forward without caching; the next packet re-runs SPI/DPI.
   std::string flow_overflow_action{"drop"};
+  /// Maximum concurrent ACL compilation threads (capped at available CPU cores).
+  std::size_t max_compilation_threads{2};
   /// Path to binary BEVE or YAML rule stream file (e.g. "rules.beve").
   /// When specified, rules are loaded directly from this binary stream file.
   std::string rule_path;

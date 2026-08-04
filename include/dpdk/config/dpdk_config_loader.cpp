@@ -19,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 
 #include "dpdk/spi/spi_ip_address.hpp"
@@ -442,6 +443,11 @@ std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexce
   CONFIG_VALIDATE(!IsSupportedFlowOverflowAction(spi_config.flow_overflow_action),
                   "spi.flow_overflow_action must be 'drop' or 'reclassify' (got '{}')",
                   spi_config.flow_overflow_action);
+
+  const std::size_t sys_cpus{std::max<std::size_t>(1, std::thread::hardware_concurrency())};
+  CONFIG_VALIDATE(spi_config.max_compilation_threads == 0 || spi_config.max_compilation_threads > sys_cpus,
+                  "spi.max_compilation_threads={} must be greater than 0 and cannot exceed available system CPU cores ({})",
+                  spi_config.max_compilation_threads, sys_cpus);
 
   for (std::size_t i{0}; i < spi_config.filter_groups.size(); ++i) {
     CONFIG_PROPAGATE(ValidateFilterGroupConfig(spi_config.filter_groups[i], i));

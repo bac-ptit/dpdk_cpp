@@ -742,8 +742,10 @@ std::expected<RuleTable, std::string> CompileRuleTable(
   std::vector<AclChunk> acl_chunks;
   acl_chunks.reserve(task_specs.size());
 
-  // Compile chunks in batches of 2 to cap peak build-time memory usage
-  constexpr std::size_t kMaxConcurrentCompiles{2};
+  // Compile chunks in batches capped by max_compilation_threads and available CPU cores
+  const std::size_t sys_cpus{std::max<std::size_t>(1, std::thread::hardware_concurrency())};
+  const std::size_t kMaxConcurrentCompiles{
+      std::clamp<std::size_t>(config.max_compilation_threads, 1, sys_cpus)};
   for (std::size_t i = 0; i < task_specs.size(); i += kMaxConcurrentCompiles) {
     const std::size_t batch_count = std::min<std::size_t>(kMaxConcurrentCompiles, task_specs.size() - i);
     std::vector<std::future<std::expected<AclChunk, std::string>>> futures;

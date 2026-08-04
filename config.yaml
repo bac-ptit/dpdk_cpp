@@ -8,7 +8,7 @@ eal:
   legacy_memory: false
   log_level: '8'
   memory_channels: 2
-  memory_size: '12000'               # Increased memory allocation to 6000 MB (6GB)
+  memory_size: '4000'               # Increased memory allocation to 6000 MB (6GB)
   disable_hugepages: false           # Hugepages enabled for hardware TLB zero-copy acceleration
   disable_pci: true
   virtual_devices:
@@ -51,4 +51,5 @@ spi:
   flow_ttl_sec: 300
   max_concurrent_flows: 100000
   flow_overflow_action: drop
-  rule_path: rules_8m.beve
+  max_compilation_threads: 2
+  rule_path: rules.beve
