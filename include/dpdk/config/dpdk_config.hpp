@@ -24,6 +24,24 @@ constexpr std::uint16_t kDefaultIpv6PrefixLength{128};
 constexpr std::uint16_t kDefaultEventEthRxQueues{1};
 constexpr std::uint32_t kDefaultDispatchQueueSize{8192};
 
+/// Bounded TCP byte-stream reassembly used only for L7 inspection.
+struct TcpReassemblyConfig {
+  /// Enable TCP payload reassembly before HTTP/TLS DPI.
+  bool enabled{false};
+  /// Remove a stream with no new segment after this many seconds.
+  std::uint32_t idle_timeout_sec{60};
+  /// Hard cap on streams that are still awaiting an L7 decision per worker.
+  std::uint32_t max_concurrent_streams{16384};
+  /// Maximum contiguous payload retained for one direction of one stream.
+  std::uint32_t max_buffered_bytes_per_direction{16384};
+  /// Maximum out-of-order segments retained for one direction.
+  std::uint16_t max_out_of_order_segments{32};
+  /// Hard aggregate payload budget per worker, in MiB.
+  std::uint32_t memory_budget_mb{256};
+  /// Reject a flow when overlapping TCP bytes disagree.
+  bool drop_conflicting_overlap{true};
+};
+
 /// EAL configuration — translated directly to DPDK EAL command-line args.
 struct EalConfig {
   /// CPU core list for `-l` (e.g. "0-4").
@@ -248,6 +266,10 @@ struct SpiConfig {
   bool drop_unmatched{false};
   /// Flow cache TTL in seconds (0 = disable flow caching).
   std::uint32_t flow_ttl_sec{300};
+  /// Maximum time to retain an incomplete IPv4 or IPv6 fragment set.
+  std::uint32_t fragment_timeout_sec{60};
+  /// TCP stream state used to make L7 DPI independent of TCP segmentation.
+  TcpReassemblyConfig tcp_reassembly;
   /// Hard ceiling on concurrent flow cache entries (pre-allocated at startup).
   /// When exceeded, the action configured in `flow_overflow_action` is taken.
   std::uint32_t max_concurrent_flows{1'000'000};
@@ -255,8 +277,17 @@ struct SpiConfig {
   /// "drop" — drop the packet (predictable, observable via `flow_table_full`).
   /// "reclassify" — forward without caching; the next packet re-runs SPI/DPI.
   std::string flow_overflow_action{"drop"};
-  /// Maximum concurrent ACL compilation threads (capped at available CPU cores).
+  /// Maximum threads used to parse raw rules into compiled numeric filters.
   std::size_t max_compilation_threads{2};
+  /// Maximum concurrent rte_acl_build operations. Keep this lower than the
+  /// parsing thread count because every build needs a large temporary trie.
+  std::size_t max_acl_build_threads{2};
+  /// ACL classify implementation for SPI contexts: default, scalar, sse,
+  /// avx2, neon, altivec, avx512x16, or avx512x32.
+  std::string acl_classify_algorithm{"default"};
+  /// Optional upper bound for each ACL context's runtime trie, in MiB.
+  /// Zero preserves DPDK's normal memory-minimizing build behavior.
+  std::size_t acl_build_max_size_mb{0};
   /// Path to binary BEVE or YAML rule stream file (e.g. "rules.beve").
   /// When specified, rules are loaded directly from this binary stream file.
   std::string rule_path;

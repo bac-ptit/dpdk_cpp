@@ -134,6 +134,25 @@ ParseL4Ipv6(const rte_mbuf& packet, std::uint32_t l4_offset,
   return meta;
 }
 
+[[nodiscard, gnu::always_inline]] inline bool PopulateTcpMetadata(
+    const rte_mbuf& packet, std::uint32_t l4_offset,
+    std::uint32_t l4_length, dpdk::spi::PacketMetadata& metadata) noexcept {
+  rte_tcp_hdr tcp_hdr{};
+  if (!ReadHeaderFast(packet, l4_offset, tcp_hdr)) [[unlikely]] {
+    return false;
+  }
+  const auto tcp_header_length{
+      static_cast<std::uint32_t>(tcp_hdr.data_off >> 4U) * 4U};
+  if (tcp_header_length < sizeof(rte_tcp_hdr) || tcp_header_length > l4_length) [[unlikely]] {
+    return false;
+  }
+  metadata.tcp_sequence = rte_be_to_cpu_32(tcp_hdr.sent_seq);
+  metadata.tcp_payload_offset = l4_offset + tcp_header_length;
+  metadata.tcp_payload_length = l4_length - tcp_header_length;
+  metadata.tcp_flags = tcp_hdr.tcp_flags;
+  return true;
+}
+
 [[nodiscard]] const void* ReadPayload(const rte_mbuf& packet,
                                       std::uint32_t offset, void* buf,
                                       std::uint32_t max_len) noexcept {
@@ -297,11 +316,23 @@ FindHostHeaderValue(
 
 namespace dpdk::spi {
 
-[[nodiscard, gnu::hot]] std::optional<PacketMetadata> ParsePacket(
-    const rte_mbuf& packet,
+[[nodiscard, gnu::hot]] std::optional<PacketMetadata> ParsePacketOwned(
+    rte_mbuf*& packet,
     struct ::rte_ip_frag_tbl* frag_tbl,
-    std::uint64_t tsc_timestamp) noexcept {
-  const rte_mbuf* current_packet{&packet};
+    std::uint64_t tsc_timestamp,
+    PacketParseStatus* status,
+    bool* was_reassembled) noexcept {
+  if (status != nullptr) {
+    *status = PacketParseStatus::kMalformed;
+  }
+  if (was_reassembled != nullptr) {
+    *was_reassembled = false;
+  }
+  if (packet == nullptr) [[unlikely]] {
+    return std::nullopt;
+  }
+
+  const rte_mbuf* current_packet{packet};
   rte_ether_hdr ether_hdr{};
   if (!ReadHeaderFast(*current_packet, 0, ether_hdr)) [[unlikely]] {
     return std::nullopt;
@@ -316,19 +347,39 @@ namespace dpdk::spi {
       return std::nullopt;
     }
 
+    const auto ipv4_header_len{rte_ipv4_hdr_len(&ipv4_hdr)};
+    if (ipv4_header_len < sizeof(rte_ipv4_hdr)) [[unlikely]] {
+      return std::nullopt;
+    }
+
     if (IsIpv4Fragmented(ipv4_hdr)) {
       if (!IsValidFragment(ipv4_hdr)) [[unlikely]] {
         return std::nullopt; // OWASP: Drop malformed / tiny fragment attack
       }
       if (frag_tbl != nullptr) {
+        if (rte_pktmbuf_data_len(packet) < ipv4_offset + ipv4_header_len) [[unlikely]] {
+          return std::nullopt;
+        }
+        packet->l2_len = static_cast<std::uint16_t>(ipv4_offset);
+        packet->l3_len = ipv4_header_len;
+        auto* fragment_ipv4_hdr{
+            rte_pktmbuf_mtod_offset(packet, rte_ipv4_hdr*, ipv4_offset)};
         struct rte_ip_frag_death_row death_row{};
         rte_mbuf* reassembled = rte_ipv4_frag_reassemble_packet(
-            frag_tbl, &death_row, const_cast<rte_mbuf*>(current_packet),
-            tsc_timestamp, &ipv4_hdr);
+            frag_tbl, &death_row, packet,
+            tsc_timestamp, fragment_ipv4_hdr);
         rte_ip_frag_free_death_row(&death_row, 0);
         if (reassembled == nullptr) {
-          // Waiting for remaining fragments of this packet
+          // DPDK now owns this fragment until completion or table timeout.
+          packet = nullptr;
+          if (status != nullptr) {
+            *status = PacketParseStatus::kWaitingForFragments;
+          }
           return std::nullopt;
+        }
+        packet = reassembled;
+        if (was_reassembled != nullptr) {
+          *was_reassembled = true;
         }
         current_packet = reassembled;
         if (!ReadHeaderFast(*current_packet, ipv4_offset, ipv4_hdr)) [[unlikely]] {
@@ -337,21 +388,31 @@ namespace dpdk::spi {
       }
     }
 
-    const auto ipv4_header_len{rte_ipv4_hdr_len(&ipv4_hdr)};
-    if (ipv4_header_len < sizeof(rte_ipv4_hdr)) [[unlikely]] {
-      return std::nullopt;
-    }
-
     const auto l4_offset{
         static_cast<std::uint32_t>(ipv4_offset + ipv4_header_len)};
 
     if (ipv4_hdr.next_proto_id == IPPROTO_TCP) [[likely]] {
-      return ParseL4<rte_tcp_hdr>(*current_packet, l4_offset, ipv4_hdr,
-                                  Protocol::kTcp);
+      auto parsed{ParseL4<rte_tcp_hdr>(*current_packet, l4_offset, ipv4_hdr,
+                                       Protocol::kTcp)};
+      const auto ipv4_total_length{rte_be_to_cpu_16(ipv4_hdr.total_length)};
+      if (!parsed || ipv4_total_length < ipv4_header_len ||
+          !PopulateTcpMetadata(*current_packet, l4_offset,
+                               ipv4_total_length - ipv4_header_len,
+                               *parsed)) [[unlikely]] {
+        return std::nullopt;
+      }
+      if (parsed && status != nullptr) {
+        *status = PacketParseStatus::kComplete;
+      }
+      return parsed;
     }
     if (ipv4_hdr.next_proto_id == IPPROTO_UDP) {
-      return ParseL4<rte_udp_hdr>(*current_packet, l4_offset, ipv4_hdr,
-                                  Protocol::kUdp);
+      auto parsed{ParseL4<rte_udp_hdr>(*current_packet, l4_offset, ipv4_hdr,
+                                       Protocol::kUdp)};
+      if (parsed && status != nullptr) {
+        *status = PacketParseStatus::kComplete;
+      }
+      return parsed;
     }
     return std::nullopt;
   }
@@ -359,24 +420,83 @@ namespace dpdk::spi {
   if (ether_type == RTE_ETHER_TYPE_IPV6) {
     constexpr std::uint32_t ipv6_offset{sizeof(rte_ether_hdr)};
     rte_ipv6_hdr ipv6_hdr{};
-    if (!ReadHeaderFast(packet, ipv6_offset, ipv6_hdr)) [[unlikely]] {
+    if (!ReadHeaderFast(*packet, ipv6_offset, ipv6_hdr)) [[unlikely]] {
       return std::nullopt;
     }
 
-    constexpr std::uint32_t l4_offset{ipv6_offset + sizeof(rte_ipv6_hdr)};
+    if (ipv6_hdr.proto == IPPROTO_FRAGMENT) {
+      constexpr std::uint32_t fragment_offset{ipv6_offset + sizeof(rte_ipv6_hdr)};
+      rte_ipv6_fragment_ext fragment_hdr{};
+      if (!ReadHeaderFast(*packet, fragment_offset, fragment_hdr)) [[unlikely]] {
+        return std::nullopt;
+      }
+      if (frag_tbl != nullptr) {
+        if (rte_pktmbuf_data_len(packet) < fragment_offset + sizeof(fragment_hdr)) [[unlikely]] {
+          return std::nullopt;
+        }
+        packet->l2_len = static_cast<std::uint16_t>(ipv6_offset);
+        packet->l3_len = sizeof(rte_ipv6_hdr);
+        auto* ipv6_header{rte_pktmbuf_mtod_offset(packet, rte_ipv6_hdr*, ipv6_offset)};
+        auto* fragment_header{rte_pktmbuf_mtod_offset(
+            packet, rte_ipv6_fragment_ext*, fragment_offset)};
+        rte_ip_frag_death_row death_row{};
+        rte_mbuf* reassembled{rte_ipv6_frag_reassemble_packet(
+            frag_tbl, &death_row, packet, tsc_timestamp, ipv6_header, fragment_header)};
+        rte_ip_frag_free_death_row(&death_row, 0);
+        if (reassembled == nullptr) {
+          packet = nullptr;
+          if (status != nullptr) {
+            *status = PacketParseStatus::kWaitingForFragments;
+          }
+          return std::nullopt;
+        }
+        packet = reassembled;
+        if (was_reassembled != nullptr) {
+          *was_reassembled = true;
+        }
+        if (!ReadHeaderFast(*packet, ipv6_offset, ipv6_hdr)) [[unlikely]] {
+          return std::nullopt;
+        }
+      } else {
+        return std::nullopt;
+      }
+    }
+
+    const std::uint32_t l4_offset{ipv6_offset + sizeof(rte_ipv6_hdr)};
 
     if (ipv6_hdr.proto == IPPROTO_TCP) [[likely]] {
-      return ParseL4Ipv6<rte_tcp_hdr>(packet, l4_offset, ipv6_hdr,
-                                      Protocol::kTcp);
+      auto parsed{ParseL4Ipv6<rte_tcp_hdr>(*packet, l4_offset, ipv6_hdr,
+                                           Protocol::kTcp)};
+      const auto ipv6_payload_length{rte_be_to_cpu_16(ipv6_hdr.payload_len)};
+      if (!parsed || !PopulateTcpMetadata(*packet, l4_offset,
+                                          ipv6_payload_length, *parsed)) [[unlikely]] {
+        return std::nullopt;
+      }
+      if (parsed && status != nullptr) {
+        *status = PacketParseStatus::kComplete;
+      }
+      return parsed;
     }
     if (ipv6_hdr.proto == IPPROTO_UDP) {
-      return ParseL4Ipv6<rte_udp_hdr>(packet, l4_offset, ipv6_hdr,
-                                      Protocol::kUdp);
+      auto parsed{ParseL4Ipv6<rte_udp_hdr>(*packet, l4_offset, ipv6_hdr,
+                                           Protocol::kUdp)};
+      if (parsed && status != nullptr) {
+        *status = PacketParseStatus::kComplete;
+      }
+      return parsed;
     }
     return std::nullopt;
   }
 
   return std::nullopt;
+}
+
+[[nodiscard, gnu::hot]] std::optional<PacketMetadata> ParsePacket(
+    const rte_mbuf& packet,
+    struct ::rte_ip_frag_tbl* frag_tbl,
+    std::uint64_t tsc_timestamp) noexcept {
+  auto* mutable_packet{const_cast<rte_mbuf*>(&packet)};
+  return ParsePacketOwned(mutable_packet, frag_tbl, tsc_timestamp);
 }
 
 [[nodiscard]] std::optional<std::pair<const char*, std::uint16_t>>
@@ -447,6 +567,32 @@ ExtractHttpHost(const rte_mbuf& packet,
     return std::nullopt;
   }
 
+  return FindHostHeaderValue(data);
+}
+
+[[nodiscard]] std::optional<std::pair<const char*, std::uint16_t>>
+ExtractTlsSni(std::span<const unsigned char> payload) noexcept {
+  constexpr std::uint32_t kMaxTlsInspect{512U};
+  constexpr std::uint32_t kMinTlsRecord{5U};
+  const auto data{payload.first(std::min<std::size_t>(payload.size(), kMaxTlsInspect))};
+  if (data.size() < kMinTlsRecord || !ValidateTlsRecordHeader(data)) [[unlikely]] {
+    return std::nullopt;
+  }
+  const auto ext_offset{WalkClientHelloPreamble(data)};
+  if (!ext_offset) [[unlikely]] {
+    return std::nullopt;
+  }
+  return FindSniExtension(data, *ext_offset);
+}
+
+[[nodiscard]] std::optional<std::pair<const char*, std::uint16_t>>
+ExtractHttpHost(std::span<const unsigned char> payload) noexcept {
+  constexpr std::uint32_t kMaxHttpInspect{256U};
+  constexpr std::uint32_t kMinHttpLen{4U};
+  const auto data{payload.first(std::min<std::size_t>(payload.size(), kMaxHttpInspect))};
+  if (data.size() < kMinHttpLen || !IsHttpMethodValid(data)) [[unlikely]] {
+    return std::nullopt;
+  }
   return FindHostHeaderValue(data);
 }
 

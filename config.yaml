@@ -8,20 +8,40 @@ eal:
   legacy_memory: false
   log_level: '8'
   memory_channels: 2
-  memory_size: '6000'               # Increased memory allocation to 6000 MB (6GB)
+  memory_size: '3800'               # 3.8GB hugepages allocated to EAL (from 4GB OS pool)
   disable_hugepages: false           # Hugepages enabled for hardware TLB zero-copy acceleration
   disable_pci: true
   virtual_devices:
-  - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_1.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_2.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_3.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_4.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_5.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_6.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_7.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_8.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_9.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_10.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_11.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_12.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_13.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/beve_shards/shard_14.pcap,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,infinite_rx=1
+  - net_pcap0,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q0.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q1.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q2.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q3.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q4.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q5.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q6.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q7.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q8.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q9.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q10.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q11.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q12.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q13.pcap,rx_pcap=/home/bac/programming/viettel/dpdk_cpp/test/bench_pcap_shards/bench_q14.pcap,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,tx_pcap=/dev/null,infinite_rx=1
 
 app:
   burst_size: 64                    # Maximized burst size (64) for peak Mpps throughput
   mac_updating: false
   timer_period_sec: 1
 
+dpi:
+  enabled: false
+  filters:
+  - filter_group: fg_l7_facebook
+    hostname_pattern: '*.facebook.com'
+    label: facebook
+    priority: 10
+  - filter_group: fg_l7_youtube
+    hostname_pattern: '*.youtube.com'
+    label: youtube
+    priority: 20
+  - filter_group: fg_l7_google
+    hostname_pattern: '*.google.com'
+    label: google
+    priority: 30
+  - filter_group: fg_l7_catchall
+    hostname_pattern: '*'
+    label: catchall
+    priority: 999
+
 mempool:
   cache_size: 512                   # Maximized per-core mempool cache
-  memory_buffer_count: 131071       # Expanded mbuf pool size
+  memory_buffer_count: 1441791       # ~1.44M mbufs (~3.13 GB total mbuf memory)
   memory_buffer_size: 2176
   name: mbuf_pool_test
 
@@ -47,9 +67,22 @@ spi:
   worker_count: 15
   packet_distribution: queue
   dispatch_queue_size: 65536
-  drop_unmatched: false
+  drop_unmatched: true
   flow_ttl_sec: 300
-  max_concurrent_flows: 100000
-  flow_overflow_action: drop
-  max_compilation_threads: 4
-  rule_path: rules_8m.beve
+  fragment_timeout_sec: 60          # Drop incomplete IPv4/IPv6 fragment sets after 60 seconds
+  tcp_reassembly:
+    enabled: false                  # Enable when DPI must inspect split TCP payloads
+    idle_timeout_sec: 60
+    max_concurrent_streams: 16384
+    max_buffered_bytes_per_direction: 16384
+    max_out_of_order_segments: 32
+    memory_budget_mb: 256
+    drop_conflicting_overlap: true
+  max_concurrent_flows: 30000
+  flow_overflow_action: reclassify
+  max_compilation_threads: 6
+  max_acl_build_threads: 2
+  acl_classify_algorithm: avx2       # Explicit SIMD classifier; use default to auto-select
+  acl_build_max_size_mb: 0           # 0 = DPDK default; constrain only after measuring trie memory
+  rule_path: rules.beve
+

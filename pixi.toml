@@ -17,9 +17,10 @@ ninja = ">=1.13.2,<2"
 llvm = ">=22.1.7,<23"
 libpcap = ">=1.10.6,<2"
 compiler-rt = ">=22.1.7,<23"
+vectorscan = ">=5.4.11,<6"
 
 [activation.env]
-PKG_CONFIG_PATH = "/usr/lib64/pkgconfig"
+PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig:/usr/lib64/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig"
 # Force clang to use ld.lld for every link. Without this, the IPO/LTO
 # test in CMakeLists.txt invokes x86_64-conda-linux-gnu-ld which then
 # looks for LLVMgold.so — a plugin that doesn't exist for LLVM 22 in

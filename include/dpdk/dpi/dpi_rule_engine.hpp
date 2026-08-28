@@ -1,5 +1,7 @@
 #pragma once
 
+#include <hs/hs.h>
+
 #include <cstdint>
 #include <expected>
 #include <limits>
@@ -45,35 +47,27 @@ struct DpiSuffixEntry {
   std::uint16_t filter_index;
 };
 
-/// Immutable table of compiled DPI filters, sorted by priority.
-///
-/// Lookup indexes:
-///   - `exact_list_` — small sorted vector of (hostname, filter_index).
-///     Linear scan because there are usually < 5 exact-match rules
-///     ("dns.google", "cloudflare-dns.com", "dns.quad9.net"); a hash map
-///     is overkill for so few entries.
-///   - `suffix_list_` — small sorted vector of (domain, filter_index),
-///     sorted by `domain` so we can stop at the first mismatch. For ~25
-///     suffix rules this is faster than a hash map (no hash compute,
-///     fits in 2-3 cache lines).
-///   - `catch_all_idx_` — single `*` catch-all rule, or sentinel if none.
-///
-/// Keeping both indexes as `std::vector` (data-only) avoids the
-/// unordered_map bucket array that was causing 656M cache-misses/sec in
-/// earlier hash-map experiments. With 30 rules total, the working set
-/// fits in a single L1 cache line and stays hot.
+/**
+ * @brief Immutable table of compiled DPI filters with Hyperscan SIMD acceleration.
+ *
+ * Uses Intel Hyperscan / Vectorscan multi-pattern block database for O(1) multi-regex matching,
+ * combined with an in-place fallback for exact/suffix matching.
+ */
 class DpiRuleTable final {
  public:
-  explicit DpiRuleTable(std::vector<CompiledDpiFilter> filters) noexcept;
+  explicit DpiRuleTable(std::vector<CompiledDpiFilter> filters, hs_database_t* hs_db = nullptr) noexcept;
 
   DpiRuleTable(const DpiRuleTable&) = delete;
   DpiRuleTable& operator=(const DpiRuleTable&) = delete;
-  DpiRuleTable(DpiRuleTable&&) = default;
-  DpiRuleTable& operator=(DpiRuleTable&&) = default;
-  ~DpiRuleTable() = default;
+  DpiRuleTable(DpiRuleTable&& other) noexcept;
+  DpiRuleTable& operator=(DpiRuleTable&& other) noexcept;
+  ~DpiRuleTable() noexcept;
 
-  /// Match hostname against DPI filters. Returns highest-priority (lowest value) match.
+  /// Match hostname against DPI filters using Hyperscan. Returns highest-priority (lowest value) match.
   [[nodiscard]] DpiResult Match(std::string_view hostname) const noexcept;
+
+  /// Match hostname using an explicitly provided Hyperscan scratch buffer.
+  [[nodiscard]] DpiResult Match(std::string_view hostname, hs_scratch_t* scratch) const noexcept;
 
   /// Get the DpiResult for a filter by its index (from a prior `Match()`).
   /// Used by the hostname cache to reconstruct result without re-running Match.
@@ -87,13 +81,7 @@ class DpiRuleTable final {
     };
   }
 
-  /// Look up the filter index for a given DPI filter group name (e.g.
-  /// `"fg_l7_facebook"`). Returns the index of the FIRST filter with that
-  /// `filter_group` value, or `std::nullopt` if none match. Used by the
-  /// SPI→DPI static link resolver at compile / reload time, NOT on the
-  /// hot path. Linear scan over `filters_` is acceptable because
-  ///   (a) typical filter count is ≤30, fits in one cache line, and
-  ///   (b) this runs once per config load / SIGUSR1, not per packet.
+  /// Look up the filter index for a given DPI filter group name.
   [[nodiscard]] std::optional<std::uint32_t> FindByFilterGroup(
       std::string_view name) const noexcept;
 
@@ -102,26 +90,32 @@ class DpiRuleTable final {
 
   [[nodiscard]] std::size_t FilterCount() const noexcept { return filters_.size(); }
 
-  /// Monotonic generation counter — incremented on each reload via
-  /// `DpiRuleTableManager::Swap`. Workers compare the cached generation
-  /// against `Generation()` on every Lookup; mismatch is treated as a
-  /// miss and triggers a re-scan. See docs_search/13 §M1.
+  /// Monotonic generation counter — incremented on each reload via DpiRuleTableManager::Swap.
   [[nodiscard]] std::uint32_t Generation() const noexcept { return generation_; }
 
-  /// Set the generation. Used by `DpiRuleTableManager::Swap` when the
-  /// new table replaces the old.
+  /// Set the generation.
   void SetGeneration(std::uint32_t gen) noexcept { generation_ = gen; }
 
+  /// Access underlying Hyperscan database.
+  [[nodiscard]] hs_database_t* HyperscanDb() const noexcept { return hs_db_; }
+
+  /// Allocate a Hyperscan scratch buffer for this database.
+  [[nodiscard]] hs_scratch_t* AllocScratch() const noexcept;
+
+  /// Free a Hyperscan scratch buffer.
+  void FreeScratch(hs_scratch_t* scratch) const noexcept;
+
  private:
-  /// Original filter list — provides filter_group / label for results.
-  /// Sorted by priority ASC so the first match in Match() is also the
-  /// highest-priority match.
+  /// Fallback matcher in case Hyperscan database is not compiled.
+  [[nodiscard]] DpiResult MatchFallback(std::string_view hostname) const noexcept;
+
+  /// Original filter list sorted by priority ASC.
   std::vector<CompiledDpiFilter> filters_;
 
-  /// Exact-match lookup map (O(1) hash table).
+  /// Exact-match lookup map.
   std::unordered_map<std::string_view, std::uint16_t> exact_map_;
 
-  /// Suffix-match lookup map (O(1) hash table keyed by domain e.g. "facebook.com").
+  /// Suffix-match lookup map.
   std::unordered_map<std::string_view, std::uint16_t> suffix_map_;
 
   /// Exact-match rules list.
@@ -132,12 +126,14 @@ class DpiRuleTable final {
 
   /// Index into `filters_` of the `*` catch-all rule, or sentinel if none.
   std::uint16_t catch_all_idx_{std::numeric_limits<std::uint16_t>::max()};
-  /// Generation counter — see `Generation()`.
+  /// Generation counter.
   std::uint32_t generation_{0U};
+
+  /// Hyperscan compiled database.
+  hs_database_t* hs_db_{nullptr};
 };
 
-/// Compile DPI config into a rule table.
+/// Compile DPI config into a rule table with Hyperscan compilation.
 [[nodiscard]] std::expected<DpiRuleTable, std::string> CompileDpiRuleTable(const DpiConfig& config) noexcept;
 
 }  // namespace dpdk::dpi
-

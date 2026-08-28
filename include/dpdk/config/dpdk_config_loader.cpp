@@ -33,6 +33,7 @@ constexpr std::uint32_t kMaxL3PacketLength{9600};
 constexpr std::size_t kMacAddressLength{17};
 constexpr std::size_t kMacAddressSeparatorPeriod{3};
 constexpr std::size_t kIpv6AddressBytes{16};
+constexpr std::size_t kBytesPerMiB{1024U * 1024U};
 
 #define CONFIG_VALIDATE(invalid_condition, ...)         \
   do {                                                  \
@@ -440,6 +441,20 @@ std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexce
   CONFIG_VALIDATE(spi_config.filter_groups.empty(), "spi.filter_groups must contain at least one group");
   CONFIG_VALIDATE(spi_config.max_concurrent_flows == 0,
                   "spi.max_concurrent_flows must be greater than 0 (got {})", spi_config.max_concurrent_flows);
+  CONFIG_VALIDATE(spi_config.fragment_timeout_sec == 0,
+                  "spi.fragment_timeout_sec must be greater than 0 for IPv4/IPv6 fragments (got {})",
+                  spi_config.fragment_timeout_sec);
+  const auto& tcp_reassembly{spi_config.tcp_reassembly};
+  CONFIG_VALIDATE(tcp_reassembly.enabled && tcp_reassembly.idle_timeout_sec == 0,
+                  "spi.tcp_reassembly.idle_timeout_sec must be greater than 0 when enabled");
+  CONFIG_VALIDATE(tcp_reassembly.enabled && tcp_reassembly.max_concurrent_streams == 0,
+                  "spi.tcp_reassembly.max_concurrent_streams must be greater than 0 when enabled");
+  CONFIG_VALIDATE(tcp_reassembly.enabled && tcp_reassembly.max_buffered_bytes_per_direction == 0,
+                  "spi.tcp_reassembly.max_buffered_bytes_per_direction must be greater than 0 when enabled");
+  CONFIG_VALIDATE(tcp_reassembly.enabled && tcp_reassembly.max_out_of_order_segments == 0,
+                  "spi.tcp_reassembly.max_out_of_order_segments must be greater than 0 when enabled");
+  CONFIG_VALIDATE(tcp_reassembly.enabled && tcp_reassembly.memory_budget_mb == 0,
+                  "spi.tcp_reassembly.memory_budget_mb must be greater than 0 when enabled");
   CONFIG_VALIDATE(!IsSupportedFlowOverflowAction(spi_config.flow_overflow_action),
                   "spi.flow_overflow_action must be 'drop' or 'reclassify' (got '{}')",
                   spi_config.flow_overflow_action);
@@ -448,6 +463,14 @@ std::expected<void, std::string> ValidateConfig(const DpdkConfig& config) noexce
   CONFIG_VALIDATE(spi_config.max_compilation_threads == 0 || spi_config.max_compilation_threads > sys_cpus,
                   "spi.max_compilation_threads={} must be greater than 0 and cannot exceed available system CPU cores ({})",
                   spi_config.max_compilation_threads, sys_cpus);
+  CONFIG_VALIDATE(spi_config.max_acl_build_threads == 0 || spi_config.max_acl_build_threads > sys_cpus,
+                  "spi.max_acl_build_threads={} must be greater than 0 and cannot exceed available system CPU cores ({})",
+                  spi_config.max_acl_build_threads, sys_cpus);
+  CONFIG_VALIDATE(!IsSupportedAclClassifyAlgorithm(spi_config.acl_classify_algorithm),
+                  "spi.acl_classify_algorithm must be 'default', 'scalar', 'sse', 'avx2', 'neon', 'altivec', "
+                  "'avx512x16', or 'avx512x32'");
+  CONFIG_VALIDATE(spi_config.acl_build_max_size_mb > std::numeric_limits<std::size_t>::max() / kBytesPerMiB,
+                  "spi.acl_build_max_size_mb is too large");
 
   for (std::size_t i{0}; i < spi_config.filter_groups.size(); ++i) {
     CONFIG_PROPAGATE(ValidateFilterGroupConfig(spi_config.filter_groups[i], i));

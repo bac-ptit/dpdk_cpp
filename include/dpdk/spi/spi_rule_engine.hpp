@@ -32,10 +32,10 @@ namespace dpdk::spi {
 /// Number of fields for ACL matching.
 constexpr uint32_t kAclNumFields{5};
 
-/// Maximum number of categories (filter groups) in a single rte_acl_ctx.
-/// Matches `RTE_ACL_MAX_CATEGORIES` in DPDK 24.11 — beyond this many groups,
-/// config validation must reject the input rather than silently dropping groups.
-inline constexpr std::size_t kMaxCategories{64};
+/// Maximum number of category results supported by the linked DPDK ACL.
+/// Large SPI rule sets are chunked before this limit because each category is
+/// an independent result slot in one rte_acl context.
+inline constexpr std::size_t kMaxCategories{RTE_ACL_MAX_CATEGORIES};
 
 /// Default filter group precedence (lower = higher priority).
 constexpr std::uint32_t kDefaultPrecedence{100};
@@ -104,6 +104,14 @@ struct alignas(64) PacketMetadata {
   std::uint16_t destination_port_be{};
   /// Length of hostname string (not null-terminated in mbuf).
   std::uint16_t hostname_length{};
+  /// TCP sequence number in host byte order (zero for UDP).
+  std::uint32_t tcp_sequence{};
+  /// Absolute offset of TCP payload from the first mbuf byte.
+  std::uint32_t tcp_payload_offset{};
+  /// TCP payload length in bytes (zero for UDP / pure ACK).
+  std::uint32_t tcp_payload_length{};
+  /// TCP control flags (SYN/FIN/RST etc.; zero for UDP).
+  std::uint8_t tcp_flags{};
   /// Parsed L4 protocol.
   Protocol protocol{};
   /// IP version (IPv4 vs IPv6).
@@ -214,7 +222,9 @@ inline constexpr std::array<rte_acl_field_def, kAclNumFields> kAclFieldDefs{{
      .offset = offsetof(AclInputData, dst_port_be)},
 }};
 
-/// ACL context chunk holding up to kMaxCategories (64) filter groups.
+/// ACL context chunk holding a bounded set of filter groups. The current
+/// compiler uses one ACL category per chunk and can therefore pack more groups
+/// than the category-result limit into a context.
 struct AclChunk {
   rte_acl_ctx* ctx{nullptr};
   std::size_t start_group_index{0};
@@ -234,7 +244,9 @@ class RuleTable final {
   RuleTable(std::vector<CompiledFilterGroup> groups, std::vector<AclChunk> acl_chunks,
             std::vector<std::uint32_t> precedence_order,
             struct rte_fib* fib_ctx = nullptr,
-            struct rte_member_setsum* member_ctx = nullptr) noexcept;
+            struct rte_member_setsum* member_ctx = nullptr,
+            std::size_t acl_build_max_size = 0,
+            enum rte_acl_classify_alg acl_classify_algorithm = RTE_ACL_CLASSIFY_DEFAULT) noexcept;
 
   /// Backward-compatible constructor for a single ACL context.
   RuleTable(std::vector<CompiledFilterGroup> groups, rte_acl_ctx* acl_ctx,
@@ -386,6 +398,10 @@ class RuleTable final {
   /// `precedence_order_[i] = cat_index` means "check `results[cat_index]`
   /// at step i". Sized to `groups_.size()` — index 0..groups_.size()-1.
   std::vector<std::uint32_t> precedence_order_;
+  /// Build-time runtime-trie memory limit, retained for in-place reloads.
+  std::size_t acl_build_max_size_{0};
+  /// Classifier selected for every ACL context, retained for reloads.
+  enum rte_acl_classify_alg acl_classify_algorithm_{RTE_ACL_CLASSIFY_DEFAULT};
 
   /// Tuple-Space Search table — open-addressed linear-probing hash keyed
   /// on canonical 5-tuple bytes → group `category_index`. Populated by

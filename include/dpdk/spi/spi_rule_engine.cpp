@@ -6,6 +6,7 @@
 #include <rte_hash.h>
 #include <rte_hash_crc.h>
 #include <rte_fib.h>
+#include <rte_lcore.h>
 #include <rte_member.h>
 
 #include <algorithm>
@@ -14,13 +15,13 @@
 #include <cstring>
 #include <format>
 #include <future>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <print>
 #include <pthread.h>
 #include <ranges>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 #include "dpdk/dpi/dpi_rule_engine.hpp"
@@ -87,6 +88,40 @@ CompiledFilterGroup& CompiledFilterGroup::operator=(CompiledFilterGroup&& other)
 
 namespace {
 
+/**
+ * @brief Build the CPU set available to rule-compilation workers.
+ *
+ * rte_eal_init pins the calling thread to the main lcore. Linux threads
+ * created afterward inherit that single-CPU affinity mask, so std::async
+ * workers would otherwise all time-share the main lcore. Unioning the CPU
+ * sets of enabled EAL lcores keeps compilation inside the application's
+ * configured CPU allocation while allowing the workers to run in parallel.
+ */
+[[nodiscard]] rte_cpuset_t BuildCompilationCpuSet() noexcept {
+  rte_cpuset_t compilation_cpu_set;
+  CPU_ZERO(&compilation_cpu_set);
+
+  unsigned int lcore_id{};
+  RTE_LCORE_FOREACH(lcore_id) {
+    const auto lcore_cpu_set{rte_lcore_cpuset(lcore_id)};
+    CPU_OR(&compilation_cpu_set, &compilation_cpu_set, &lcore_cpu_set);
+  }
+  return compilation_cpu_set;
+}
+
+/** Restore the multi-CPU EAL mask on a rule-compilation worker thread. */
+[[nodiscard]] std::expected<void, std::string> SetCompilationThreadAffinity(
+    const rte_cpuset_t& compilation_cpu_set) noexcept {
+  const auto result{pthread_setaffinity_np(
+      pthread_self(), sizeof(compilation_cpu_set), &compilation_cpu_set)};
+  if (result != 0) {
+    return std::unexpected(std::format(
+        "pthread_setaffinity_np failed for rule-compilation worker: {}",
+        std::strerror(result)));
+  }
+  return {};
+}
+
 struct MemberKey {
   uint32_t dst_ip_be;
   uint16_t dst_port_be;
@@ -109,6 +144,29 @@ static_assert(sizeof(MemberKey) == 7);
     return Action::kDrop;
   }
   return Action::kForward;
+}
+
+[[nodiscard]] std::expected<enum rte_acl_classify_alg, std::string> ParseAclClassifyAlgorithm(
+    std::string_view algorithm) noexcept {
+  if (algorithm == "default") return RTE_ACL_CLASSIFY_DEFAULT;
+  if (algorithm == "scalar") return RTE_ACL_CLASSIFY_SCALAR;
+  if (algorithm == "sse") return RTE_ACL_CLASSIFY_SSE;
+  if (algorithm == "avx2") return RTE_ACL_CLASSIFY_AVX2;
+  if (algorithm == "neon") return RTE_ACL_CLASSIFY_NEON;
+  if (algorithm == "altivec") return RTE_ACL_CLASSIFY_ALTIVEC;
+  if (algorithm == "avx512x16") return RTE_ACL_CLASSIFY_AVX512X16;
+  if (algorithm == "avx512x32") return RTE_ACL_CLASSIFY_AVX512X32;
+  return std::unexpected(std::format("unsupported SPI ACL classify algorithm '{}'", algorithm));
+}
+
+[[nodiscard]] std::expected<void, std::string> ApplyAclClassifyAlgorithm(
+    rte_acl_ctx* ctx, enum rte_acl_classify_alg algorithm) noexcept {
+  if (algorithm == RTE_ACL_CLASSIFY_DEFAULT) return {};
+  if (const int ret{rte_acl_set_ctx_classify(ctx, algorithm)}; ret != 0) {
+    return std::unexpected(std::format("rte_acl_set_ctx_classify({}) failed: {}",
+                                       static_cast<int>(algorithm), -ret));
+  }
+  return {};
 }
 
 /// IP protocol number for TCP (RFC 793).
@@ -261,8 +319,11 @@ void BuildAclRule(struct rte_acl_rule* rule, const CompiledFilter& filter, uint3
 RuleTable::RuleTable(std::vector<CompiledFilterGroup> groups, std::vector<AclChunk> acl_chunks,
                        std::vector<std::uint32_t> precedence_order,
                        struct rte_fib* fib_ctx,
-                       struct rte_member_setsum* member_ctx) noexcept
+                       struct rte_member_setsum* member_ctx,
+                       std::size_t acl_build_max_size,
+                       enum rte_acl_classify_alg acl_classify_algorithm) noexcept
     : groups_{std::move(groups)}, acl_chunks_{std::move(acl_chunks)}, precedence_order_{std::move(precedence_order)},
+      acl_build_max_size_{acl_build_max_size}, acl_classify_algorithm_{acl_classify_algorithm},
       fib_ctx_{fib_ctx}, member_ctx_{member_ctx} {
   if (!acl_chunks_.empty()) {
     acl_ctx_ = acl_chunks_[0].ctx;
@@ -284,6 +345,8 @@ RuleTable::RuleTable(RuleTable&& other) noexcept
       acl_chunks_{std::move(other.acl_chunks_)},
       acl_ctx_{other.acl_ctx_},
       precedence_order_{std::move(other.precedence_order_)},
+      acl_build_max_size_{other.acl_build_max_size_},
+      acl_classify_algorithm_{other.acl_classify_algorithm_},
       fib_ctx_{other.fib_ctx_},
       member_ctx_{other.member_ctx_} {
   other.acl_ctx_ = nullptr;
@@ -308,6 +371,8 @@ RuleTable& RuleTable::operator=(RuleTable&& other) noexcept {
     groups_ = std::move(other.groups_);
     acl_ctx_ = other.acl_ctx_;
     precedence_order_ = std::move(other.precedence_order_);
+    acl_build_max_size_ = other.acl_build_max_size_;
+    acl_classify_algorithm_ = other.acl_classify_algorithm_;
     fib_ctx_ = other.fib_ctx_;
     member_ctx_ = other.member_ctx_;
     other.acl_ctx_ = nullptr;
@@ -464,34 +529,14 @@ ClassificationResult RuleTable::Match(const PacketMetadata& packet) const noexce
 
 void RuleTable::FibLookupBulk(std::span<const PacketMetadata> packets,
                               std::span<ClassificationResult> results) const noexcept {
-  if (fib_ctx_ == nullptr) return;
-  const auto n{std::min<std::size_t>(packets.size(), 64)};
-  std::array<uint32_t, 64> dst_ips{};
-  std::array<uint64_t, 64> next_hops{};
-  for (std::size_t i{0}; i < n; ++i) {
-    dst_ips[i] = packets[i].destination_ip_be;  // already network byte order
-  }
-  rte_fib_lookup_bulk(fib_ctx_, dst_ips.data(), next_hops.data(), static_cast<int>(n));
-  for (std::size_t i{0}; i < n; ++i) {
-    if (next_hops[i] == kFibDefaultNh) continue;  // FIB miss
-    const auto group_idx{static_cast<uint32_t>((next_hops[i] >> 32) - 1)};
-    const auto filter_idx{static_cast<uint32_t>((next_hops[i] & 0xFFFFFFFF) - 1)};
-    if (group_idx < groups_.size()) {
-      const auto& group{groups_[group_idx]};
-      if (filter_idx < group.filters.size() &&
-          FilterMatchesPortProtocol(group.filters[filter_idx], packets[i])) {
-        results[i] = ClassificationResult{
-            .group_name = group.name,
-            .label = group.filters[filter_idx].label,
-            .group_precedence = group.precedence,
-            .bound_dpi_filter_index = group.bound_dpi_filter_index,
-            .action = group.action,
-            .matched = true,
-            .l7_required = group.l7_required,
-        };
-      }
-    }
-  }
+  // A FIB lookup has longest-prefix semantics, whereas SPI selection has
+  // explicit group precedence over the complete 5-tuple. A destination-only
+  // FIB hit therefore cannot safely be promoted to an ACL result: overlapping
+  // CIDRs can select a lower-priority group, and source/port constraints are
+  // not represented by the FIB key. Keep the API as a future candidate-set
+  // hook, but let rte_acl_classify remain the authoritative positive matcher.
+  (void)packets;
+  (void)results;
 }
 
 void RuleTable::MemberFilterBulk(std::span<const PacketMetadata> packets,
@@ -594,10 +639,15 @@ std::expected<void, std::string> RuleTable::RebuildInPlace(
   struct rte_acl_config acl_cfg{};
   acl_cfg.num_categories = 1;
   acl_cfg.num_fields = kAclNumFields;
+  acl_cfg.max_size = acl_build_max_size_;
   std::memcpy(acl_cfg.defs, kAclFieldDefs.data(), sizeof(rte_acl_field_def) * kAclNumFields);
 
   if (const int build_ret{rte_acl_build(acl_ctx_, &acl_cfg)}; build_ret != 0) {
     return std::unexpected(std::format("rte_acl_build failed during rebuild: {}", -build_ret));
+  }
+  if (auto classifier_result{ApplyAclClassifyAlgorithm(acl_ctx_, acl_classify_algorithm_)};
+      !classifier_result) {
+    return std::unexpected(classifier_result.error());
   }
 
   groups_ = std::move(new_groups);
@@ -615,11 +665,31 @@ std::expected<RuleTable, std::string> CompileRuleTable(
   const std::size_t total_groups{config.filter_groups.size()};
   std::vector<CompiledFilterGroup> groups(total_groups);
 
-  const std::size_t sys_cpus{std::max<std::size_t>(1, std::thread::hardware_concurrency())};
+  const auto compilation_cpu_set{BuildCompilationCpuSet()};
+  const auto available_compile_cpus{
+      std::max<std::size_t>(1, static_cast<std::size_t>(CPU_COUNT(&compilation_cpu_set)))};
   const std::size_t parse_threads{
-      std::clamp<std::size_t>(config.max_compilation_threads, 1, sys_cpus)};
+      std::clamp<std::size_t>(config.max_compilation_threads, 1,
+                              available_compile_cpus)};
+  const std::size_t acl_build_threads{
+      std::clamp<std::size_t>(config.max_acl_build_threads, 1,
+                              available_compile_cpus)};
+  const auto acl_classify_algorithm_result{ParseAclClassifyAlgorithm(config.acl_classify_algorithm)};
+  if (!acl_classify_algorithm_result) {
+    return std::unexpected(acl_classify_algorithm_result.error());
+  }
+  const auto acl_classify_algorithm{*acl_classify_algorithm_result};
+  constexpr std::size_t kBytesPerMiB{1024U * 1024U};
+  if (config.acl_build_max_size_mb > std::numeric_limits<std::size_t>::max() / kBytesPerMiB) {
+    return std::unexpected("spi.acl_build_max_size_mb is too large");
+  }
+  const std::size_t acl_build_max_size{config.acl_build_max_size_mb * kBytesPerMiB};
 
   auto parse_group_range_fn = [&](std::size_t start_g, std::size_t end_g) -> std::expected<void, std::string> {
+    if (auto affinity_result{SetCompilationThreadAffinity(compilation_cpu_set)};
+        !affinity_result) {
+      return std::unexpected(affinity_result.error());
+    }
     for (std::size_t group_index = start_g; group_index < end_g; ++group_index) {
       const auto& group_config = config.filter_groups[group_index];
       CompiledFilterGroup group;
@@ -644,16 +714,50 @@ std::expected<RuleTable, std::string> CompileRuleTable(
     return {};
   };
 
-  const std::size_t groups_per_thread = (total_groups + parse_threads - 1) / parse_threads;
-  std::vector<std::future<std::expected<void, std::string>>> parse_futures;
-  parse_futures.reserve(parse_threads);
+  // Partition by cumulative rule count rather than group count. Large rule
+  // stores commonly have a few groups with most of the filters; equal group
+  // counts would leave parsing workers badly imbalanced.
+  const std::size_t parse_worker_count{std::min(parse_threads, total_groups)};
+  std::vector<std::pair<std::size_t, std::size_t>> parse_ranges;
+  parse_ranges.reserve(parse_worker_count);
+  std::vector<std::size_t> group_rule_counts(total_groups);
+  std::size_t total_rule_count_for_parse{0};
+  for (std::size_t group_index{0}; group_index < total_groups; ++group_index) {
+    group_rule_counts[group_index] = config.filter_groups[group_index].filters.size();
+    total_rule_count_for_parse += group_rule_counts[group_index];
+  }
 
-  for (std::size_t t = 0; t < parse_threads; ++t) {
-    const std::size_t start_g = t * groups_per_thread;
-    const std::size_t end_g = std::min(total_groups, start_g + groups_per_thread);
-    if (start_g < end_g) {
-      parse_futures.push_back(std::async(std::launch::async, parse_group_range_fn, start_g, end_g));
+  std::size_t next_group{0};
+  std::size_t remaining_rules{total_rule_count_for_parse};
+  for (std::size_t worker{0}; worker < parse_worker_count; ++worker) {
+    const std::size_t remaining_workers{parse_worker_count - worker};
+    const std::size_t max_end{total_groups - (remaining_workers - 1U)};
+    const std::size_t target_rules{
+        (remaining_rules + remaining_workers - 1U) / remaining_workers};
+    const std::size_t start_group{next_group};
+    std::size_t assigned_rules{0};
+    while (next_group < max_end &&
+           (assigned_rules == 0 || assigned_rules + group_rule_counts[next_group] <= target_rules)) {
+      assigned_rules += group_rule_counts[next_group];
+      ++next_group;
     }
+    if (next_group == start_group) {
+      assigned_rules += group_rule_counts[next_group];
+      ++next_group;
+    }
+    parse_ranges.emplace_back(start_group, next_group);
+    remaining_rules -= assigned_rules;
+  }
+
+  std::vector<std::future<std::expected<void, std::string>>> parse_futures;
+  parse_futures.reserve(parse_ranges.size());
+
+  std::println("[SPI] Parsing {} filter groups across {} threads on {} CPUs...",
+               total_groups, parse_ranges.size(),
+               available_compile_cpus);
+
+  for (const auto [start_group, end_group] : parse_ranges) {
+    parse_futures.push_back(std::async(std::launch::async, parse_group_range_fn, start_group, end_group));
   }
 
   for (auto& fut : parse_futures) {
@@ -704,10 +808,18 @@ std::expected<RuleTable, std::string> CompileRuleTable(
     }
   }
 
-  const std::size_t num_threads{parse_threads};
-  std::println("[SPI] Compiling {} ACL chunks (256 groups/chunk) in parallel across {} CPU cores...", task_specs.size(), num_threads);
+  const auto concurrent_compiles{
+      std::min(acl_build_threads, task_specs.size())};
+  std::println(
+      "[SPI] Compiling {} ACL chunks (256 groups/chunk) with up to {} "
+      "concurrent builds on {} CPUs...",
+      task_specs.size(), concurrent_compiles, available_compile_cpus);
 
   auto compile_chunk_fn = [&](const ChunkTaskSpec spec) -> std::expected<AclChunk, std::string> {
+    if (auto affinity_result{SetCompilationThreadAffinity(compilation_cpu_set)};
+        !affinity_result) {
+      return std::unexpected(affinity_result.error());
+    }
     const std::size_t start_idx{spec.start_group_index};
     const std::size_t chunk_count{spec.chunk_count};
 
@@ -749,11 +861,18 @@ std::expected<RuleTable, std::string> CompileRuleTable(
     struct rte_acl_config acl_cfg{};
     acl_cfg.num_categories = 1;
     acl_cfg.num_fields = kAclNumFields;
+    acl_cfg.max_size = acl_build_max_size;
     std::memcpy(acl_cfg.defs, kAclFieldDefs.data(), sizeof(rte_acl_field_def) * kAclNumFields);
 
     if (const int build_ret{rte_acl_build(chunk_ctx, &acl_cfg)}; build_ret != 0) {
       rte_acl_free(chunk_ctx);
       return std::unexpected(std::format("rte_acl_build failed for chunk {}: {}", spec.chunk_id, -build_ret));
+    }
+    if (auto classifier_result{ApplyAclClassifyAlgorithm(chunk_ctx, acl_classify_algorithm)};
+        !classifier_result) {
+      rte_acl_free(chunk_ctx);
+      return std::unexpected(std::format("ACL classifier setup failed for chunk {}: {}",
+                                         spec.chunk_id, classifier_result.error()));
     }
 
     return AclChunk{.ctx = chunk_ctx, .start_group_index = start_idx, .group_count = chunk_count};
@@ -762,10 +881,12 @@ std::expected<RuleTable, std::string> CompileRuleTable(
   std::vector<AclChunk> acl_chunks;
   acl_chunks.reserve(task_specs.size());
 
-  // Compile chunks in batches capped by max_compilation_threads and available CPU cores
-  const std::size_t kMaxConcurrentCompiles{parse_threads};
-  for (std::size_t i = 0; i < task_specs.size(); i += kMaxConcurrentCompiles) {
-    const std::size_t batch_count = std::min<std::size_t>(kMaxConcurrentCompiles, task_specs.size() - i);
+  // rte_acl_build needs a large temporary trie per context. Keep its
+  // concurrency independently bounded so parsing can use many CPUs without
+  // multiplying peak build memory by the same factor.
+  for (std::size_t i = 0; i < task_specs.size(); i += acl_build_threads) {
+    const std::size_t batch_count{
+        std::min<std::size_t>(acl_build_threads, task_specs.size() - i)};
     std::vector<std::future<std::expected<AclChunk, std::string>>> futures;
     futures.reserve(batch_count);
 
@@ -892,7 +1013,8 @@ std::expected<RuleTable, std::string> CompileRuleTable(
     }
   }
 
-  return RuleTable{std::move(groups), std::move(acl_chunks), std::move(precedence_order), fib_ctx, member_ctx};
+  return RuleTable{std::move(groups), std::move(acl_chunks), std::move(precedence_order), fib_ctx, member_ctx,
+                   acl_build_max_size, acl_classify_algorithm};
 }
 
 std::expected<void, std::string> RuleTable::ResolveDpiLinks(

@@ -8,4 +8,6 @@ target_link_libraries(${FASTAPI_DPI_TARGET}
         PUBLIC
         fastapi_common
         ${FASTAPI_CONFIG_ALIAS}
-        PkgConfig::DPDK)
+        PkgConfig::DPDK
+        PkgConfig::HYPERSCAN)
+

@@ -130,7 +130,37 @@ list(REMOVE_ITEM FASTAPI_DPDK_INCLUDE_DIRS "/usr/include/x86_64-linux-gnu")
 list(APPEND FASTAPI_DPDK_INCLUDE_DIRS "/usr/include/x86_64-linux-gnu/bsd")
 set_target_properties(PkgConfig::DPDK PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${FASTAPI_DPDK_INCLUDE_DIRS}")
+
+pkg_check_modules(HYPERSCAN IMPORTED_TARGET libhs)
+if(NOT HYPERSCAN_FOUND)
+    pkg_check_modules(HYPERSCAN IMPORTED_TARGET hyperscan)
+endif()
+if(NOT HYPERSCAN_FOUND)
+    find_path(HYPERSCAN_INCLUDE_DIR hs/hs.h PATHS "${CMAKE_SOURCE_DIR}/.pixi/envs/default/include" "/usr/include")
+    find_library(HYPERSCAN_LIBRARY NAMES hs vectorscan PATHS "${CMAKE_SOURCE_DIR}/.pixi/envs/default/lib" "/usr/lib" "/usr/lib64" "/usr/lib/x86_64-linux-gnu")
+    if(HYPERSCAN_INCLUDE_DIR AND HYPERSCAN_LIBRARY)
+        add_library(PkgConfig::HYPERSCAN UNKNOWN IMPORTED)
+        set_target_properties(PkgConfig::HYPERSCAN PROPERTIES
+            IMPORTED_LOCATION "${HYPERSCAN_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${HYPERSCAN_INCLUDE_DIR}")
+        set(HYPERSCAN_FOUND TRUE)
+    endif()
+endif()
+
 include(FetchContent)
+
+if(NOT HYPERSCAN_FOUND)
+    message(STATUS "Hyperscan/Vectorscan not found in system or pixi. Fetching vectorscan via FetchContent...")
+    FetchContent_Declare(
+        vectorscan
+        GIT_REPOSITORY https://github.com/VectorCamp/vectorscan.git
+        GIT_TAG vectorscan/5.4.11
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(vectorscan)
+    add_library(PkgConfig::HYPERSCAN ALIAS hs)
+endif()
+
 
 FetchContent_Declare(
         glaze

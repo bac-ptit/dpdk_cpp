@@ -1,0 +1,75 @@
+eal:
+  cpu_core_list: '0-1'
+  memory_channels: 1
+  memory_size: '256'
+  disable_hugepages: true
+  disable_pci: true
+  process_type: primary
+  file_prefix: fragment_delay_test
+  log_level: '7'
+  virtual_devices:
+    - net_af_packet0,iface=frag_dpdk,qpairs=1,qdisc_bypass=1,framecnt=1024
+
+app:
+  burst_size: 32
+  mac_updating: false
+  timer_period_sec: 1
+
+mempool:
+  name: fragment_delay_pool
+  memory_buffer_count: 8192
+  memory_buffer_size: 2176
+  cache_size: 256
+
+port:
+  port_bitmask: '0x1'
+  promiscuous: true
+  receive_queues: 1
+  transmit_queues: 1
+  receive_descriptors: 1024
+  transmit_descriptors: 1024
+  link_speed: 0
+  link_check_interval_ms: 100
+  link_check_max_count: 30
+
+l3_forward:
+  enabled: false
+
+pcap_injector:
+  enabled: false
+
+spi:
+  worker_count: 1
+  packet_distribution: queue
+  dispatch_queue_size: 8192
+  drop_unmatched: true
+  flow_ttl_sec: 300
+  fragment_timeout_sec: 2
+  tcp_reassembly:
+    enabled: true
+    idle_timeout_sec: 60
+    max_concurrent_streams: 1024
+    max_buffered_bytes_per_direction: 16384
+    max_out_of_order_segments: 32
+    memory_budget_mb: 32
+    drop_conflicting_overlap: true
+  max_concurrent_flows: 1024
+  flow_overflow_action: reclassify
+  max_compilation_threads: 1
+  max_acl_build_threads: 1
+  acl_classify_algorithm: default
+  filter_groups:
+    - name: fragment_reassembly_test
+      precedence: 100
+      action: forward
+      filters:
+        - source_ip_address: 192.0.2.1
+          destination_ip_address: 198.51.100.2
+          source_port: 12345
+          destination_port: 8080
+          protocol: tcp
+          label: delayed_tcp_fragment
+
+dpi:
+  enabled: false
+  filters: []

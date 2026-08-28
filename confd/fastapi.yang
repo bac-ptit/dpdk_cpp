@@ -160,6 +160,63 @@ module fastapi {
         default 300;
         description "Flow table entry TTL in seconds.";
       }
+      leaf max_concurrent_flows {
+        type uint32 {
+          range "1..max";
+        }
+        default 1000000;
+        description "Maximum pre-allocated flow-cache entries.";
+      }
+      leaf flow_overflow_action {
+        type string {
+          pattern "drop|reclassify";
+        }
+        default "drop";
+        description "Action when the flow cache is full.";
+      }
+      leaf fragment_timeout_sec {
+        type uint32 {
+          range "1..max";
+        }
+        default 60;
+        description "Maximum lifetime of an incomplete IPv4 or IPv6 fragment set.";
+      }
+      leaf max_compilation_threads {
+        type uint16 {
+          range "1..max";
+        }
+        default 2;
+        description "Maximum threads used to parse SPI rules.";
+      }
+      leaf max_acl_build_threads {
+        type uint16 {
+          range "1..max";
+        }
+        default 2;
+        description "Maximum concurrent rte_acl_build operations.";
+      }
+      leaf acl_classify_algorithm {
+        type string {
+          pattern "default|scalar|sse|avx2|neon|altivec|avx512x16|avx512x32";
+        }
+        default "default";
+        description "DPDK rte_acl classifier implementation.";
+      }
+      leaf acl_build_max_size_mb {
+        type uint32;
+        default 0;
+        description "Per-context runtime ACL-trie memory limit; zero uses DPDK default.";
+      }
+      container tcp_reassembly {
+        description "Bounded TCP byte-stream reassembly for L7 inspection.";
+        leaf enabled { type boolean; default false; }
+        leaf idle_timeout_sec { type uint32 { range "1..max"; } default 60; }
+        leaf max_concurrent_streams { type uint32 { range "1..max"; } default 16384; }
+        leaf max_buffered_bytes_per_direction { type uint32 { range "1..max"; } default 16384; }
+        leaf max_out_of_order_segments { type uint16 { range "1..max"; } default 32; }
+        leaf memory_budget_mb { type uint32 { range "1..max"; } default 256; }
+        leaf drop_conflicting_overlap { type boolean; default true; }
+      }
       list filter-groups {
         key "name";
         description "Hierarchical filter groups sorted by precedence.";
@@ -178,8 +235,24 @@ module fastapi {
           }
           default "forward";
         }
+        leaf l7_required {
+          type boolean;
+          default false;
+          description "Run L7 DPI after this SPI group matches.";
+        }
+        leaf dpi_filter_group {
+          type string;
+          default "";
+          description "Optional statically linked DPI filter group.";
+        }
         list filters {
+          key "id";
           description "Individual filter rules within the group.";
+          leaf id {
+            type uint32;
+            mandatory true;
+            description "Stable management-plane identity; not part of packet matching.";
+          }
           leaf protocol {
             type string {
               pattern "tcp|udp";
@@ -188,7 +261,7 @@ module fastapi {
           }
           leaf source_ip_address {
             type string;
-            description "Source IP or CIDR (e.g. 10.0.0.0/8).";
+            description "Exact source IPv4 address.";
           }
           leaf destination_ip_address {
             type string;

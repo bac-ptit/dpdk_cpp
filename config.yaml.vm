@@ -154,6 +154,18 @@ spi:
   dispatch_queue_size: 65536
   # When true, any packet that does not match any rule is silently dropped.
   drop_unmatched: false
+  # Maximum time to retain an incomplete IPv4 or IPv6 fragment set.
+  fragment_timeout_sec: 60
+  # Reassemble a bounded TCP byte stream for L7 inspection. Disabled keeps
+  # the packet-per-packet fast path.
+  tcp_reassembly:
+    enabled: false
+    idle_timeout_sec: 60
+    max_concurrent_streams: 16384
+    max_buffered_bytes_per_direction: 16384
+    max_out_of_order_segments: 32
+    memory_budget_mb: 256
+    drop_conflicting_overlap: true
   filter_groups:
     # --- HTTP_REQUEST: VM1 -> VM2 on port 80 (precedence 100, highest) ---
     - name: fg_http_request

@@ -3,6 +3,7 @@ add_library(${FASTAPI_SPI_TARGET} STATIC
         spi_ip_address.cpp
         spi_packet_parser.cpp
         spi_pipeline.cpp
+        spi_tcp_reassembly.cpp
         spi_rule_engine.cpp)
 
 add_library(${FASTAPI_SPI_ALIAS} ALIAS ${FASTAPI_SPI_TARGET})

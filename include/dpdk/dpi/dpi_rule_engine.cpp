@@ -16,6 +16,22 @@ namespace dpdk::dpi {
 
 namespace {
 
+/// Escape regular expression metacharacters in a string literal.
+[[nodiscard]] std::string EscapeRegex(std::string_view str) noexcept {
+  std::string escaped;
+  escaped.reserve(str.size() * 2);
+  for (const char c : str) {
+    if (c == '.' || c == '\\' || c == '+' || c == '*' || c == '?' ||
+        c == '[' || c == '^' || c == ']' || c == '$' || c == '(' ||
+        c == ')' || c == '{' || c == '}' || c == '=' || c == '!' ||
+        c == '<' || c == '>' || c == '|' || c == ':') {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(c);
+  }
+  return escaped;
+}
+
 /// Compute the "domain key" for suffix-match lookup: the last two
 /// dot-separated components of `hostname`. For example
 /// "static.xx.fbcdn.net" -> "fbcdn.net". Returns a view into the input.
@@ -46,10 +62,33 @@ namespace {
   return {};
 }
 
+/// Context passed to the Hyperscan match callback.
+struct HsMatchContext {
+  uint32_t matched_filter_idx{std::numeric_limits<uint32_t>::max()};
+  uint32_t best_priority{std::numeric_limits<uint32_t>::max()};
+  const std::vector<CompiledDpiFilter>* filters{nullptr};
+};
+
+/// Hyperscan match callback: selects the rule with the highest priority (lowest numerical value).
+static int OnHyperscanMatch(unsigned int id, unsigned long long /*from*/,
+                            unsigned long long /*to*/, unsigned int /*flags*/,
+                            void* ctx) noexcept {
+  auto* context = static_cast<HsMatchContext*>(ctx);
+  const auto filter_idx = static_cast<std::size_t>(id);
+  if (context != nullptr && context->filters != nullptr && filter_idx < context->filters->size()) {
+    const auto prio = (*context->filters)[filter_idx].priority;
+    if (prio < context->best_priority) {
+      context->best_priority = prio;
+      context->matched_filter_idx = static_cast<uint32_t>(filter_idx);
+    }
+  }
+  return 0;  // Continue matching to find the absolute highest priority match
+}
+
 }  // namespace
 
-DpiRuleTable::DpiRuleTable(std::vector<CompiledDpiFilter> filters) noexcept
-    : filters_{std::move(filters)} {
+DpiRuleTable::DpiRuleTable(std::vector<CompiledDpiFilter> filters, hs_database_t* hs_db) noexcept
+    : filters_{std::move(filters)}, hs_db_{hs_db} {
   // Sort by priority ASC so the first match is the highest-priority match.
   std::ranges::sort(filters_,
                      [](const CompiledDpiFilter& lhs, const CompiledDpiFilter& rhs) {
@@ -81,7 +120,108 @@ DpiRuleTable::DpiRuleTable(std::vector<CompiledDpiFilter> filters) noexcept
                     });
 }
 
+DpiRuleTable::DpiRuleTable(DpiRuleTable&& other) noexcept
+    : filters_{std::move(other.filters_)},
+      exact_map_{std::move(other.exact_map_)},
+      suffix_map_{std::move(other.suffix_map_)},
+      exact_list_{std::move(other.exact_list_)},
+      suffix_list_{std::move(other.suffix_list_)},
+      catch_all_idx_{other.catch_all_idx_},
+      generation_{other.generation_},
+      hs_db_{std::exchange(other.hs_db_, nullptr)} {}
+
+DpiRuleTable& DpiRuleTable::operator=(DpiRuleTable&& other) noexcept {
+  if (this != &other) {
+    if (hs_db_ != nullptr) {
+      hs_free_database(hs_db_);
+    }
+    filters_ = std::move(other.filters_);
+    exact_map_ = std::move(other.exact_map_);
+    suffix_map_ = std::move(other.suffix_map_);
+    exact_list_ = std::move(other.exact_list_);
+    suffix_list_ = std::move(other.suffix_list_);
+    catch_all_idx_ = other.catch_all_idx_;
+    generation_ = other.generation_;
+    hs_db_ = std::exchange(other.hs_db_, nullptr);
+  }
+  return *this;
+}
+
+DpiRuleTable::~DpiRuleTable() noexcept {
+  if (hs_db_ != nullptr) {
+    hs_free_database(hs_db_);
+    hs_db_ = nullptr;
+  }
+}
+
+hs_scratch_t* DpiRuleTable::AllocScratch() const noexcept {
+  if (hs_db_ == nullptr) return nullptr;
+  hs_scratch_t* scratch{nullptr};
+  if (hs_alloc_scratch(hs_db_, &scratch) != HS_SUCCESS) {
+    return nullptr;
+  }
+  return scratch;
+}
+
+void DpiRuleTable::FreeScratch(hs_scratch_t* scratch) const noexcept {
+  if (scratch != nullptr) {
+    hs_free_scratch(scratch);
+  }
+}
+
+DpiResult DpiRuleTable::Match(std::string_view hostname, hs_scratch_t* scratch) const noexcept {
+  if (hostname.empty()) [[unlikely]] {
+    return {};
+  }
+
+  if (hs_db_ != nullptr && scratch != nullptr) [[likely]] {
+    HsMatchContext match_ctx{
+        .filters = &filters_,
+    };
+
+    const auto ret = hs_scan(
+        hs_db_,
+        hostname.data(),
+        static_cast<unsigned int>(hostname.size()),
+        0,
+        scratch,
+        OnHyperscanMatch,
+        &match_ctx);
+
+    if (ret == HS_SUCCESS && match_ctx.matched_filter_idx < filters_.size()) {
+      const auto& filter = filters_[match_ctx.matched_filter_idx];
+      return DpiResult{
+          .filter_group = filter.filter_group,
+          .label = filter.label,
+          .priority = filter.priority,
+          .matched = true,
+      };
+    }
+    return {};
+  }
+
+  return MatchFallback(hostname);
+}
+
 DpiResult DpiRuleTable::Match(std::string_view hostname) const noexcept {
+  if (hostname.empty()) [[unlikely]] {
+    return {};
+  }
+
+  if (hs_db_ != nullptr) [[likely]] {
+    static thread_local hs_scratch_t* tl_scratch{nullptr};
+    if (tl_scratch == nullptr) [[unlikely]] {
+      if (hs_alloc_scratch(hs_db_, &tl_scratch) != HS_SUCCESS) [[unlikely]] {
+        return MatchFallback(hostname);
+      }
+    }
+    return Match(hostname, tl_scratch);
+  }
+
+  return MatchFallback(hostname);
+}
+
+DpiResult DpiRuleTable::MatchFallback(std::string_view hostname) const noexcept {
   if (hostname.empty()) [[unlikely]] {
     return {};
   }
@@ -168,7 +308,6 @@ std::optional<std::uint32_t> DpiRuleTable::FindByFilterGroup(
   return std::nullopt;
 }
 
-// std::format is safe with -fno-exceptions; DpiConfig comes from dpi_rule_engine.hpp
 // NOLINTNEXTLINE(bugprone-exception-escape, misc-include-cleaner)
 std::expected<DpiRuleTable, std::string> CompileDpiRuleTable(const DpiConfig& config) noexcept {
   std::vector<CompiledDpiFilter> filters;
@@ -193,7 +332,70 @@ std::expected<DpiRuleTable, std::string> CompileDpiRuleTable(const DpiConfig& co
     filters.push_back(std::move(filter));
   }
 
-  return DpiRuleTable{std::move(filters)};
+  // Sort filters by priority ascending before compiling Hyperscan patterns
+  std::ranges::sort(filters,
+                     [](const CompiledDpiFilter& lhs, const CompiledDpiFilter& rhs) {
+                       return lhs.priority < rhs.priority;
+                    });
+
+  std::vector<const char*> hs_patterns;
+  std::vector<unsigned int> hs_flags;
+  std::vector<unsigned int> hs_ids;
+  std::vector<std::string> regex_strings;
+
+  hs_patterns.reserve(filters.size());
+  hs_flags.reserve(filters.size());
+  hs_ids.reserve(filters.size());
+  regex_strings.reserve(filters.size());
+
+  for (std::size_t i{0}; i < filters.size(); ++i) {
+    const auto& f = filters[i];
+    std::string_view raw_pattern{&f.hostname_pattern[0], f.hostname_pattern_length};
+    std::string regex;
+
+    if (f.is_catch_all) {
+      regex = ".*";
+    } else if (f.is_suffix_match) {
+      // "*.facebook.com" -> "(^|\.)facebook\.com$"
+      const auto domain = (raw_pattern.size() >= 2) ? raw_pattern.substr(2) : raw_pattern;
+      regex = std::format(R"((^|\.)({})$)", EscapeRegex(domain));
+    } else {
+      // Exact match e.g. "dns.google" -> "^dns\.google$"
+      regex = std::format(R"(^({})$)", EscapeRegex(raw_pattern));
+    }
+
+    regex_strings.push_back(std::move(regex));
+    hs_patterns.push_back(regex_strings.back().c_str());
+    hs_flags.push_back(HS_FLAG_CASELESS | HS_FLAG_DOTALL | HS_FLAG_ALLOWEMPTY);
+    hs_ids.push_back(static_cast<unsigned int>(i));
+  }
+
+  hs_database_t* hs_db{nullptr};
+  if (!hs_patterns.empty()) {
+    hs_compile_error_t* compile_err{nullptr};
+    const auto compile_res = hs_compile_multi(
+        hs_patterns.data(),
+        hs_flags.data(),
+        hs_ids.data(),
+        static_cast<unsigned int>(hs_patterns.size()),
+        HS_MODE_BLOCK,
+        nullptr,
+        &hs_db,
+        &compile_err);
+
+    if (compile_res != HS_SUCCESS) {
+      std::string err_msg = "Unknown Hyperscan compile error";
+      if (compile_err != nullptr) {
+        if (compile_err->message != nullptr) {
+          err_msg = compile_err->message;
+        }
+        hs_free_compile_error(compile_err);
+      }
+      return std::unexpected(std::format("Hyperscan compilation failed: {}", err_msg));
+    }
+  }
+
+  return DpiRuleTable{std::move(filters), hs_db};
 }
 
 }  // namespace dpdk::dpi

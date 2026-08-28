@@ -1,86 +1,73 @@
-# ConfD Integration for FastAPI DPDK
+# ConfD control plane
 
-NETCONF-based configuration management for the DPDK SPI/DPI packet processor.
+`fastapi_confd` is a standard ConfD **CDB subscription client**. It is not a
+packet-path callback and ConfD never calls into a DPDK worker.
 
-## Architecture
-
+```text
+OSS/NMS → NETCONF commit → ConfD CDB_RUNNING
+                              ↓
+                 fastapi_confd CDB subscription socket
+                              ↓
+                  read one running-config snapshot
+                              ↓
+             config.yaml.tmp → fsync → atomic rename
+                              ↓
+                       SIGUSR1 to FastAPI
+                              ↓
+                    main lcore reload workflow
 ```
-OSS/NMS → NETCONF → ConfD → CDB callback → Write YAML → kill -USR1
-                                                          ↓
-                                    Main lcore detects flag → LoadConfig() → CompileRuleTable() → Swap()
-```
 
-## Files
-
-| File | Description |
-|------|-------------|
-| `fastapi.yang` | YANG model mirroring `DpdkConfig` structure |
-| `fastapi_confd.c` | CDB callback daemon — reads CDB, writes YAML, signals FastAPI |
-| `Makefile` | Build script for the callback daemon |
-
-## Prerequisites
-
-1. **ConfD developer kit** — Download from Tail-f/ConfD (requires license)
-2. **pkg-config** — for finding ConfD headers/libraries
-
-## Build
+## Build and run
 
 ```bash
-# Set ConfD installation path
 export CONFD_DIR=/opt/confd
+make -C confd
 
-# Build the callback daemon
-make
-
-# Install to ConfD bin directory
-make install
+./confd/fastapi_confd \
+  --config /absolute/path/config.yaml \
+  --pid "$(pidof FastAPI)" \
+  --confd-ip 127.0.0.1 \
+  --confd-port 4565
 ```
 
-## Configuration
+The daemon subscribes to `/fastapi:fastapi/spi` and `/fastapi:fastapi/dpi`.
+After every completed commit it reads `CDB_RUNNING`, emits the full ACL-relevant
+SPI/DPI YAML snapshot, then signals the process. A failed read, write, `fsync`,
+or rename leaves the prior YAML unchanged. A signal failure leaves the active
+DPDK rules unchanged; the new on-disk snapshot remains available for a retry.
 
-### 1. Install YANG model
+`filters` has a management-only `id` key in YANG. It makes each NETCONF list
+entry addressable; the key is not emitted to YAML and does not participate in
+packet matching.
 
-```bash
-# Copy YANG model to ConfD init directory
-cp fastapi.yang $CONFD_DIR/etc/confd/init/
+## ACL workflow
 
-# Load into ConfD
-confd_cli -C -u admin -P admin <<EOF
-load-config fastapi.yang
-commit
-EOF
+```text
+SIGUSR1
+  → main lcore consumes reload flag
+  → LoadConfig + schema validation
+  → CompileRuleTable: YAML rules → rte_acl_rule[] → rte_acl_build()
+  → workers stop at a burst boundary
+  → publish the validated new rule-table generation
+  → resume workers
+
+RX → IPv4 fragment reassembly → flow cache → exact-5-tuple precheck
+   → member negative prefilter → rte_acl_classify(batch) → forward/drop
 ```
 
-### 2. Start the callback daemon
+The source-of-truth match is the five-tuple rule: protocol, source IPv4,
+destination IPv4/CIDR, source port, destination port. `precedence` is lower-is-
+higher and `drop_unmatched` determines the default action. Any optimisation
+such as FIB, member-set, or exact-tuple cache must verify the complete rule
+before it is allowed to return a match.
 
-```bash
-# Start with config path and optional FastAPI PID
-./fastapi_confd --config /path/to/config.yaml --pid $(pidof FastAPI)
-```
+The current FIB positive shortcut is deliberately disabled: FIB has
+destination longest-prefix semantics, which cannot preserve arbitrary ACL group
+precedence over the full five-tuple.
 
-### 3. Push configuration via NETCONF
+## Operational boundary
 
-```bash
-# From OSS/NMS, edit the configuration tree
-confd_cli -C -u admin -P admin <<EOF
-configure
-set fastapi spi filter-groups fg_dns precedence 104
-set fastapi spi filter-groups fg_dns action drop
-commit
-EOF
-```
-
-## How it Works
-
-1. **ConfD CDB** stores the running configuration as a YANG-modeled tree
-2. When configuration is committed, the CDB callback (`fastapi_confd`) is triggered
-3. The callback reads all CDB values and writes them to `config.yaml`
-4. It sends `SIGUSR1` to the FastAPI process
-5. FastAPI detects the signal, reloads the config, recompiles rules, and swaps atomically
-
-## Notes
-
-- ConfD does NOT touch the hot path — only the control plane
-- The callback daemon runs as a separate process
-- SPI filter groups and DPI filters are complex nested structures; the current implementation handles the top-level config and signals reload. For full nested config sync, extend `write_config_yaml()` with `cdb_get_num_instances()` iteration
-- The existing `SIGUSR1` reload mechanism in FastAPI handles the actual hot-swap
+This subscriber exports the configuration managed by the YANG model. Treat EAL,
+NIC, queue, mempool and virtual-device changes as restart-required; changing
+them in CDB does not reinitialize an already running DPDK EAL. SPI/DPI rule
+changes are the intended hot-reload scope.

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@
 #include "dpdk/spi/spi_flow_table.hpp"
 #include "dpdk/spi/spi_rule_engine.hpp"
 #include "dpdk/spi/spi_rule_table_manager.hpp"
+#include "dpdk/spi/spi_tcp_reassembly.hpp"
 
 struct rte_mbuf;
 struct rte_ring;
@@ -140,6 +142,8 @@ struct alignas(64) WorkerContext {
   const dpi::DpiRuleTableManager* dpi_rule_manager{};
   FlowTable* flow_table{};
   struct ::rte_ip_frag_tbl* ip_frag_tbl{nullptr};
+  /// Per-worker bounded TCP inspection streams. Null when disabled.
+  std::unique_ptr<TcpStreamReassembler> tcp_reassembler;
   const std::vector<L3RouteEntry>* l3_routes{};
   const std::vector<EthernetDestinationEntry>* ethernet_destinations{};
   AtomicCounters* counters{};
@@ -152,6 +156,9 @@ struct alignas(64) WorkerContext {
   std::uint32_t bursts_since_flush{};
   std::vector<std::uint64_t> rule_match_counts;
   rte_ring* dispatch_ring{};
+  /// Non-empty only in flow_hash mode. Reassembled IP packets are handed to
+  /// the canonical 5-tuple worker before TCP/DPI processing.
+  std::span<rte_ring*> flow_hash_rings{};
   /// Force-quit flag polled by the worker loop. `std::atomic<int>` so
   /// the cross-lcore access (main lcore writes, worker reads) is
   /// well-defined per the C++ memory model. In multi-worker mode this
@@ -194,6 +201,12 @@ struct alignas(64) WorkerContext {
   /// same cache line as `dpi_hostname_cache` (aligned 64 B) to keep it
   /// out of the hot-fields cacheline.
   std::uint64_t current_burst_tsc{};
+  /// IPv4/IPv6 fragment timeout converted to TSC cycles for table creation/shutdown.
+  std::uint64_t fragment_timeout_cycles{};
+  /// Sweep cadence for expired fragment entries (normally one second).
+  std::uint64_t fragment_cleanup_interval_cycles{};
+  /// Last periodic sweep of expired fragment entries.
+  std::uint64_t last_fragment_cleanup_tsc{};
 };
 
 /**
@@ -255,6 +268,16 @@ class Pipeline final {
   /// Access to the DPI rule table manager (used by MaybeReload to swap).
   [[nodiscard]] dpi::DpiRuleTableManager& GetDpiRuleTableManager() noexcept { return dpi_rule_manager_; }
   [[nodiscard]] const dpi::DpiRuleTableManager& GetDpiRuleTableManager() const noexcept { return dpi_rule_manager_; }
+
+  /// Current active flow count across the pipeline.
+  [[nodiscard]] std::size_t ActiveFlowCount() const noexcept {
+    return flow_table_ ? flow_table_->Count() : 0;
+  }
+
+  /// Total capacity of the flow table.
+  [[nodiscard]] std::size_t FlowTableCapacity() const noexcept {
+    return flow_table_ ? flow_table_->Capacity() : 0;
+  }
 
  private:
   using WorkerEntryPoint = int (*)(void*);
@@ -363,6 +386,8 @@ class Pipeline final {
   bool l3_forwarding_{false};
   bool drop_unmatched_{false};
   std::uint32_t flow_ttl_sec_{300};
+  std::uint32_t fragment_timeout_sec_{60};
+  TcpReassemblyConfig tcp_reassembly_config_;
   /// Hard ceiling on concurrent flow cache entries. Sized once at startup;
   /// the rte_hash table never grows past this.
   std::uint32_t max_concurrent_flows_{1'000'000};

@@ -507,6 +507,15 @@ class FlowTable final {
     return overflow_count_.load(std::memory_order_relaxed) >= eviction_threshold_;
   }
 
+  /// Current number of active entries stored in the FlowTable.
+  [[nodiscard]] std::size_t Count() const noexcept {
+    if (hash_ == nullptr) {
+      return 0;
+    }
+    const auto count = rte_hash_count(hash_);
+    return count >= 0 ? static_cast<std::size_t>(count) : 0;
+  }
+
  private:
   rte_hash* hash_{nullptr};
   /// Per-entry storage: one FlowData per cache slot, allocated once at

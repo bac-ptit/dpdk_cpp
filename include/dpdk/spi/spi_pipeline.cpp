@@ -7,6 +7,7 @@
 #include <rte_ether.h>
 #include <rte_gro.h>
 #include <rte_ip.h>
+#include <rte_ip6.h>
 #include <rte_ip_frag.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
@@ -65,6 +66,10 @@ constexpr std::size_t kPortMacByteIndex{5};
 constexpr std::uint8_t kLocalAdminMacPrefix{0x02};
 constexpr std::uint16_t kTlsPort{443};
 constexpr std::uint16_t kHttpPort{80};
+constexpr std::uint16_t kPacketWaitingForFragments{
+    std::numeric_limits<std::uint16_t>::max() - 1U};
+constexpr std::uint16_t kPacketUnmapped{
+    std::numeric_limits<std::uint16_t>::max()};
 
 /// Per-burst counters accumulated in a single worker iteration.
 // BurstCounters is defined in spi_pipeline.hpp so WorkerContext can hold one.
@@ -81,6 +86,7 @@ struct PacketClassification {
   Action action{Action::kForward};
   bool parsed{false};
   bool matched{false};
+  bool redispatch{false};
 };
 
 /// Convert one hexadecimal character to its numeric value.
@@ -108,7 +114,6 @@ struct PacketClassification {
 [[nodiscard]] std::uint32_t HashPacketFlow(const rte_mbuf& packet, std::uint16_t receive_port) noexcept {
   constexpr std::uint32_t kFnvOffset{2166136261U};
   std::uint32_t hash{MixHash(kFnvOffset, receive_port)};
-  hash = MixHash(hash, rte_pktmbuf_pkt_len(&packet));
 
   const auto data_len{rte_pktmbuf_data_len(&packet)};
   if (data_len < sizeof(rte_ether_hdr)) [[unlikely]] {
@@ -118,6 +123,26 @@ struct PacketClassification {
   const auto* ether_hdr{rte_pktmbuf_mtod(&packet, const rte_ether_hdr*)};
   const auto ether_type{rte_be_to_cpu_16(ether_hdr->ether_type)};
   hash = MixHash(hash, ether_type);
+  if (ether_type == RTE_ETHER_TYPE_IPV6) {
+    if (data_len < sizeof(rte_ether_hdr) + sizeof(rte_ipv6_hdr)) {
+      return hash;
+    }
+    const auto* ipv6_hdr{rte_pktmbuf_mtod_offset(&packet, const rte_ipv6_hdr*, sizeof(rte_ether_hdr))};
+    hash = MixHash(hash, ipv6_hdr->proto);
+    for (const auto byte : ipv6_hdr->src_addr.a) {
+      hash = MixHash(hash, byte);
+    }
+    for (const auto byte : ipv6_hdr->dst_addr.a) {
+      hash = MixHash(hash, byte);
+    }
+    constexpr std::uint16_t fragment_offset{sizeof(rte_ether_hdr) + sizeof(rte_ipv6_hdr)};
+    if (ipv6_hdr->proto == IPPROTO_FRAGMENT &&
+        data_len >= fragment_offset + sizeof(rte_ipv6_fragment_ext)) {
+      const auto* fragment{rte_pktmbuf_mtod_offset(&packet, const rte_ipv6_fragment_ext*, fragment_offset)};
+      return MixHash(hash, rte_be_to_cpu_32(fragment->id));
+    }
+    return hash;
+  }
   if (ether_type != RTE_ETHER_TYPE_IPV4 || data_len < sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr)) {
     return hash;
   }
@@ -131,6 +156,9 @@ struct PacketClassification {
   hash = MixHash(hash, rte_be_to_cpu_32(ipv4_hdr->src_addr));
   hash = MixHash(hash, rte_be_to_cpu_32(ipv4_hdr->dst_addr));
   hash = MixHash(hash, ipv4_hdr->next_proto_id);
+  if (rte_ipv4_frag_pkt_is_fragmented(ipv4_hdr) != 0) {
+    return MixHash(hash, rte_be_to_cpu_16(ipv4_hdr->packet_id));
+  }
 
   const auto l4_offset{static_cast<std::uint16_t>(sizeof(rte_ether_hdr) + ipv4_header_len)};
   if (data_len < l4_offset + sizeof(rte_udp_hdr)) {
@@ -459,8 +487,9 @@ void AddBurstCounters(BurstCounters& accumulator, const BurstCounters& burst) no
  * @param timer_tsc         Accumulated ticks (updated in place).
  * @param start_tsc
  */
-void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_sec, std::uint64_t stats_period_tsc,
-                     std::uint64_t& previous_tsc, std::uint64_t& timer_tsc, std::uint64_t start_tsc) noexcept {
+void MaybePrintStats(const AtomicCounters& counters, const FlowTable* flow_table, std::uint32_t timer_period_sec,
+                     std::uint64_t stats_period_tsc, std::uint64_t& previous_tsc, std::uint64_t& timer_tsc,
+                     std::uint64_t start_tsc) noexcept {
   if (timer_period_sec == 0) {
     return;
   }
@@ -474,6 +503,9 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
     const auto stats{CollectStats(counters)};
     const auto elapsed_sec{static_cast<double>(current_tsc - start_tsc) / static_cast<double>(rte_get_tsc_hz())};
     const auto mpps{static_cast<double>(stats.received) / elapsed_sec / 1e6};
+    const auto active_flows{flow_table ? flow_table->Count() : 0};
+    const auto flow_capacity{flow_table ? flow_table->Capacity() : 1};
+    const auto flow_occupancy_pct{static_cast<double>(active_flows) * 100.0 / static_cast<double>(flow_capacity)};
     // Print to std::cerr (unbuffered by default, separate stream from workers'
     // stdout) so a stdout-mutex contention or pipe-buffer stall on the main
     // lcore can never appear as the dispatcher "hanging". std::cerr MUST come
@@ -482,12 +514,12 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
     // treat it as a format arg (no std::formatter<ostream> exists → build fail).
     std::println(
         std::cerr,
-        "SPI stats: received={} matched={} flow_table_full={} pressure_evictions={} "
+        "SPI stats: received={} matched={} active_flows={}/{} ({:.1f}%) flow_table_full={} pressure_evictions={} "
         "flow_table_resizes={} dpi_skipped_by_spi={} dpi_skipped_by_link={} "
         "elapsed={:.1f}s Mpps={:.2f}",
-        stats.received, stats.matched, stats.flow_table_full, stats.pressure_evictions,
-        stats.flow_table_resizes, stats.dpi_skipped_by_spi, stats.dpi_skipped_by_link,
-        elapsed_sec, mpps);
+        stats.received, stats.matched, active_flows, flow_capacity, flow_occupancy_pct,
+        stats.flow_table_full, stats.pressure_evictions, stats.flow_table_resizes,
+        stats.dpi_skipped_by_spi, stats.dpi_skipped_by_link, elapsed_sec, mpps);
     timer_tsc = 0;
   }
 }
@@ -581,28 +613,23 @@ void MaybePrintStats(const AtomicCounters& counters, std::uint32_t timer_period_
     return;
   }
 
-  const auto* active{rule_manager_.Load()};
-  if (active == nullptr) {
+  if (rule_manager_.Load() == nullptr) {
     std::println(stderr, "Reload failed: no active RuleTable");
     reload_barrier.store(false, std::memory_order_release);
     return;
   }
 
-  auto new_groups{std::move(*new_rules).MoveGroupsOut()};
-  auto new_precedence{std::move(*new_rules).MovePrecedenceOrderOut()};
-  if (const auto rebuild{const_cast<RuleTable*>(active)->RebuildInPlace(
-          std::move(new_groups), std::move(new_precedence))};
-      !rebuild) {
-    std::println(stderr, "Reload failed: {}", rebuild.error());
-    reload_barrier.store(false, std::memory_order_release);
-    return;
-  }
-
+  // `new_rules` owns independently built ACL chunks. Publish that immutable
+  // table instead of rebuilding the context workers had been reading. This
+  // keeps multi-chunk reload correct and avoids an rte_acl mutation race.
+  const auto new_group_count{new_rules->GroupCount()};
+  const auto new_filter_count{new_rules->FilterCount()};
+  rule_manager_.Swap(std::make_unique<RuleTable>(std::move(*new_rules)));
   dpi_rule_manager_.Swap(std::move(new_dpi_rules));
   MaybeReloadFlowTable(*config);
 
-  std::println("Rules reloaded: {} groups, {} filters (in-place)",
-               active->GroupCount(), active->FilterCount());
+  std::println("Rules reloaded: {} groups, {} filters (atomic table swap)",
+               new_group_count, new_filter_count);
   reload_barrier.store(false, std::memory_order_release);
 }
 
@@ -852,7 +879,8 @@ struct DpiMatch {
 // matching the mentor's "spi -> link tới dpi" requirement.
 [[gnu::hot, gnu::always_inline]] inline void TryDpiClassify(
     WorkerContext& context, BurstCounters& counters, const rte_mbuf& packet, PacketMetadata& metadata,
-    const ClassificationResult& spi_match, const FlowKey& key, Action& action, bool& matched) noexcept;
+    const ClassificationResult& spi_match, const FlowKey& key, Action& action, bool& matched,
+    bool& defer_spi_cache) noexcept;
 
 /**
  * @brief Parse and classify a single packet, updating counters.
@@ -862,8 +890,19 @@ struct DpiMatch {
  * @return Parsed metadata plus whether a SPI rule matched.
  */
 [[nodiscard, gnu::hot]] PacketClassification ClassifyPacket(WorkerContext& context, BurstCounters& counters,
-                                                            const rte_mbuf& packet) noexcept {
-  if (auto parsed{ParsePacket(packet, context.ip_frag_tbl, context.current_burst_tsc)}) {
+                                                            rte_mbuf*& packet,
+                                                            std::uint16_t receive_port) noexcept {
+  PacketParseStatus parse_status{PacketParseStatus::kMalformed};
+  bool was_reassembled{false};
+  if (auto parsed{ParsePacketOwned(packet, context.ip_frag_tbl, context.current_burst_tsc,
+                                   &parse_status, &was_reassembled)}) {
+    if (was_reassembled && !context.flow_hash_rings.empty()) {
+      const auto target_worker{HashPacketFlow(*packet, receive_port) % context.flow_hash_rings.size()};
+      if (target_worker != context.worker_id) {
+        return {.metadata = *parsed, .action = Action::kForward, .parsed = true,
+                .matched = false, .redispatch = true};
+      }
+    }
     ++counters.parsed;
     auto metadata{*parsed};
 
@@ -960,13 +999,19 @@ struct DpiMatch {
     //      and propagate the action via the out-params.
     Action action{Action::kForward};
     bool matched{false};
-    TryDpiClassify(context, counters, packet, metadata, spi_match, key, action, matched);
+    bool defer_spi_cache{false};
+    TryDpiClassify(context, counters, *packet, metadata, spi_match, key, action, matched,
+                   defer_spi_cache);
     if (matched) {
       return {.metadata = metadata, .action = action, .parsed = true, .matched = true};
     }
 
     // Plain SPI match (no DPI on this packet — or DPI found nothing).
     if (spi_match.matched) {
+      if (defer_spi_cache) {
+        ++counters.matched;
+        return {.metadata = metadata, .action = spi_match.action, .parsed = true, .matched = true};
+      }
       return MakeMatched(metadata, spi_match.action, key, context, counters);
     }
 
@@ -974,6 +1019,9 @@ struct DpiMatch {
     return {.metadata = metadata, .action = Action::kForward, .parsed = true, .matched = false};
   }
 
+  if (parse_status == PacketParseStatus::kWaitingForFragments) {
+    return {.metadata = {}, .action = Action::kForward, .parsed = false, .matched = true};
+  }
   ++counters.malformed;
   return {.metadata = {}, .action = Action::kForward, .parsed = false, .matched = false};
 }
@@ -1048,10 +1096,21 @@ struct DpiMatch {
  * @param transmit_counts   Per-port TX counts.
  */
 [[gnu::hot]] void ForwardPacket(WorkerContext& context, const std::vector<std::uint16_t>& active_ports,
-                                BurstCounters& counters, rte_mbuf* packet, std::uint16_t receive_port,
+                                BurstCounters& counters, rte_mbuf*& packet, std::uint16_t receive_port,
                                 std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
                                 std::vector<std::uint16_t>& transmit_counts) noexcept {
-  const auto classification{ClassifyPacket(context, counters, *packet)};
+  const auto classification{ClassifyPacket(context, counters, packet, receive_port)};
+  if (packet == nullptr) [[unlikely]] {
+    return;  // The DPDK fragment table owns incomplete fragments.
+  }
+  if (classification.redispatch) [[unlikely]] {
+    packet->port = receive_port;
+    const auto target_worker{HashPacketFlow(*packet, receive_port) % context.flow_hash_rings.size()};
+    if (rte_ring_enqueue(context.flow_hash_rings[target_worker], packet) != 0) {
+      DropPacket(counters, packet);
+    }
+    return;
+  }
   // Drop by explicit SPI rule action.
   if (classification.matched && classification.action == Action::kDrop) [[unlikely]] {
     ++counters.dropped_by_rule;
@@ -1121,8 +1180,8 @@ struct DpiMatch {
  *
  * Three stages:
  *   A. Prefetch + parse every received packet; collect metadata + FlowKey.
- *      Drop malformed packets now and remember them via the `kUnmapped`
- *      sentinel in `packet_to_parsed`.
+ *      Drop malformed packets via `kPacketUnmapped`; incomplete fragments use
+ *      a separate sentinel and remain owned by the DPDK fragment table.
  *   B. Call `rte_hash_lookup_bulk` once per chunk (RTE_HASH_LOOKUP_BULK_MAX
  *      = 64 keys/call) on the contiguous keys[] array; `positions[]`
  *      holds the per-packet slot index (>= 0) or a negative value for
@@ -1151,7 +1210,8 @@ struct DpiMatch {
 /// NIST's CC < 10 guideline for hot paths.
 [[gnu::hot, gnu::always_inline]] inline void TryDpiClassify(
     WorkerContext& context, BurstCounters& counters, const rte_mbuf& packet, PacketMetadata& metadata,
-    const ClassificationResult& spi_match, const FlowKey& key, Action& action, bool& matched) noexcept {
+    const ClassificationResult& spi_match, const FlowKey& key, Action& action, bool& matched,
+    bool& defer_spi_cache) noexcept {
   const auto* const dpi_rules{context.dpi_rule_manager->Load()};
   if (dpi_rules == nullptr || !dpi_rules->IsEnabled()) [[likely]] {
     return;
@@ -1222,10 +1282,48 @@ struct DpiMatch {
     return;
   }
 
-  // ExtractHostname mutates metadata.hostname to point into the mbuf
-  // (zero-copy via rte_pktmbuf_read). Safe because the mbuf outlives
-  // the metadata reference (we still hold the packet in the burst).
-  ExtractHostname(packet, metadata);
+  if (context.tcp_reassembler != nullptr) {
+    constexpr std::size_t kMaxTcpInspectionPayload{65536U};
+    const auto payload_length{std::min<std::size_t>(metadata.tcp_payload_length,
+                                                    kMaxTcpInspectionPayload)};
+    std::array<unsigned char, kMaxTcpInspectionPayload> payload_copy{};
+    const void* payload_data{rte_pktmbuf_read(&packet, metadata.tcp_payload_offset,
+                                              payload_length, payload_copy.data())};
+    if (payload_data == nullptr) [[unlikely]] {
+      defer_spi_cache = true;
+      return;
+    }
+    const std::span<const unsigned char> payload{
+        static_cast<const unsigned char*>(payload_data), payload_length};
+    const auto stream{context.tcp_reassembler->Insert(metadata, payload,
+                                                       context.current_burst_tsc)};
+    if (stream.status == TcpReassemblyStatus::kConflictingOverlap ||
+        stream.status == TcpReassemblyStatus::kResourceLimit) [[unlikely]] {
+      ++counters.matched;
+      action = Action::kDrop;
+      matched = true;
+      return;
+    }
+    if (stream.status == TcpReassemblyStatus::kWaiting ||
+        stream.status == TcpReassemblyStatus::kReady) {
+      if (dst_port == kTlsPort) {
+        if (const auto sni{ExtractTlsSni(stream.contiguous_payload)}) {
+          metadata.hostname = sni->first;
+          metadata.hostname_length = sni->second;
+        }
+      } else if (const auto host{ExtractHttpHost(stream.contiguous_payload)}) {
+        metadata.hostname = host->first;
+        metadata.hostname_length = host->second;
+      }
+      if (metadata.hostname == nullptr) {
+        defer_spi_cache = true;
+        return;
+      }
+    }
+  } else {
+    // Legacy zero-copy inspection of one TCP segment.
+    ExtractHostname(packet, metadata);
+  }
   if (auto dpi{MatchDpi(context, counters, metadata)}) {
     const auto final_action{spi_match.matched ? spi_match.action : Action::kForward};
     if (context.flow_table->Insert(key, /*match_count=*/1, final_action) != FlowInsertResult::kOk) [[unlikely]] {
@@ -1257,8 +1355,8 @@ struct DpiMatch {
 [[nodiscard]] std::uint32_t ParseReceivedPackets(
     std::span<rte_mbuf*> received_packets, BurstCounters& counters,
     std::span<PacketMetadata> metadata, std::span<FlowKey> keys,
-    std::span<std::uint16_t> packet_to_parsed) noexcept {
-  constexpr std::uint16_t kUnmapped{std::numeric_limits<std::uint16_t>::max()};
+    std::span<std::uint16_t> packet_to_parsed,
+    struct rte_ip_frag_tbl* frag_tbl, std::uint64_t tsc_timestamp) noexcept {
   constexpr auto kPrefetchDistance{4UZ};
   std::uint32_t n_parsed{0};
 
@@ -1266,16 +1364,23 @@ struct DpiMatch {
     if (i + kPrefetchDistance < received_packets.size()) [[likely]] {
       rte_prefetch0(rte_pktmbuf_mtod(received_packets[i + kPrefetchDistance], void*));
     }
-    auto* const packet{received_packets[i]};
-    if (auto parsed{ParsePacket(*packet)}) {
+    auto* packet{received_packets[i]};
+    PacketParseStatus parse_status{PacketParseStatus::kMalformed};
+    if (auto parsed{ParsePacketOwned(packet, frag_tbl, tsc_timestamp,
+                                     &parse_status)}) {
+      received_packets[i] = packet;
       ++counters.parsed;
       metadata[n_parsed] = *parsed;
       keys[n_parsed] = MakeCanonicalFromMetadata(*parsed);
       packet_to_parsed[i] = static_cast<std::uint16_t>(n_parsed);
       ++n_parsed;
+    } else if (parse_status == PacketParseStatus::kWaitingForFragments) {
+      // The fragment table owns the mbuf until completion or timeout.
+      received_packets[i] = nullptr;
+      packet_to_parsed[i] = kPacketWaitingForFragments;
     } else {
       ++counters.malformed;
-      packet_to_parsed[i] = kUnmapped;
+      packet_to_parsed[i] = kPacketUnmapped;
     }
   }
   return n_parsed;
@@ -1337,7 +1442,6 @@ void BulkFlowLookup(FlowTable& flow_table,
                      std::vector<std::array<rte_mbuf*, kMaxBurstCapacity>>& transmit_buffers,
                      std::vector<std::uint16_t>& transmit_counts,
                      BurstCounters& counters) noexcept {
-  constexpr std::uint16_t kUnmapped{std::numeric_limits<std::uint16_t>::max()};
   const auto* rules{context.rule_manager->Load()};
 
   std::array<ClassificationResult, kMaxBurstCapacity> spi_matches{};
@@ -1349,7 +1453,10 @@ void BulkFlowLookup(FlowTable& flow_table,
   // Phase 1: Check Flow Cache and TSS pre-check first
   for (auto i{0UZ}; i < received_packets.size(); ++i) {
     const auto parsed_idx{packet_to_parsed[i]};
-    if (parsed_idx == kUnmapped) continue;
+    if (parsed_idx == kPacketUnmapped ||
+        parsed_idx == kPacketWaitingForFragments) {
+      continue;
+    }
 
     const auto& bulk_result{bulk_results[parsed_idx]};
     if (bulk_result.valid) [[likely]] {
@@ -1424,13 +1531,17 @@ void BulkFlowLookup(FlowTable& flow_table,
 
   // Phase 3: Finalize packet actions and forward
   for (auto i{0UZ}; i < received_packets.size(); ++i) {
-    rte_prefetch0(rte_pktmbuf_mtod(received_packets[i], void*));
-    auto* const packet{received_packets[i]};
     const auto parsed_idx{packet_to_parsed[i]};
-    if (parsed_idx == kUnmapped) [[unlikely]] {
+    if (parsed_idx == kPacketWaitingForFragments) [[unlikely]] {
+      continue;
+    }
+
+    auto* const packet{received_packets[i]};
+    if (parsed_idx == kPacketUnmapped) [[unlikely]] {
       DropPacket(counters, packet);
       continue;
     }
+    rte_prefetch0(rte_pktmbuf_mtod(packet, void*));
 
     Action action{Action::kForward};
     bool matched{false};
@@ -1443,11 +1554,17 @@ void BulkFlowLookup(FlowTable& flow_table,
     } else {
       const auto& key{keys[parsed_idx]};
       const auto& spi_match{spi_matches[parsed_idx]};
-      TryDpiClassify(context, counters, *packet, metadata[parsed_idx], spi_match, key, action, matched);
+      bool defer_spi_cache{false};
+      TryDpiClassify(context, counters, *packet, metadata[parsed_idx], spi_match, key, action, matched,
+                     defer_spi_cache);
 
       if (!matched) {
         if (spi_match.matched) {
-          if (context.flow_table->Insert(key, /*match_count=*/1, spi_match.action) != FlowInsertResult::kOk) [[unlikely]] {
+          if (defer_spi_cache) {
+            ++counters.matched;
+            action = spi_match.action;
+            matched = true;
+          } else if (context.flow_table->Insert(key, /*match_count=*/1, spi_match.action) != FlowInsertResult::kOk) [[unlikely]] {
             ++counters.flow_table_full;
             if (context.flow_overflow_drop) {
               ++counters.matched;
@@ -1501,7 +1618,8 @@ void BulkFlowLookup(FlowTable& flow_table,
 
   const std::span received_packets{packets.data(), received};
   const auto n_parsed{ParseReceivedPackets(received_packets, counters,
-      metadata, keys, packet_to_parsed)};
+      metadata, keys, packet_to_parsed, context.ip_frag_tbl,
+      context.current_burst_tsc)};
   BulkFlowLookup(*context.flow_table, keys, n_parsed,
                  context.current_burst_tsc, bulk_results);
   FinalizePackets(context, active_ports, port_id, received_packets,
@@ -1514,6 +1632,25 @@ void BulkFlowLookup(FlowTable& flow_table,
 // restructuring ClassifyPacket to expose the cached-action fast path
 // without re-parsing. Estimated gain: ~1-3% over the current 120 Mpps.
 // Defer until per-packet CPU cost becomes the dominant constraint again.
+
+/// Periodically release incomplete fragment sets whose configured TTL elapsed.
+[[gnu::always_inline]] inline void CleanupExpiredFragments(
+    WorkerContext& context) noexcept {
+  if (context.ip_frag_tbl == nullptr || context.current_burst_tsc == 0 ||
+      context.current_burst_tsc - context.last_fragment_cleanup_tsc <
+          context.fragment_cleanup_interval_cycles) {
+    return;
+  }
+
+  rte_ip_frag_death_row death_row{};
+  rte_ip_frag_table_del_expired_entries(
+      context.ip_frag_tbl, &death_row, context.current_burst_tsc);
+  rte_ip_frag_free_death_row(&death_row, 0);
+  if (context.tcp_reassembler != nullptr) {
+    context.tcp_reassembler->PurgeExpired(context.current_burst_tsc);
+  }
+  context.last_fragment_cleanup_tsc = context.current_burst_tsc;
+}
 
 /**
  * @brief Run one full iteration of the worker loop.
@@ -1535,6 +1672,7 @@ void BulkFlowLookup(FlowTable& flow_table,
   for (const auto port_id : active_ports) {
     ProcessPortBurst(context, active_ports, port_id, packets, transmit_buffers, transmit_counts, burst_counters);
   }
+  CleanupExpiredFragments(context);
 
   FlushTransmitBuffers(context, transmit_buffers, transmit_counts, burst_counters);
   AddBurstStats(context.stats, burst_counters);
@@ -1555,7 +1693,7 @@ void DispatchPacketToWorker(rte_mbuf* packet, std::uint16_t receive_port, std::s
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
   packet->port = receive_port;
   const auto worker_id{HashPacketFlow(*packet, receive_port) % dispatch_rings.size()};
-  if (rte_ring_sp_enqueue(dispatch_rings[worker_id], packet) != 0) [[unlikely]] {
+  if (rte_ring_enqueue(dispatch_rings[worker_id], packet) != 0) [[unlikely]] {
     DropPacket(counters, packet);
   }
 }
@@ -1624,6 +1762,7 @@ void ProcessDispatchedWorkerIteration(WorkerContext& context, std::array<rte_mbu
     ForwardPacket(context, active_ports, burst_counters, packet, packet->port, transmit_buffers, transmit_counts);
   }
 
+  CleanupExpiredFragments(context);
   FlushTransmitBuffers(context, transmit_buffers, transmit_counts, burst_counters);
   AddBurstStats(context.stats, burst_counters);
   // Rate-limited atomic flush (see ProcessWorkerIteration for rationale).
@@ -1741,6 +1880,8 @@ Pipeline::Pipeline(const dpdk::Environment& environment, RuleTable initial_rules
       l3_forwarding_{config.l3_forward.enabled},
       drop_unmatched_{config.spi.drop_unmatched},
       flow_ttl_sec_{config.spi.flow_ttl_sec},
+      fragment_timeout_sec_{config.spi.fragment_timeout_sec},
+      tcp_reassembly_config_{config.spi.tcp_reassembly},
       max_concurrent_flows_{config.spi.max_concurrent_flows},
       flow_overflow_drop_{config.spi.flow_overflow_action == "drop"} {
   // Allocate the flow cache with the configured hard ceiling. This is the
@@ -1853,6 +1994,11 @@ std::expected<void, std::string> Pipeline::LaunchWorker(std::size_t worker_id, u
                                                         WorkerEntryPoint entry_point) noexcept {
   auto& context{worker_contexts_[worker_id]};
   PrepareWorkerContext(context, worker_force_quit_, static_cast<std::uint16_t>(worker_id));
+  if (context.ip_frag_tbl == nullptr) {
+    return std::unexpected(std::format(
+        "rte_ip_frag_table_create failed for worker {} (rte_errno={}: {})",
+        worker_id, rte_errno, rte_strerror(rte_errno)));
+  }
 
   const int ret{rte_eal_remote_launch(entry_point, &context, lcore_id)};
   if (ret == 0) {
@@ -1874,6 +2020,11 @@ void Pipeline::StopWorkers() noexcept {
   rte_eal_mp_wait_lcore();
   for (auto& context : worker_contexts_) {
     if (context.ip_frag_tbl != nullptr) {
+      rte_ip_frag_death_row death_row{};
+      rte_ip_frag_table_del_expired_entries(
+          context.ip_frag_tbl, &death_row,
+          rte_rdtsc() + context.fragment_timeout_cycles);
+      rte_ip_frag_free_death_row(&death_row, 0);
       rte_ip_frag_table_destroy(context.ip_frag_tbl);
       context.ip_frag_tbl = nullptr;
     }
@@ -1887,10 +2038,23 @@ void Pipeline::PrepareWorkerContext(WorkerContext& context, const std::atomic<in
   context.rule_manager = &rule_manager_;
   context.dpi_rule_manager = &dpi_rule_manager_;
   context.flow_table = flow_table_.get();
+  const auto tsc_hz{rte_get_tsc_hz()};
+  if (tcp_reassembly_config_.enabled) {
+    context.tcp_reassembler = std::make_unique<TcpStreamReassembler>(
+        tcp_reassembly_config_, tsc_hz);
+  }
+  const auto max_timeout_sec{
+      std::numeric_limits<std::uint64_t>::max() / tsc_hz};
+  const auto timeout_sec{std::min<std::uint64_t>(
+      fragment_timeout_sec_, max_timeout_sec)};
+  context.fragment_timeout_cycles = timeout_sec * tsc_hz;
+  context.fragment_cleanup_interval_cycles =
+      std::min<std::uint64_t>(tsc_hz, context.fragment_timeout_cycles);
+  context.last_fragment_cleanup_tsc = rte_rdtsc();
   if (context.ip_frag_tbl == nullptr) {
-    const std::uint64_t max_cycles{(rte_get_tsc_hz() + 999) / 1000 * 10000};
     const int socket_id{static_cast<int>(rte_lcore_to_socket_id(worker_id))};
-    context.ip_frag_tbl = rte_ip_frag_table_create(4096, 16, 65536, max_cycles, socket_id);
+    context.ip_frag_tbl = rte_ip_frag_table_create(
+        4096, 16, 65536, context.fragment_timeout_cycles, socket_id);
   }
   context.l3_routes = &l3_routes_;
   context.ethernet_destinations = &ethernet_destinations_;
@@ -1900,6 +2064,7 @@ void Pipeline::PrepareWorkerContext(WorkerContext& context, const std::atomic<in
   context.bursts_since_flush = 0;
   context.rule_match_counts.assign(rule_manager_.Load()->GroupCount(), 0);
   context.dispatch_ring = worker_id < dispatch_rings_.size() ? dispatch_rings_[worker_id] : nullptr;
+  context.flow_hash_rings = {dispatch_rings_.data(), dispatch_rings_.size()};
   context.force_quit = &force_quit;
   context.burst_size = burst_size_;
   context.worker_id = worker_id;
@@ -1921,7 +2086,7 @@ std::expected<void, std::string> Pipeline::CreateDispatchRings() noexcept {
     const auto ring_name{std::format("spi_dispatch_{}", worker_id)};
     auto* const ring{rte_ring_create(
         ring_name.c_str(), static_cast<unsigned>(dispatch_queue_size_),
-        static_cast<int>(rte_socket_id()), RING_F_SP_ENQ | RING_F_SC_DEQ)};
+        static_cast<int>(rte_socket_id()), RING_F_SC_DEQ)};
     if (ring == nullptr) {
       DestroyDispatchRings();
       return std::unexpected(
@@ -1966,10 +2131,16 @@ std::expected<PipelineStats, std::string> Pipeline::RunMultiWorker(const std::at
   std::uint64_t timer_tsc{};
   const auto stats_period_tsc{rte_get_tsc_hz() * timer_period_sec};
   while (force_quit.load(std::memory_order_relaxed) == 0) {
-    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
+    MaybePrintStats(counters_, flow_table_.get(), timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
     MaybeReload(force_quit, reload_flag_, config_path_, reload_barrier_);
-    if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
-      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
+    if (flow_ttl_sec_ > 0) {
+      if (timer_tsc == 0 && previous_tsc != 0) {
+        flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
+      } else if (flow_table_->ShouldEvictOnPressure()) {
+        flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
+        flow_table_->ResetOverflowCount();
+        counters_.pressure_evictions.fetch_add(1, std::memory_order_relaxed);
+      }
     }
     std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
@@ -2009,10 +2180,16 @@ std::expected<PipelineStats, std::string> Pipeline::RunFlowHashDispatch(const st
       last_tick_tsc = now;
     }
     ProcessDispatchIteration(environment_, burst_size_, packets, dispatch_rings, counters_);
-    MaybePrintStats(counters_, timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
+    MaybePrintStats(counters_, flow_table_.get(), timer_period_sec, stats_period_tsc, previous_tsc, timer_tsc, start_tsc);
     MaybeReload(force_quit, reload_flag_, config_path_, reload_barrier_);
-    if (flow_ttl_sec_ > 0 && timer_tsc == 0 && previous_tsc != 0) {
-      flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
+    if (flow_ttl_sec_ > 0) {
+      if (timer_tsc == 0 && previous_tsc != 0) {
+        flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
+      } else if (flow_table_->ShouldEvictOnPressure()) {
+        flow_table_->PurgeExpired(rte_rdtsc(), static_cast<std::uint64_t>(flow_ttl_sec_) * rte_get_tsc_hz(), force_quit);
+        flow_table_->ResetOverflowCount();
+        counters_.pressure_evictions.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
 
@@ -2038,16 +2215,6 @@ std::expected<PipelineStats, std::string> Pipeline::RunUntilStopped(const std::a
                                                                     std::uint32_t timer_period_sec) noexcept {
   config_path_ = config_path;
   reload_flag_ = &reload_flag;
-
-  if (worker_contexts_.size() < 2) {
-    return std::unexpected(std::format(
-        "spi.worker_count must be >= 2 (got {}). Single-worker mode is "
-        "no longer supported; the pipeline requires at least one main "
-        "lcore plus one or more worker lcores for proper Ctrl+C "
-        "responsiveness and to keep the signal-polling loop free of "
-        "packet-processing work.",
-        worker_contexts_.size()));
-  }
 
   const auto packet_distribution{
       ResolvePacketDistribution(environment_, packet_distribution_, worker_contexts_.size())};
